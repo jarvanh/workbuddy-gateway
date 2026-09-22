@@ -45,6 +45,20 @@ type runtimeFileConfig struct {
 		// Allowlist：白名单；非空时只允许列表内的模型，其余一律拒绝。
 		Allowlist []string `json:"allowlist"`
 	} `json:"models"`
+	// Checkin 段可选，控制每日签到与 Buddy 旅行自动化。
+	// 省略字段用默认值（全部开启），显式 false 关闭。
+	Checkin struct {
+		CN struct {
+			// Enabled：国内站每日自动签到（默认开启）。
+			Enabled *bool `json:"enabled"`
+			// Travel：国内站签到后自动派 Buddy 旅行（默认开启）。
+			Travel *bool `json:"travel"`
+		} `json:"cn"`
+		Intl struct {
+			// Enabled：国际站每日自动签到（默认开启）。
+			Enabled *bool `json:"enabled"`
+		} `json:"intl"`
+	} `json:"checkin"`
 }
 
 type debugRequestContextKey struct{}
@@ -114,6 +128,18 @@ func loadRuntimeConfig(path string) error {
 	}
 	if fileCfg.Upstream.NetworkRetries != nil && *fileCfg.Upstream.NetworkRetries >= 0 {
 		upstreamNetworkRetries = *fileCfg.Upstream.NetworkRetries
+	}
+
+	// 签到与 Buddy 旅行开关：省略字段恢复默认开启，显式 false 关闭。
+	cnCheckinEnabled, cnTravelEnabled, intlCheckinEnabled = true, true, true
+	if fileCfg.Checkin.CN.Enabled != nil {
+		cnCheckinEnabled = *fileCfg.Checkin.CN.Enabled
+	}
+	if fileCfg.Checkin.CN.Travel != nil {
+		cnTravelEnabled = *fileCfg.Checkin.CN.Travel
+	}
+	if fileCfg.Checkin.Intl.Enabled != nil {
+		intlCheckinEnabled = *fileCfg.Checkin.Intl.Enabled
 	}
 	return nil
 }

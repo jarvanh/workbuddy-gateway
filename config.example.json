@@ -5,5 +5,14 @@
   "models": {
     "blocklist": [],
     "allowlist": []
+  },
+  "checkin": {
+    "cn": {
+      "enabled": true,
+      "travel": true
+    },
+    "intl": {
+      "enabled": true
+    }
   }
 }

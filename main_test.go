@@ -526,14 +526,17 @@ func TestNextDailyCheckinUTC8(t *testing.T) {
 	}
 }
 
-func TestCheckinAccountCNAndSkipIntl(t *testing.T) {
-	var calls int
+// 国内站与国际站账号都会自动签到（可在 config.json checkin 段分别关闭）。
+func TestCheckinAccountCNAndIntl(t *testing.T) {
+	travelSeedFlags(t, true, false, true) // 关闭旅行，专注验证签到行为
+
+	var checkinCalls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
 		if r.URL.Path != "/v2/billing/meter/daily-checkin" {
 			t.Errorf("unexpected path %s", r.URL.Path)
 		}
-		if r.Header.Get("Authorization") != "Bearer test-access" || r.Header.Get("X-User-Id") != "user-1" {
+		checkinCalls++
+		if r.Header.Get("Authorization") != "Bearer test-access" {
 			t.Errorf("missing checkin auth headers")
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -541,32 +544,27 @@ func TestCheckinAccountCNAndSkipIntl(t *testing.T) {
 	}))
 	defer server.Close()
 
-	oldOrigin := profileCN.Origin
+	oldCNOrigin, oldIntlOrigin := profileCN.Origin, profileINTL.Origin
 	oldClient := cfg.HttpClient
 	profileCN.Origin = server.URL
+	profileINTL.Origin = server.URL
 	cfg.HttpClient = server.Client()
 	defer func() {
-		profileCN.Origin = oldOrigin
+		profileCN.Origin = oldCNOrigin
+		profileINTL.Origin = oldIntlOrigin
 		cfg.HttpClient = oldClient
 	}()
 
-	cn := &Account{Path: "cn.json", Auth: &StoredAuth{
-		Edition: "cn",
-		Auth:    StoredTokens{AccessToken: "test-access"},
-		Account: StoredAccount{UID: "user-1"},
-	}}
+	cn := travelSeedAccount(t, "cn")
 	result, err := checkinAccount(context.Background(), cn)
-	if err != nil || result != "ok" || calls != 1 {
-		t.Fatalf("cn checkin result=%q calls=%d err=%v", result, calls, err)
+	if err != nil || result != "ok" || checkinCalls != 1 {
+		t.Fatalf("cn checkin result=%q calls=%d err=%v", result, checkinCalls, err)
 	}
 
-	intl := &Account{Path: "intl.json", Auth: &StoredAuth{
-		Edition: "intl",
-		Auth:    StoredTokens{AccessToken: "test-access"},
-	}}
+	intl := travelSeedAccount(t, "intl")
 	result, err = checkinAccount(context.Background(), intl)
-	if err != nil || result != "global_skipped" || calls != 1 {
-		t.Fatalf("intl should be skipped: result=%q calls=%d err=%v", result, calls, err)
+	if err != nil || result != "ok" || checkinCalls != 2 {
+		t.Fatalf("intl checkin should execute by default: result=%q calls=%d err=%v", result, checkinCalls, err)
 	}
 }
 

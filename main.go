@@ -1886,6 +1886,14 @@ func requestQuotaScan() {
 	}
 }
 
+// 签到与 Buddy 旅行的自动化开关（默认全部开启，可由 config.json 的 checkin 段覆盖）。
+var (
+	cnCheckinEnabled   = true // 国内站每日自动签到
+	cnTravelEnabled    = true // 国内站签到后自动派 Buddy 旅行
+	intlCheckinEnabled = true // 国际站每日自动签到
+)
+
+// isAlreadyCheckedIn 判断签到响应是否为「今日已签」类幂等结果。
 func isAlreadyCheckedIn(status int, message string) bool {
 	if status == 0 && message == "" {
 		return false
@@ -1895,7 +1903,8 @@ func isAlreadyCheckedIn(status int, message string) bool {
 		strings.Contains(message, "已签到") || strings.Contains(low, "already checked in")
 }
 
-// checkinAccount 执行国内站每日签到。国际站没有已确认可用的签到体系，明确跳过。
+// checkinAccount 执行单账号每日签到：国内站与国际站均支持，国内站签到成功后
+// 按配置自动派 Buddy 旅行。是否执行由 config.json 的 checkin 段控制（默认开启）。
 func checkinAccount(ctx context.Context, acc *Account) (string, error) {
 	if acc == nil {
 		return "skipped", nil
@@ -1908,7 +1917,8 @@ func checkinAccount(ctx context.Context, acc *Account) (string, error) {
 		accountMu.Unlock()
 		return "skipped", nil
 	}
-	if acc.Profile().Key != profileCN.Key {
+	isCN := acc.Profile().Key == profileCN.Key
+	if (isCN && !cnCheckinEnabled) || (!isCN && !intlCheckinEnabled) {
 		accountMu.Unlock()
 		return "global_skipped", nil
 	}
@@ -1936,16 +1946,32 @@ func checkinAccount(ctx context.Context, acc *Account) (string, error) {
 		}
 	}
 	_, status, err := doJSONContext(ctx, cfg.HttpClient, http.MethodPost, prof.dailyCheckinURL(), headers, strings.NewReader("{}"))
-	if err == nil {
+	var checkinErr error
+	result := "failed"
+	switch {
+	case err == nil:
 		log.Printf("[Checkin] 账号 %s 每日签到成功", path)
-		return "ok", nil
-	}
-	if isAlreadyCheckedIn(status, err.Error()) {
+		result = "ok"
+	case isAlreadyCheckedIn(status, err.Error()):
 		log.Printf("[Checkin] 账号 %s 今天已经签到，本次按幂等成功处理", path)
-		return "already", nil
+		result = "already"
+	default:
+		log.Printf("[Checkin] 账号 %s 每日签到失败，HTTP=%d，原因=%v；不改变账号调度状态", path, status, err)
+		checkinErr = err
 	}
-	log.Printf("[Checkin] 账号 %s 每日签到失败，HTTP=%d，原因=%v；不改变账号调度状态", path, status, err)
-	return "failed", err
+
+	// 国内站签到后派 Buddy 旅行：旅行是独立活动，签到成功或今日已签都尝试执行；
+	// 结果只记录日志，不影响签到本身的返回值。
+	if isCN && cnTravelEnabled && (result == "ok" || result == "already") {
+		travelResult, travelErr := performBuddyTravel(ctx, acc)
+		switch {
+		case travelErr != nil:
+			log.Printf("[Travel] 账号 %s Buddy 旅行失败: %v", path, travelErr)
+		case travelResult == "ok":
+			log.Printf("[Travel] 账号 %s Buddy 旅行流程完成", path)
+		}
+	}
+	return result, checkinErr
 }
 
 func checkinAllAccounts(ctx context.Context) {
@@ -1958,7 +1984,7 @@ func checkinAllAccounts(ctx context.Context) {
 	accountMu.Lock()
 	accs := append([]*Account(nil), accounts...)
 	accountMu.Unlock()
-	log.Printf("[Checkin] 开始每日签到，账号总数=%d，国际站账号将跳过", len(accs))
+	log.Printf("[Checkin] 开始每日签到，账号总数=%d（国内站签到+Buddy旅行、国际站签到，均可在 config.json checkin 段关闭）", len(accs))
 	ok, already, failed, skipped := 0, 0, 0, 0
 	for _, acc := range accs {
 		if err := ctx.Err(); err != nil {
