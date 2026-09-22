@@ -55,6 +55,15 @@ const (
 	// 就永不超时，一旦超过该时长没有任何新数据，才判定上游卡死并中断。
 	upstreamIdleTimeoutDefault = 120 * time.Second
 
+	// upstreamNetworkRetriesDefault 是单个账号网络层失败（EOF、use of closed
+	// network connection 等瞬时错误）后的原地重试次数。陈旧 keep-alive 连接
+	// 导致的写入失败通常重连一次即恢复，默认 3 次以覆盖短暂网络抖动。
+	// 0 表示关闭原地重试（直接回退账号）。
+	upstreamNetworkRetriesDefault = 3
+
+	// upstreamNetworkRetryDelayDefault 是两次网络重试之间的等待间隔。
+	upstreamNetworkRetryDelayDefault = 500 * time.Millisecond
+
 	// defaultRequestTimeout 用于令牌刷新、额度查询、模型目录等控制类短请求。
 	defaultRequestTimeout = 60 * time.Second
 )
@@ -62,8 +71,10 @@ const (
 // 生效的超时值（默认取上面的 Default，可由 config.json 的 upstream 段覆盖）。
 // 定义为变量既便于测试调小阈值，也便于运维按网络状况调整。
 var (
-	upstreamHeaderTimeout = upstreamHeaderTimeoutDefault
-	upstreamIdleTimeout   = upstreamIdleTimeoutDefault
+	upstreamHeaderTimeout     = upstreamHeaderTimeoutDefault
+	upstreamIdleTimeout       = upstreamIdleTimeoutDefault
+	upstreamNetworkRetries    = upstreamNetworkRetriesDefault
+	upstreamNetworkRetryDelay = upstreamNetworkRetryDelayDefault
 )
 
 // -----------------------------------------------------------------------------
@@ -1285,21 +1296,33 @@ func clearDisabledMarker(path string) {
 	}
 }
 
+// authFailureKeywords 是上游鉴权失败响应体的特征关键字（大小写不敏感）。
+var authFailureKeywords = []string{
+	"invalid token",
+	"unauthorized",
+	"登录已过期",
+	"登录失效",
+	"token 已失效",
+	"authentication required",
+}
+
+// bodyIndicatesAuthFailure 判断上游响应体是否带鉴权失败特征。
+func bodyIndicatesAuthFailure(body string) bool {
+	low := strings.ToLower(body)
+	for _, kw := range authFailureKeywords {
+		if strings.Contains(low, kw) {
+			return true
+		}
+	}
+	return false
+}
+
 // isAuthFailure 判断上游响应是否为授权失效（401/403 / invalid token / 登录过期等）。
 func isAuthFailure(statusCode int, body string) bool {
 	if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden {
 		return true
 	}
-	low := strings.ToLower(body)
-	if strings.Contains(low, "invalid token") ||
-		strings.Contains(low, "unauthorized") ||
-		strings.Contains(low, "登录已过期") ||
-		strings.Contains(low, "登录失效") ||
-		strings.Contains(low, "token 已失效") ||
-		strings.Contains(low, "authentication required") {
-		return true
-	}
-	return false
+	return bodyIndicatesAuthFailure(body)
 }
 
 var resetTimeRe = regexp.MustCompile(`将在\s*(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s*(UTC[+-]\d+(?::\d{2})?)?`)
@@ -1458,7 +1481,13 @@ func doRefreshTokenFor(acc *Account) error {
 	if err != nil {
 		log.Printf("[Auth] 账号 %s Token 刷新失败，HTTP=%d，原因=%v，旧凭据未覆盖", path, status, err)
 		if isAuthFailure(status, err.Error()) {
-			disableAccount(acc, fmt.Sprintf("令牌刷新失败 (HTTP %d): %v", status, err))
+			// 与对话链路同理：403 但响应体无鉴权失败特征时疑似 WAF/CDN 拦截，
+			// 不禁用账号、不删凭据，等待下轮重试即可。
+			if status == http.StatusForbidden && !bodyIndicatesAuthFailure(err.Error()) {
+				log.Printf("[Auth] 账号 %s Token 刷新返回 403 但响应体无鉴权失败特征，疑似 WAF/CDN 拦截，不禁用账号", path)
+			} else {
+				disableAccount(acc, fmt.Sprintf("令牌刷新失败 (HTTP %d): %v", status, err))
+			}
 		}
 		return err
 	}
@@ -2705,8 +2734,8 @@ func runServe() {
 	} else {
 		fmt.Printf("   JSON 调试日志: 已关闭 (%s 中 debug.enabled=false)\n", runtimeConfigFile)
 	}
-	fmt.Printf("   上游超时:      响应头等待 %v / 流空闲 %v (%s 可覆盖)\n",
-		upstreamHeaderTimeout, upstreamIdleTimeout, runtimeConfigFile)
+	fmt.Printf("   上游超时:      响应头等待 %v / 流空闲 %v / 网络错误重试 %d 次 (%s 可覆盖)\n",
+		upstreamHeaderTimeout, upstreamIdleTimeout, upstreamNetworkRetries, runtimeConfigFile)
 	if modelFilterConfigured() {
 		blocked, allowed := modelFilterSummary()
 		fmt.Printf("   模型黑白名单:  已启用 (黑名单 %d 个 / 白名单 %d 个，被禁模型已从列表隐藏并拒绝请求)\n", blocked, allowed)
@@ -2910,6 +2939,8 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 
 	var lastRateErr string
 	var lastAuthErr string
+	var lastNetErr string
+	var lastUpstreamErr string
 	attempted := make(map[*Account]bool, poolSize)
 	for attempt := 0; attempt < poolSize; attempt++ {
 		acc, selection, err := nextAccountForModel(modelName, attempted)
@@ -2921,6 +2952,12 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			}
 			if lastRateErr != "" {
 				msg += " | 最近一次频率限制: " + truncate(lastRateErr, 200)
+			}
+			if lastNetErr != "" {
+				msg += " | 最近一次网络错误: " + truncate(lastNetErr, 200)
+			}
+			if lastUpstreamErr != "" {
+				msg += " | 最近一次上游错误: " + truncate(lastUpstreamErr, 200)
 			}
 			log.Printf("[#%d] %s", reqID, msg)
 			debugEvent(r, "warn", "request_rejected_no_available_account", map[string]any{
@@ -2961,44 +2998,76 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 		prof := acc.Profile()
 
 		upstreamCtx, upstreamCancel := context.WithCancel(r.Context())
-		upstreamReq, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, prof.chatURL(), bytes.NewReader(upstreamBytes))
-		if err != nil {
-			upstreamCancel()
-			debugEvent(r, "error", "upstream_request_create_failed", map[string]any{
-				"error_type": debugErrorType(err),
-				"error":      safeDebugError(err),
+		// 网络层失败（EOF、use of closed network connection 等瞬时错误）处理策略：
+		// 1) 同一账号先原地重试（陈旧 keep-alive 连接重连一次通常即恢复）；
+		// 2) 仍失败则回退到账号池中的下一个账号继续尝试；
+		// 3) 所有账号的网络调用都失败，才向客户端返回 502。
+		var resp *http.Response
+		var netErr error
+		for netAttempt := 0; ; netAttempt++ {
+			upstreamReq, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, prof.chatURL(), bytes.NewReader(upstreamBytes))
+			if err != nil {
+				upstreamCancel()
+				debugEvent(r, "error", "upstream_request_create_failed", map[string]any{
+					"error_type": debugErrorType(err),
+					"error":      safeDebugError(err),
+				})
+				recordModelFailure(modelName, "req_create_error")
+				writeOpenAIError(w, http.StatusInternalServerError, "req_create_error", err.Error())
+				return nil, nil, nil, false
+			}
+			// 注入 CodeBuddy 凭据与指纹 Header
+			// 限制同一账号向腾讯上游的请求严格单并发串行排队，防止并发双发触发腾讯风控
+			acc.lock.Lock()
+			backendHeaders(upstreamReq, acc.Auth, prof)
+			if cfg.DebugEnabled {
+				upstreamReq.Header.Set("X-Trace-ID", debugTraceID(r))
+				upstreamReq.Header.Set("X-Parent-Request-ID", strconv.FormatUint(reqID, 10))
+			}
+			debugEvent(r, "info", "upstream_request_started", map[string]any{
+				"upstream_host": prof.Base,
+				"attempt":       attempt + 1,
+				"retry":         netAttempt,
+				"payload_bytes": len(upstreamBytes),
 			})
-			recordModelFailure(modelName, "req_create_error")
-			writeOpenAIError(w, http.StatusInternalServerError, "req_create_error", err.Error())
-			return nil, nil, nil, false
+			resp, netErr = cfg.HttpClient.Do(upstreamReq)
+			acc.lock.Unlock()
+			if netErr == nil {
+				break
+			}
+			// 客户端已断开或请求上下文被取消：重试与回退均无意义，直接终止
+			if upstreamCtx.Err() != nil || errors.Is(netErr, context.Canceled) {
+				break
+			}
+			if netAttempt >= upstreamNetworkRetries {
+				break
+			}
+			log.Printf("[#%d] 账号 %s [%s] 上游网络错误 (%v)，%v 后进行第 %d/%d 次重试",
+				reqID, acc.Path, prof.Label, netErr, upstreamNetworkRetryDelay, netAttempt+1, upstreamNetworkRetries)
+			select {
+			case <-time.After(upstreamNetworkRetryDelay):
+			case <-upstreamCtx.Done():
+				netErr = upstreamCtx.Err()
+			}
 		}
-		// 注入 CodeBuddy 凭据与指纹 Header
-		// 限制同一账号向腾讯上游的请求严格单并发串行排队，防止并发双发触发腾讯风控
-		acc.lock.Lock()
-		backendHeaders(upstreamReq, acc.Auth, prof)
-		if cfg.DebugEnabled {
-			upstreamReq.Header.Set("X-Trace-ID", debugTraceID(r))
-			upstreamReq.Header.Set("X-Parent-Request-ID", strconv.FormatUint(reqID, 10))
-		}
-		debugEvent(r, "info", "upstream_request_started", map[string]any{
-			"upstream_host": prof.Base,
-			"attempt":       attempt + 1,
-			"payload_bytes": len(upstreamBytes),
-		})
-		resp, err := cfg.HttpClient.Do(upstreamReq)
-		acc.lock.Unlock()
-		if err != nil {
+		if netErr != nil {
+			clientGone := upstreamCtx.Err() != nil || errors.Is(netErr, context.Canceled)
 			upstreamCancel()
 			debugEvent(r, "error", "upstream_request_failed", map[string]any{
 				"upstream_host": prof.Base,
-				"error_type":    debugErrorType(err),
-				"error":         safeDebugError(err),
+				"error_type":    debugErrorType(netErr),
+				"error":         safeDebugError(netErr),
 			})
-			log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游网络调用 账号=%s 异常=%v 业务影响=本次模型请求失败 是否已处理=是", traceID, reqID, acc.Path, err)
-			log.Printf("[#%d] 账号 %s [%s] 上游请求失败: %v", reqID, acc.Path, prof.Label, err)
+			log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游网络调用 账号=%s 异常=%v 业务影响=本次模型请求失败 是否已处理=是", traceID, reqID, acc.Path, netErr)
+			log.Printf("[#%d] 账号 %s [%s] 上游请求失败: %v", reqID, acc.Path, prof.Label, netErr)
 			recordModelFailure(modelName, "网络错误")
-			writeOpenAIError(w, http.StatusBadGateway, "upstream_network_error", fmt.Sprintf("网络转发失败: %v", err))
-			return nil, nil, nil, false
+			if clientGone {
+				// 客户端已断开：不再回退其他账号，直接结束
+				writeOpenAIError(w, http.StatusBadGateway, "upstream_network_error", fmt.Sprintf("网络转发失败: %v", netErr))
+				return nil, nil, nil, false
+			}
+			lastNetErr = netErr.Error()
+			continue // 回退到下一个账号
 		}
 
 		// 上游非 200 响应处理
@@ -3056,11 +3125,27 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			}
 
 			if isAuthFailure(resp.StatusCode, errStr) {
+				// 403 但响应体没有任何鉴权失败特征：大概率是 WAF/CDN 拦截页而非 token 失效。
+				// 只做短冷却并回退下一个账号，避免误禁账号、误删凭据文件。
+				if resp.StatusCode == http.StatusForbidden && !bodyIndicatesAuthFailure(errStr) {
+					markCooldown(acc, time.Now().Add(60*time.Second), truncate(errStr, 200))
+					lastUpstreamErr = fmt.Sprintf("HTTP 403 (疑似WAF/CDN拦截): %s", truncate(errStr, 200))
+					log.Printf("[#%d] 账号 %s [%s] 上游 403 但响应体无鉴权失败特征，疑似 WAF/CDN 拦截：仅冷却 60s 并回退下一个账号，不禁用账号", reqID, acc.Path, prof.Label)
+					continue
+				}
 				// 授权失效（401/403 / token 无效 / 登录过期）：禁用该账号并删除凭据文件，
 				// 自动改用下一个可用账号，控制台提示用户重新登录
 				disableAccount(acc, fmt.Sprintf("上游鉴权失败 (HTTP %d): %s", resp.StatusCode, truncate(errStr, 200)))
 				lastAuthErr = errStr
 				continue // 尝试下一个账号
+			}
+
+			if isRetryableUpstreamStatus(resp.StatusCode) {
+				// 上游瞬时故障（408 / 5xx）：换下一个账号代偿，全部失败才返回错误
+				lastUpstreamErr = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncate(errStr, 200))
+				recordModelFailure(modelName, modelStatusFromError(resp.StatusCode, errStr))
+				log.Printf("[#%d] 账号 %s [%s] 上游返回瞬时错误 HTTP %d，回退下一个账号重试", reqID, acc.Path, prof.Label, resp.StatusCode)
+				continue
 			}
 
 			recordModelFailure(modelName, modelStatusFromError(resp.StatusCode, errStr))
@@ -3080,7 +3165,29 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 		return resp, acc, prof, true
 	}
 
-	// 理论上不可达（poolSize 次尝试后未成功即已在循环内返回）
+	// 账号池中每个账号都尝试过且均失败（网络错误 / 上游瞬时错误 / 冷却等）
+	if lastNetErr != "" {
+		debugEvent(r, "error", "request_failed_all_accounts_network", map[string]any{
+			"status_code":     http.StatusBadGateway,
+			"reason":          "upstream_network_error",
+			"tried_accounts":  poolSize,
+			"business_impact": "所有账号上游网络调用均失败",
+		})
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_network_error",
+			fmt.Sprintf("已依次尝试全部 %d 个账号仍网络转发失败，最近一次错误: %s", poolSize, truncate(lastNetErr, 200)))
+		return nil, nil, nil, false
+	}
+	if lastUpstreamErr != "" {
+		debugEvent(r, "warn", "request_failed_all_accounts_upstream", map[string]any{
+			"status_code":     http.StatusBadGateway,
+			"reason":          "upstream_error",
+			"tried_accounts":  poolSize,
+			"business_impact": "所有账号上游均返回瞬时错误",
+		})
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_error",
+			fmt.Sprintf("已依次尝试全部 %d 个账号仍失败，最近一次上游错误: %s", poolSize, truncate(lastUpstreamErr, 200)))
+		return nil, nil, nil, false
+	}
 	recordModelFailure(modelName, "all_cooldown")
 	debugEvent(r, "warn", "request_rejected_all_cooldown", map[string]any{
 		"status_code":     http.StatusTooManyRequests,
@@ -3089,6 +3196,13 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 	})
 	writeOpenAIError(w, http.StatusTooManyRequests, "all_accounts_cooldown", "所有账号均处于冷却状态")
 	return nil, nil, nil, false
+}
+
+// isRetryableUpstreamStatus 判断上游 HTTP 状态码是否属于可跨账号回退重试的瞬时故障：
+// 408 请求超时与所有 5xx 服务端错误，换账号重试通常有意义；
+// 其余 4xx（参数错误、模型不存在等）属于请求级问题，换账号无意义。
+func isRetryableUpstreamStatus(status int) bool {
+	return status == http.StatusRequestTimeout || status >= http.StatusInternalServerError
 }
 
 func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -3172,15 +3286,20 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[#%d] POST /v1/chat/completions -> Upstream [Model: %s, Stream: %v]", reqID, modelName, isStream)
 	}
 
-	resp, acc, prof, ok := upstreamChat(w, r, reqID, modelName, upstreamBytes, startTime)
-	if !ok {
+	if isStream {
+		resp, acc, prof, ok := upstreamChat(w, r, reqID, modelName, upstreamBytes, startTime)
+		if !ok {
+			return
+		}
+		streamChatResponse(w, r, resp, modelName, reqID, acc, prof, startTime)
 		return
 	}
-	if isStream {
-		streamChatResponse(w, r, resp, modelName, reqID, acc, prof, startTime)
-	} else {
-		writeChatAggregate(w, r, resp, modelName, reqID, acc, prof, startTime)
-	}
+	// 非流式：网关本地聚合上游 SSE。聚合期间若上游流被网络中断
+	//（此时尚未向客户端写出任何字节），自动回退账号池重新请求。
+	handleNonStreamUpstream(w, r, reqID, modelName, upstreamBytes, startTime,
+		func(completionJSON []byte) ([]byte, map[string]any, error) {
+			return completionJSON, usageFromCompletion(completionJSON), nil
+		})
 }
 
 // streamChatResponse 将上游 SSE 逐行透传为 OpenAI Chat Completions 流式响应。
@@ -3254,33 +3373,78 @@ func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Respo
 	log.Printf("[#%d] 流式输出完成 (账号 %s [%s], 耗时 %v, 首字 %v)", reqID, acc.Path, prof.Label, time.Since(startTime), body.duration())
 }
 
-// writeChatAggregate 聚合上游 SSE 为完整 Chat Completions JSON 响应。
-func writeChatAggregate(w http.ResponseWriter, r *http.Request, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time) {
-	defer resp.Body.Close()
-	body := newTTFTReader(resp.Body, startTime)
-	completionJSON, err := aggregateCompletion(body, modelName)
-	if err != nil {
-		debugEvent(r, "error", "aggregate_response_failed", map[string]any{
-			"error_type": debugErrorType(err),
-			"error":      safeDebugError(err),
+// maxNonStreamAttempts 限制非流式聚合的端到端尝试次数（含首次）。
+// 每次尝试内部都会完整执行 upstreamChat 的账号回退与原地重试，故总上限无需过大。
+const maxNonStreamAttempts = 3
+
+// handleNonStreamUpstream 获取上游响应并聚合为非流式 JSON（chat 与 responses 共用）。
+//
+// 聚合完成前不会向客户端写出任何字节，因此若上游流在聚合期间被网络中断
+// （EOF / 连接重置 / 空闲看门狗触发），可透明回退账号池重新请求，最多尝试
+// maxNonStreamAttempts 次；全部失败才返回错误，绝不把截断内容伪装成完整结果。
+// 流式请求不经过此路径：部分内容已发出，无法透明重试（由 streamChatResponse /
+// streamResponsesResponse 下发明确的中断错误事件）。
+func handleNonStreamUpstream(
+	w http.ResponseWriter,
+	r *http.Request,
+	reqID uint64,
+	modelName string,
+	upstreamBytes []byte,
+	startTime time.Time,
+	buildResponse func(completionJSON []byte) (finalJSON []byte, usage map[string]any, err error),
+) {
+	for attempt := 1; ; attempt++ {
+		resp, acc, prof, ok := upstreamChat(w, r, reqID, modelName, upstreamBytes, startTime)
+		if !ok {
+			return
+		}
+		body := newTTFTReader(resp.Body, startTime)
+		completionJSON, aggErr := aggregateCompletion(body, modelName)
+		resp.Body.Close()
+		if aggErr != nil {
+			recordModelFailure(modelName, "聚合中断")
+			debugEvent(r, "error", "aggregate_response_failed", map[string]any{
+				"error_type": debugErrorType(aggErr),
+				"error":      safeDebugError(aggErr),
+				"attempt":    attempt,
+			})
+			log.Printf("[#%d] 账号 %s [%s] 聚合响应失败 (第 %d/%d 次尝试): %v", reqID, acc.Path, prof.Label, attempt, maxNonStreamAttempts, aggErr)
+			if r.Context().Err() != nil {
+				// 客户端已断开：回退重试无意义
+				writeOpenAIError(w, http.StatusBadGateway, "aggregate_error", "上游流式响应在聚合阶段中断: "+aggErr.Error())
+				return
+			}
+			if attempt < maxNonStreamAttempts {
+				continue // 回退账号池重新请求
+			}
+			writeOpenAIError(w, http.StatusBadGateway, "aggregate_error",
+				fmt.Sprintf("上游流式响应在聚合阶段中断（已尝试 %d 次）: %v", attempt, aggErr))
+			return
+		}
+		finalJSON, usage, convErr := buildResponse(completionJSON)
+		if convErr != nil {
+			debugEvent(r, "error", "response_translation_failed", map[string]any{
+				"error_type": debugErrorType(convErr),
+				"error":      safeDebugError(convErr),
+			})
+			log.Printf("[#%d] Responses 转换失败: %v", reqID, convErr)
+			writeOpenAIError(w, http.StatusInternalServerError, "translate_error", "转换 Responses 响应失败: "+convErr.Error())
+			return
+		}
+		observeModelCredit(acc, modelName, usage, reqID)
+		recordModelTokens(modelName, usage, reqID)
+		recordModelTTFT(modelName, body.duration())
+		recordModelLatency(modelName, time.Since(startTime))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(finalJSON)
+		debugEvent(r, "info", "aggregate_response_completed", map[string]any{
+			"status_code":    http.StatusOK,
+			"response_bytes": len(finalJSON),
 		})
-		log.Printf("[#%d] 聚合响应失败: %v", reqID, err)
-		writeOpenAIError(w, http.StatusInternalServerError, "aggregate_error", "聚合上游流式响应失败: "+err.Error())
+		log.Printf("[#%d] 非流式响应完成 (账号 %s [%s], 耗时 %v, 首字 %v)", reqID, acc.Path, prof.Label, time.Since(startTime), body.duration())
 		return
 	}
-	usage := usageFromCompletion(completionJSON)
-	observeModelCredit(acc, modelName, usage, reqID)
-	recordModelTokens(modelName, usage, reqID)
-	recordModelTTFT(modelName, body.duration())
-	recordModelLatency(modelName, time.Since(startTime))
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(completionJSON)
-	debugEvent(r, "info", "aggregate_response_completed", map[string]any{
-		"status_code":    http.StatusOK,
-		"response_bytes": len(completionJSON),
-	})
-	log.Printf("[#%d] 非流式响应完成 (账号 %s [%s], 耗时 %v, 首字 %v)", reqID, acc.Path, prof.Label, time.Since(startTime), body.duration())
 }
 
 // -----------------------------------------------------------------------------
@@ -3625,6 +3789,12 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 				finish = v
 			}
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		// 上游流在聚合期间被中断（网络错误 / 空闲看门狗 / 客户端取消）。
+		// 绝不把已聚合的部分内容伪装成完整结果（finish_reason=stop）返回，
+		// 交由上层判断是否回退其他账号重试。
+		return nil, fmt.Errorf("上游流式响应读取中断: %w", err)
 	}
 
 	message := map[string]any{"role": ifEmpty(role, "assistant"), "content": content}

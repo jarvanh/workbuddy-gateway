@@ -98,15 +98,24 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[#%d] POST /v1/responses -> Upstream [Model: %s, Stream: %v]", reqID, modelName, isStream)
 
-	resp, acc, prof, ok := upstreamChat(w, r, reqID, modelName, upstreamBytes, startTime)
-	if !ok {
+	if isStream {
+		resp, acc, prof, ok := upstreamChat(w, r, reqID, modelName, upstreamBytes, startTime)
+		if !ok {
+			return
+		}
+		streamResponsesResponse(w, r, resp, modelName, reqID, acc, prof, startTime)
 		return
 	}
-	if isStream {
-		streamResponsesResponse(w, r, resp, modelName, reqID, acc, prof, startTime)
-	} else {
-		writeResponsesAggregate(w, r, resp, modelName, reqID, acc, prof, startTime)
-	}
+	// 非流式：网关本地聚合上游 SSE 并转换为 Responses 对象。聚合期间若上游流
+	// 被网络中断（此时尚未向客户端写出任何字节），自动回退账号池重新请求。
+	handleNonStreamUpstream(w, r, reqID, modelName, upstreamBytes, startTime,
+		func(completionJSON []byte) ([]byte, map[string]any, error) {
+			out, err := chatCompletionToResponses(completionJSON, modelName)
+			if err != nil {
+				return nil, nil, err
+			}
+			return out, usageFromCompletion(completionJSON), nil
+		})
 }
 
 // responsesToChatRequest 将 Responses 请求体转换为上游 Chat Completions 请求体。
@@ -321,45 +330,6 @@ func convertResponsesToolChoice(tc any) any {
 		}
 	}
 	return nil
-}
-
-// writeResponsesAggregate 聚合上游 SSE 后转换为 Responses 非流式响应。
-func writeResponsesAggregate(w http.ResponseWriter, r *http.Request, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time) {
-	defer resp.Body.Close()
-	body := newTTFTReader(resp.Body, startTime)
-	completionJSON, err := aggregateCompletion(body, modelName)
-	if err != nil {
-		debugEvent(r, "error", "aggregate_response_failed", map[string]any{
-			"error_type": debugErrorType(err),
-			"error":      safeDebugError(err),
-		})
-		log.Printf("[#%d] 聚合响应失败: %v", reqID, err)
-		writeOpenAIError(w, http.StatusInternalServerError, "aggregate_error", "聚合上游流式响应失败: "+err.Error())
-		return
-	}
-	usage := usageFromCompletion(completionJSON)
-	observeModelCredit(acc, modelName, usage, reqID)
-	recordModelTokens(modelName, usage, reqID)
-	recordModelTTFT(modelName, body.duration())
-	recordModelLatency(modelName, time.Since(startTime))
-	out, err := chatCompletionToResponses(completionJSON, modelName)
-	if err != nil {
-		debugEvent(r, "error", "response_translation_failed", map[string]any{
-			"error_type": debugErrorType(err),
-			"error":      safeDebugError(err),
-		})
-		log.Printf("[#%d] Responses 转换失败: %v", reqID, err)
-		writeOpenAIError(w, http.StatusInternalServerError, "translate_error", "转换 Responses 响应失败: "+err.Error())
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(out)
-	debugEvent(r, "info", "aggregate_response_completed", map[string]any{
-		"status_code":    http.StatusOK,
-		"response_bytes": len(out),
-	})
-	log.Printf("[#%d] Responses 非流式响应完成 (账号 %s [%s], 耗时 %v)", reqID, acc.Path, prof.Label, time.Since(startTime))
 }
 
 // chatCompletionToResponses 将 chat.completion JSON 转换为 Responses 响应对象。

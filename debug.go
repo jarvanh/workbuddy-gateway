@@ -33,6 +33,10 @@ type runtimeFileConfig struct {
 		HeaderTimeoutSeconds int `json:"headerTimeoutSeconds"`
 		// IdleTimeoutSeconds：流式响应体的空闲读超时（持续有数据则不超时）。
 		IdleTimeoutSeconds int `json:"idleTimeoutSeconds"`
+		// NetworkRetries：单个账号网络层失败（EOF、连接复用失效等）的原地重试次数，
+		// 默认 3；显式设为 0 表示关闭原地重试（网络错误直接回退账号池下一个账号）。
+		// 使用指针以区分「省略（用默认值）」与「显式 0（关闭）」。
+		NetworkRetries *int `json:"networkRetries"`
 	} `json:"upstream"`
 	// Models 段可选，用于按模型名做黑白名单控制（大小写不敏感）。
 	Models struct {
@@ -99,11 +103,17 @@ func loadRuntimeConfig(path string) error {
 	// 上游超时覆盖：仅当配置为正数时生效，否则保持内置默认值。
 	upstreamHeaderTimeout = upstreamHeaderTimeoutDefault
 	upstreamIdleTimeout = upstreamIdleTimeoutDefault
+	// 网络重试次数覆盖：省略时恢复默认值，显式配置（含 0）生效。
+	upstreamNetworkRetries = upstreamNetworkRetriesDefault
+	upstreamNetworkRetryDelay = upstreamNetworkRetryDelayDefault
 	if secs := fileCfg.Upstream.HeaderTimeoutSeconds; secs > 0 {
 		upstreamHeaderTimeout = time.Duration(secs) * time.Second
 	}
 	if secs := fileCfg.Upstream.IdleTimeoutSeconds; secs > 0 {
 		upstreamIdleTimeout = time.Duration(secs) * time.Second
+	}
+	if fileCfg.Upstream.NetworkRetries != nil && *fileCfg.Upstream.NetworkRetries >= 0 {
+		upstreamNetworkRetries = *fileCfg.Upstream.NetworkRetries
 	}
 	return nil
 }

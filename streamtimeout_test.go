@@ -175,14 +175,16 @@ func TestLargeSlowUpstreamHeaderIsNotKilled(t *testing.T) {
 func TestRuntimeConfigOverridesUpstreamTimeouts(t *testing.T) {
 	oldHeader := upstreamHeaderTimeout
 	oldIdle := upstreamIdleTimeout
+	oldRetries := upstreamNetworkRetries
 	defer func() {
 		upstreamHeaderTimeout = oldHeader
 		upstreamIdleTimeout = oldIdle
+		upstreamNetworkRetries = oldRetries
 	}()
 
 	dir := t.TempDir()
 	path := dir + "/config.json"
-	if err := os.WriteFile(path, []byte(`{"upstream":{"headerTimeoutSeconds":420,"idleTimeoutSeconds":75}}`), 0600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"upstream":{"headerTimeoutSeconds":420,"idleTimeoutSeconds":75,"networkRetries":3}}`), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if err := loadRuntimeConfig(path); err != nil {
@@ -193,6 +195,20 @@ func TestRuntimeConfigOverridesUpstreamTimeouts(t *testing.T) {
 	}
 	if upstreamIdleTimeout != 75*time.Second {
 		t.Fatalf("idle timeout override failed: %v", upstreamIdleTimeout)
+	}
+	if upstreamNetworkRetries != 3 {
+		t.Fatalf("network retries override failed: %d", upstreamNetworkRetries)
+	}
+
+	// 显式 networkRetries=0 表示关闭原地重试（与省略字段含义不同）
+	if err := os.WriteFile(path, []byte(`{"upstream":{"networkRetries":0}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := loadRuntimeConfig(path); err != nil {
+		t.Fatal(err)
+	}
+	if upstreamNetworkRetries != 0 {
+		t.Fatalf("networkRetries=0 应关闭原地重试: %d", upstreamNetworkRetries)
 	}
 
 	// 省略 upstream 段时应回到默认值
@@ -205,6 +221,9 @@ func TestRuntimeConfigOverridesUpstreamTimeouts(t *testing.T) {
 	if upstreamHeaderTimeout != upstreamHeaderTimeoutDefault || upstreamIdleTimeout != upstreamIdleTimeoutDefault {
 		t.Fatalf("omitted upstream section must restore defaults: header=%v idle=%v",
 			upstreamHeaderTimeout, upstreamIdleTimeout)
+	}
+	if upstreamNetworkRetries != upstreamNetworkRetriesDefault {
+		t.Fatalf("omitted upstream section must restore default retries: %d", upstreamNetworkRetries)
 	}
 }
 func TestInterruptedChatStreamDoesNotSendDone(t *testing.T) {
