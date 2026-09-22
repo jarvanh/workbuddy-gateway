@@ -617,7 +617,7 @@ llm-pi-ai:
 
 ### Windows
 
-1. 从 [Releases](https://github.com/CangShui/workbuddy-gateway/releases) 下载 `workbuddy-gateway-windows-amd64.exe`。
+1. 从 [Releases](https://github.com/jarvanh/workbuddy-gateway/releases) 下载 `workbuddy-gateway-windows-amd64.exe`。
 2. 在 PowerShell / CMD 中进入文件所在目录：
 
    ```powershell
@@ -631,11 +631,11 @@ llm-pi-ai:
 
 ```bash
 # x86_64
-wget https://github.com/CangShui/workbuddy-gateway/releases/latest/download/workbuddy-gateway-linux-amd64
+wget https://github.com/jarvanh/workbuddy-gateway/releases/latest/download/workbuddy-gateway-linux-amd64
 sudo install -m 755 workbuddy-gateway-linux-amd64 /usr/local/bin/workbuddy-gateway
 
 # ARM64
-wget https://github.com/CangShui/workbuddy-gateway/releases/latest/download/workbuddy-gateway-linux-arm64
+wget https://github.com/jarvanh/workbuddy-gateway/releases/latest/download/workbuddy-gateway-linux-arm64
 sudo install -m 755 workbuddy-gateway-linux-arm64 /usr/local/bin/workbuddy-gateway
 
 workbuddy-gateway login
@@ -753,7 +753,7 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 831
 需要 Go 1.20+：
 
 ```bash
-git clone https://github.com/CangShui/workbuddy-gateway.git
+git clone https://github.com/jarvanh/workbuddy-gateway.git
 cd workbuddy-gateway
 
 go vet ./...
@@ -766,6 +766,8 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o workbuddy-gateway .
 GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/workbuddy-gateway-linux-amd64 .
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/workbuddy-gateway-windows-amd64.exe .
 ```
+
+> **自动发布**：推送 `v*` 标签（如 `v1.13.1`）即触发 GitHub Actions（`.github/workflows/release.yml`）自动运行 `go vet` + `go test`、交叉编译全部 5 个平台产物（版本号取自标签名，通过 `-ldflags -X main.version=` 注入）、生成 SHA-256 校验文件并创建 GitHub Release。
 
 ---
 

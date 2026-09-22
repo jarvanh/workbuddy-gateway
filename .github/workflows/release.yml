@@ -1,0 +1,64 @@
+# 自动发布：推送 v* 标签后自动跑测试、交叉编译全平台产物并创建 GitHub Release。
+# 版本号取自标签名（去掉 v 前缀），通过 -ldflags 注入 main.version。
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Vet & test
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: Build all platforms
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          targets=(
+            "windows amd64 .exe"
+            "linux amd64 "
+            "linux arm64 "
+            "darwin amd64 "
+            "darwin arm64 "
+          )
+          for t in "${targets[@]}"; do
+            set -- $t
+            goos="$1"; goarch="$2"; ext="$3"
+            name="workbuddy-gateway-${goos}-${goarch}${ext}"
+            echo "==> Building ${name}"
+            CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
+              go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+              -o "dist/${name}" .
+          done
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum workbuddy-gateway-* > checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/workbuddy-gateway-*
+            dist/checksums.txt
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

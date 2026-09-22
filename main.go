@@ -31,9 +31,11 @@ import (
 	"github.com/skip2/go-qrcode"
 )
 
-const (
-	version = "1.13.0"
+// version 是网关版本号：默认取开发值，发布流水线会通过
+// -ldflags "-X main.version=<tag>" 注入 tag 版本（因此必须是 var 而非 const）。
+var version = "1.13.1"
 
+const (
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
 	logDir             = "logs"
