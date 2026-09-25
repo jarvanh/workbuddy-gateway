@@ -6,6 +6,72 @@
     "blocklist": [],
     "allowlist": []
   },
+  "routing": {
+    "tz": "Asia/Shanghai",
+    "defaultPolicy": "allow",
+    "accountOrder": "expiringFirst",
+    "minBalanceGuard": 10,
+    "maxPrice": 0.06,
+    "priceAnchor": {
+      "model": "glm-5.3-flash",
+      "site": "cn",
+      "multiplier": 0.06
+    },
+    "rules": [
+      {
+        "models": [
+          "hy4-preview-f"
+        ],
+        "sites": [
+          {
+            "site": "intl"
+          },
+          {
+            "site": "cn"
+          }
+        ]
+      },
+      {
+        "models": [
+          "hy4-preview"
+        ],
+        "sites": [
+          {
+            "site": "intl"
+          },
+          {
+            "site": "cn",
+            "window": {
+              "start": "23:00",
+              "end": "08:00"
+            },
+            "outside": "reject",
+            "fallbackBudget": {
+              "credits": 1
+            },
+            "active": {
+              "from": "2026-09-11",
+              "until": "2026-10-11"
+            },
+            "onExpire": "reject"
+          }
+        ]
+      },
+      {
+        "models": [
+          "glm-5.3-flash"
+        ],
+        "sites": [
+          {
+            "site": "intl"
+          },
+          {
+            "site": "cn"
+          }
+        ]
+      }
+    ]
+  },
   "checkin": {
     "cn": {
       "enabled": true,

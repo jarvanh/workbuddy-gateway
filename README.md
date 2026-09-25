@@ -28,6 +28,7 @@
 - [version / help](#version--help)
 - [多账号池](#多账号池)
 - [模型列表与倍率](#模型列表与倍率)
+- [站点路由](#站点路由)
 - [客户端接入](#客户端接入)
 - [各平台部署](#各平台部署)
 - [安全提示](#安全提示)
@@ -568,6 +569,82 @@ workbuddy-gateway serve -auth-dir ./auths
 仅探测被实际请求过、或接口明确需要确认的模型，避免无谓消耗额度。
 
 `/v1/models` 响应头 `X-Model-Source` 与 `/health` 的 `model_source` 会标注目录来源。
+
+---
+
+## 站点路由
+
+v1.14+ 提供「价格驱动的站点路由」：在调度前判定**该模型允许走哪些站点、是否允许在免费时段外花钱**，付费模型不再依赖黑白名单一刀切。
+
+### 核心机制
+
+- **站点五态**：`ALLOWED`（无限制）/ `IN_WINDOW`（免费时段内）/ `BUDGETED`（时段外但当日预算未耗尽）/ `FORBIDDEN`（超价 / 区间外拒绝 / 预算耗尽）。全部站点 `FORBIDDEN` 时入口直接 403（零额度消耗）。
+- **价格上限 `maxPrice`**（默认 0.06）：有效倍率超过阈值即拒绝——0.29x 等高价模型自动封死，无需逐个加黑名单。
+- **保底余额 `minBalanceGuard`**（默认 10）：账号余额低于阈值时只调度免费模型，防止账号被烧到 0。
+- **破例预算 `fallbackBudget.credits`**（默认 1）：时段外默认拒绝；配置后允许破例，按**实际 credit** 逐日累计，超限熔断（免费请求 credit=0 不计数）。
+- **冲突优先级**：`minBalanceGuard` > `fallbackBudget`——保底拦截时请求未发出，零扣费，不消耗预算。
+- **账号顺序 `accountOrder: expiringFirst`**：授权（凭据）快到期的账号优先消耗。
+- **cheapest-first**：多站可选时按有效倍率升序。
+
+### 价格来源优先级
+
+`catalog`（官方倍率，促销有效时才可信）> `ledger`（真实请求大样本 credit/tokens）> `probe`（探测小样本，仅作 free/paid 存在性判断）。
+
+> 探测用最小请求（max_tokens:300），其单价会把真实消耗高估约 14 倍，因此**不用于比价与预算**；比价以真实消耗大样本为准。目录外模型经 `priceAnchor`（默认 glm-5.3-flash@cn=0.06x）换算到同一倍率标尺。
+
+### 配置示例
+
+```json
+{
+  "routing": {
+    "tz": "Asia/Shanghai",
+    "defaultPolicy": "allow",
+    "accountOrder": "expiringFirst",
+    "minBalanceGuard": 10,
+    "maxPrice": 0.06,
+    "priceAnchor": { "model": "glm-5.3-flash", "site": "cn", "multiplier": 0.06 },
+    "rules": [
+      { "models": ["hy4-preview-f"],
+        "sites": [ { "site": "intl" }, { "site": "cn" } ] },
+      { "models": ["hy4-preview"],
+        "sites": [
+          { "site": "intl" },
+          { "site": "cn",
+            "window": { "start": "23:00", "end": "08:00" },
+            "outside": "reject",
+            "fallbackBudget": { "credits": 1 },
+            "active": { "from": "2026-09-11", "until": "2026-10-11" },
+            "onExpire": "reject" } ] },
+      { "models": ["glm-5.3-flash"],
+        "sites": [ { "site": "intl" }, { "site": "cn" } ] }
+    ]
+  }
+}
+```
+
+### 字段说明
+
+| 字段 | 说明 |
+|---|---|
+| `tz` | 时区，默认 `Asia/Shanghai`（无 tzdata 环境回落 UTC+8） |
+| `defaultPolicy` | 未匹配规则的模型：`allow`（默认，兼容现状）/ `reject` |
+| `accountOrder` | 账号排序：`expiringFirst`（默认，授权快到期优先）/ 留空保持轮询原序 |
+| `minBalanceGuard` | 保底余额（credit），低于它不调度付费模型；0 关闭 |
+| `maxPrice` | 价格上限（有效倍率），超过即拒绝 |
+| `priceAnchor` | 倍率校准锚点：已知倍率的模型 + 其站点 |
+| `rules[].models` | 匹配的模型名（大小写不敏感） |
+| `rules[].sites[].window` | 每日免费时段（HH:MM，支持跨午夜如 23:00-08:00） |
+| `rules[].sites[].outside` | 时段外策略：`reject`（默认）/ `prefer`（放行但降权） |
+| `rules[].sites[].fallbackBudget` | 时段外破例的每日 credit 上限 |
+| `rules[].sites[].active` | 生效日期区间，`until` 为排他日期（该日 00:00 起失效） |
+| `rules[].sites[].onExpire` | 区间外行为：`reject`（默认）/ `warn` / `allow` |
+
+### 运行行为
+
+- 全站 `FORBIDDEN` → 入口 403 `model_routing_blocked`，零额度消耗；
+- `FORBIDDEN` 站点在账号选择的所有轮次（含失败回退换号）中均被排除；
+- 被全禁的模型不再出现在 `/v1/models`；
+- 启动横幅展示：规则数 / maxPrice / 保底余额 / 账号序。
 
 ---
 
