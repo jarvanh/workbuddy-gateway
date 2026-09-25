@@ -51,6 +51,10 @@ type routingSiteRule struct {
 type routingRule struct {
 	Models []string          `json:"models"`
 	Sites  []routingSiteRule `json:"sites"`
+	// MaxPrice 为该规则的模型级价格上限；nil 表示沿用全局 maxPrice。
+	// 用指针以区分「省略（用全局）」与「显式 0（该规则禁止一切付费模型）」，
+	// 与 debug.go 中 NetworkRetries *int 的既有约定一致。
+	MaxPrice *float64 `json:"maxPrice"`
 }
 
 type routingAnchor struct {
@@ -140,6 +144,11 @@ func routingLocation(cfg routingConfig) *time.Location {
 type sitePriceSample struct {
 	Credit float64
 	Tokens int64
+	// LastCredit 记录最近一次真实请求的扣费。
+	// 免费/收费判定必须看「最近一次」而非累积：限时免费模型在免费期内
+	// 累积 Credit 仍可能 >0，用累积会把当期免费的模型误判为收费。
+	// 累积 Credit/Tokens 只用于数值定价（大样本校准），不做 free/paid 判定。
+	LastCredit float64
 }
 
 var (
@@ -163,6 +172,7 @@ func recordSitePriceSample(site, model string, tokens int64, credit float64) {
 	}
 	s.Tokens += tokens
 	s.Credit += credit
+	s.LastCredit = credit
 	sitePriceMu.Unlock()
 }
 
@@ -187,6 +197,17 @@ const (
 	pricePaidUnk                        // 付费但数值不可信（仅 probe 存在性判断）
 )
 
+// lastCreditFor 返回该站点该模型最近一次真实请求的扣费（无样本返回 -1）。
+func lastCreditFor(site, model string) float64 {
+	sitePriceMu.Lock()
+	s := sitePriceSamples[site+"|"+normalizeModelName(model)]
+	sitePriceMu.Unlock()
+	if s == nil {
+		return -1
+	}
+	return s.LastCredit
+}
+
 // classifyPrice 返回价格结论与可信度。
 // 口径（决策 17）：catalog（促销有效）> 站点级 ledger 校准 > probe 存在性。
 // 校准要求锚点与目标同源（同为站点级 ledger）；混源比率会被小样本偏差污染（约 14 倍）。
@@ -200,8 +221,8 @@ func classifyPrice(site, model string) (float64, priceConfidence) {
 	}
 	// 2) 站点级 ledger
 	if rate, ok := siteCreditRate(site, model); ok {
-		if rate <= 0 {
-			return 0, priceFree
+		if lastCreditFor(site, model) <= 0 {
+			return 0, priceFree // 最近一次免费 → 当前按免费处理
 		}
 		anchor := routingSnapshot().PriceAnchor
 		if anchor != nil && anchor.Multiplier > 0 {
@@ -295,7 +316,13 @@ func resetRoutingSpend() {
 }
 
 // evaluateSite 判定单个站点在给定时刻的状态。
+// evaluateSite 判定单个站点在给定时刻的状态，价格上限取全局。
 func evaluateSite(r routingSiteRule, model string, now time.Time, loc *time.Location, cfg routingConfig) siteState {
+	return evaluateSiteWithLimit(r, model, now, loc, cfg, cfg.MaxPrice)
+}
+
+// evaluateSiteWithLimit 同 evaluateSite，但允许覆盖价格上限（按规则覆盖时用）。
+func evaluateSiteWithLimit(r routingSiteRule, model string, now time.Time, loc *time.Location, cfg routingConfig, maxPrice float64) siteState {
 	// 1) 生效区间
 	if r.Active != nil {
 		var from, until time.Time
@@ -346,7 +373,7 @@ func evaluateSite(r routingSiteRule, model string, now time.Time, loc *time.Loca
 		}
 	}
 	// 3) 价格闸（无窗口或窗口外）：超过上限即禁止
-	if mult := effectiveMultiplier(r.Site, model); mult > cfg.MaxPrice {
+	if mult := effectiveMultiplier(r.Site, model); mult > maxPrice {
 		return siteForbidden
 	}
 	if !hasWindow {
@@ -388,17 +415,24 @@ func routingRejection(model string, now time.Time) (bool, map[string]siteState) 
 		}
 	}
 	if rule == nil {
-		// 未匹配任何规则：由 defaultPolicy 决定
+		// 未匹配任何规则：先看 defaultPolicy，再过「幽灵模型护栏」
 		if cfg.DefaultPolicy == "reject" {
+			return true, nil
+		}
+		if ghostPaidBlocked(model, cfg) {
 			return true, nil
 		}
 		return false, nil
 	}
 
+	limit := cfg.MaxPrice
+	if rule.MaxPrice != nil {
+		limit = *rule.MaxPrice
+	}
 	states := make(map[string]siteState, len(rule.Sites))
 	freeExists := false
 	for _, s := range rule.Sites {
-		st := evaluateSite(s, model, now, loc, cfg)
+		st := evaluateSiteWithLimit(s, model, now, loc, cfg, limit)
 		states[s.Site] = st
 		if st.isFreeNow() {
 			freeExists = true
@@ -434,6 +468,39 @@ func routingRejectionWithReason(model string, now time.Time) (bool, string) {
 // -----------------------------------------------------------------------------
 // 账号维度：快过期优先 + 保底余额
 // -----------------------------------------------------------------------------
+
+// ghostPaidBlocked 判断「未匹配任何 routing 规则」的模型是否应被价格闸拒绝。
+// 这是 ja 事故同源风险的护栏：当年 glm-5.3-flash 正是目录外幽灵模型、
+// 无规则、裸奔被真实计费烧光。探测是事后的（先有请求才探），挡不住第一次，
+// 因此只能靠「价格明确超上限就拒绝」来堵。
+//
+// 关键约束（保守，且绝不能阻断学习闭环）：
+//   - 只在「价格明确已知(pricePaidNum)且超上限」时拒绝；
+//   - 价格未知(priceUnknown)、或付费但无法定标(pricePaidUnk)一律放行。
+//     理由：拒绝会阻断请求 → 再也拿不到新的 credit 证据 → 模型被永久
+//     锁死在 paid，连「恢复免费」都无法再观测（死锁式误杀）。
+//   - 任一站点确认免费、或任一站点价格可接受 → 放行。
+func ghostPaidBlocked(model string, cfg routingConfig) bool {
+	anyFreeOrOK := false
+	anyOver := false
+	for _, site := range []string{"cn", "intl"} {
+		mult, conf := classifyPrice(site, model)
+		switch conf {
+		case priceFree:
+			anyFreeOrOK = true
+		case pricePaidNum:
+			if mult <= cfg.MaxPrice {
+				anyFreeOrOK = true
+			} else {
+				anyOver = true
+			}
+		}
+	}
+	if anyFreeOrOK {
+		return false
+	}
+	return anyOver
+}
 
 // authExpiresAt 返回账号授权到期时间戳；未知/失效排到最后。
 func authExpiresAt(acc *Account) int64 {

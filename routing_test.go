@@ -346,3 +346,118 @@ func TestOutsidePreferAllowsAfterPriceGate(t *testing.T) {
 		t.Fatalf("outside=prefer 且价格达标应放行，实际=%v", got)
 	}
 }
+
+// resetSitePriceSamples 清理站点级价格样本，避免用例互相污染（账本是全局 map）。
+func resetSitePriceSamples() {
+	sitePriceMu.Lock()
+	sitePriceSamples = map[string]*sitePriceSample{}
+	sitePriceMu.Unlock()
+}
+
+func TestGhostPaidBlocksExpensiveModel(t *testing.T) {
+	// 幽灵模型护栏：未匹配任何规则的高价模型（cn 0.79x）应被拒绝
+	catalogModels = map[string][]catalogModel{
+		"cn": {{ID: "ghost-expensive", HasMultiplier: true, Multiplier: 0.79, FromLive: true}},
+	}
+	defer func() { catalogModels = map[string][]catalogModel{} }()
+	resetSitePriceSamples()
+
+	cfg := defaultRoutingConfig() // maxPrice 0.06
+	cfg.Rules = nil               // 未匹配任何规则
+	setTestRouting(t, cfg)
+
+	blocked, _ := routingRejection("ghost-expensive", time.Now())
+	if !blocked {
+		t.Fatal("未匹配规则的高价模型应被幽灵护栏拒绝（ja 事故同源风险）")
+	}
+}
+
+func TestGhostPaidAllowsFreeModel(t *testing.T) {
+	catalogModels = map[string][]catalogModel{}
+	defer func() { catalogModels = map[string][]catalogModel{} }()
+	resetSitePriceSamples()
+
+	cfg := defaultRoutingConfig()
+	cfg.Rules = nil
+	setTestRouting(t, cfg)
+
+	recordSitePriceSample("cn", "ghost-free", 1000, 0) // 真实请求确认免费
+
+	if blocked, _ := routingRejection("ghost-free", time.Now()); blocked {
+		t.Fatal("确认免费模型（无规则）不应被护栏拒绝")
+	}
+}
+
+func TestGhostPaidAllowsUnknownModel(t *testing.T) {
+	catalogModels = map[string][]catalogModel{}
+	defer func() { catalogModels = map[string][]catalogModel{} }()
+	resetSitePriceSamples()
+	delete(modelProbes, probeKey("cn", "ghost-unknown"))
+	delete(modelProbes, probeKey("intl", "ghost-unknown"))
+
+	cfg := defaultRoutingConfig()
+	cfg.Rules = nil
+	setTestRouting(t, cfg)
+
+	if blocked, _ := routingRejection("ghost-unknown", time.Now()); blocked {
+		t.Fatal("完全未知价格模型应放行（不因猜测误杀）")
+	}
+}
+
+func TestRuleMaxPriceOverridesGlobal(t *testing.T) {
+	catalogModels = map[string][]catalogModel{
+		"cn": {{ID: "m-rule-price", HasMultiplier: true, Multiplier: 0.29, FromLive: true}},
+	}
+	defer func() { catalogModels = map[string][]catalogModel{} }()
+	resetSitePriceSamples()
+
+	cfg := defaultRoutingConfig()
+	cfg.Rules = []routingRule{{
+		Models: []string{"m-rule-price"},
+		Sites:  []routingSiteRule{{Site: "cn"}},
+	}}
+	setTestRouting(t, cfg)
+
+	// 未覆盖 → 按全局 0.06 封死 0.29x
+	if blocked, _ := routingRejection("m-rule-price", time.Now()); !blocked {
+		t.Fatal("未覆盖时应按全局 0.06 封死 0.29x")
+	}
+	// 规则级 0.5 → 放行 0.29x
+	limit := 0.5
+	cfg.Rules[0].MaxPrice = &limit
+	setTestRouting(t, cfg)
+	if blocked, _ := routingRejection("m-rule-price", time.Now()); blocked {
+		t.Fatal("规则级 maxPrice=0.5 应放行 0.29x")
+	}
+	// 显式 0（区别于省略）→ 禁止一切付费模型
+	zero := 0.0
+	cfg.Rules[0].MaxPrice = &zero
+	setTestRouting(t, cfg)
+	if blocked, _ := routingRejection("m-rule-price", time.Now()); !blocked {
+		t.Fatal("规则级 maxPrice=0 应禁止付费模型")
+	}
+}
+
+func TestGhostGuardHonorsTimeLimitedFree(t *testing.T) {
+	// 限时免费语义 + 不阻断学习闭环：
+	// 付费期明确超价 → 拒绝；回到免费期 → 必须放行（累积 credit 不得误杀）
+	catalogModels = map[string][]catalogModel{}
+	defer func() { catalogModels = map[string][]catalogModel{} }()
+	resetSitePriceSamples()
+
+	cfg := defaultRoutingConfig()
+	cfg.Rules = nil
+	setTestRouting(t, cfg)
+
+	// 注入锚点，使模型可被数值定标（否则付费但无法定标本就该放行）
+	recordSitePriceSample("cn", "glm-5.3-flash", 1000000, 6) // 6e-6/token = 0.06x
+	recordSitePriceSample("cn", "limited-free", 1000000, 20) // 校准 ≈ 0.2x > 0.06
+	if !ghostPaidBlocked("limited-free", cfg) {
+		t.Fatal("明确超价的未匹配模型应被护栏拒绝")
+	}
+	// 回到限时免费期（最近一次 credit=0）→ 放行，且请求不被阻断
+	recordSitePriceSample("cn", "limited-free", 1000000, 0)
+	if ghostPaidBlocked("limited-free", cfg) {
+		t.Fatal("限时免费期内护栏应放行（累积 credit 不得误判，不得阻断学习闭环）")
+	}
+}
