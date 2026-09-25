@@ -1741,6 +1741,7 @@ func observeModelCredit(acc *Account, model string, usage map[string]any, reqID 
 	quotaExhausted := acc.QuotaExhausted
 	path := acc.Path
 	accountMu.Unlock()
+	recordModelCredit(model, credit)
 	recordModelCostClass(model, acc.Profile().Key, credit <= 0)
 
 	if credit <= 0 {

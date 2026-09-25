@@ -34,7 +34,8 @@ type modelStat struct {
 	Requests      int64
 	Success       int64
 	Failed        int64
-	Tokens        int64 // 上游 usage 累计的 total_tokens（无 usage 的请求不计入）
+	Tokens        int64   // 上游 usage 累计的 total_tokens（无 usage 的请求不计入）
+	Credit        float64 // 上游 usage 累计的 credit（真实大样本，供 v6 价格校准）
 	LastRequestAt time.Time
 	LastStatus    string
 	// 最近 statsWindow 内按小时分桶的延迟样本（自动淘汰过期桶）。
@@ -499,4 +500,25 @@ func modelRequestCount(model string) int64 {
 		return stat.Requests
 	}
 	return 0
+}
+
+// recordModelCredit 把一次响应的上游 usage credit 累加到该模型。
+// 与 recordModelTokens 配对使用，形成「credit/token」真实大样本单价（v6 决策 17）。
+func recordModelCredit(model string, credit float64) {
+	modelStatsMu.Lock()
+	stat := modelStatLocked(model)
+	stat.Credit += credit
+	modelStatsMu.Unlock()
+}
+
+// modelCreditRate 返回该模型累计的「每 token 消耗 credit」。
+// 仅在有 token 样本时返回 true；credit 为 0 表示该模型实测免费（rate=0）。
+func modelCreditRate(model string) (float64, bool) {
+	modelStatsMu.Lock()
+	defer modelStatsMu.Unlock()
+	stat := modelStats[normalizeModelName(model)]
+	if stat == nil || stat.Tokens <= 0 {
+		return 0, false
+	}
+	return stat.Credit / float64(stat.Tokens), true
 }
