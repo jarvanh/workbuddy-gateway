@@ -226,7 +226,7 @@ func probeAccountModel(ctx context.Context, acc *Account, model string) probeRes
 			}
 			markModelCooldown(acc, model, until, errStr)
 			result.Status = "rate_limited"
-			result.Detail = "模型级限流至 " + until.Format("2006-01-02 15:04:05")
+			result.Detail = "模型级限流至 " + formatDisplayTime(until)
 		case isAuthFailure(resp.StatusCode, errStr):
 			result.Status = "auth_failed"
 			result.Detail = "授权失效（未自动禁用，请重新登录）：" + truncate(errStr, 120)

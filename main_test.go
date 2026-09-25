@@ -244,6 +244,44 @@ func TestNextAccountAllCooldown(t *testing.T) {
 	t.Logf("all-cooldown error: %v", err)
 }
 
+// 验证「最早恢复」始终按 UTC+8 渲染，即使进程 Local 时区被固化成 UTC。
+// 回归背景：2026-09-24 runner 重启后网关先于 /etc/localtime 设置启动，
+// 报错里的恢复时间（真实为 21:25:28 UTC+8）被显示成 13:25:28（UTC）。
+func TestEarliestRecoveryRenderedUTC8(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	defer func() { time.Local = oldLocal }()
+
+	loc8 := time.FixedZone("UTC+8", 8*60*60)
+	now8 := time.Now().In(loc8)
+	until := time.Date(now8.Year(), now8.Month(), now8.Day(), 21, 25, 28, 0, loc8).Add(24 * time.Hour) // 明天 21:25:28 UTC+8，确保在未来
+	wantDate := until.In(loc8).Format("2006-01-02") + " 21:25:28"
+
+	accountMu.Lock()
+	oldAccounts := accounts
+	oldRR := rrIndex
+	accounts = []*Account{{Path: "a.json", Auth: &StoredAuth{}, CooldownUntil: until}}
+	rrIndex = 0
+	accountMu.Unlock()
+	defer func() {
+		accountMu.Lock()
+		accounts = oldAccounts
+		rrIndex = oldRR
+		accountMu.Unlock()
+	}()
+
+	_, _, err := nextAccountForModel("m", nil)
+	if err == nil {
+		t.Fatal("expected error when all accounts cooling")
+	}
+	if !strings.Contains(err.Error(), "最早恢复="+wantDate) {
+		t.Fatalf("recovery time must render UTC+8 (%s), got: %s", wantDate, err.Error())
+	}
+	if strings.Contains(err.Error(), "13:25:28") {
+		t.Fatalf("recovery time must not render UTC: %s", err.Error())
+	}
+}
+
 // 验证冷却到期后自动恢复
 func TestNextAccountCooldownExpiry(t *testing.T) {
 	accountMu.Lock()

@@ -857,6 +857,16 @@ func timeFromUnix(value int64) time.Time {
 	return time.Unix(value, 0)
 }
 
+// displayLoc 用户可见时间的统一展示时区（北京时间，与上游 6004 限流报价的 UTC+8 一致）。
+// 宿主机 /etc/localtime 就绪时机不可控（进程先于 localtime 启动时 time.Local 固化为 UTC，
+// 且进程存活期间不会刷新），展示层一律经 displayLoc 转换，避免恢复/过期时间被显示成 UTC。
+var displayLoc = time.FixedZone("UTC+8", 8*60*60)
+
+// formatDisplayTime 以固定 UTC+8 渲染用户可见时间。
+func formatDisplayTime(t time.Time) string {
+	return t.In(displayLoc).Format("2006-01-02 15:04:05")
+}
+
 func unixOrZero(value time.Time) int64 {
 	if value.IsZero() {
 		return 0
@@ -1121,7 +1131,7 @@ func nextAccountForModel(model string, attempted map[*Account]bool) (*Account, a
 	}
 	msg := fmt.Sprintf("当前模型 %s 暂无可用账号：授权失效=%d，账号冷却=%d，模型冷却=%d，额度阻断=%d，等待探测=%d", model, disabled, accountCooling, modelCooling, quotaBlocked, probeWaiting)
 	if !earliest.IsZero() {
-		msg += "，最早恢复=" + earliest.Format("2006-01-02 15:04:05")
+		msg += "，最早恢复=" + formatDisplayTime(earliest)
 	}
 	return nil, "", fmt.Errorf("%s", msg)
 }
@@ -1138,7 +1148,7 @@ func markCooldown(acc *Account, until time.Time, msg string) {
 	acc.CooldownMsg = msg
 	accountMu.Unlock()
 	log.Printf("[Cooldown] 账号 %s 触发频率限制，自动屏蔽至 %s (提示: %s)",
-		acc.Path, until.Format("2006-01-02 15:04:05"), msg)
+		acc.Path, formatDisplayTime(until), msg)
 }
 
 func markModelCooldown(acc *Account, model string, until time.Time, msg string) {
@@ -1147,7 +1157,7 @@ func markModelCooldown(acc *Account, model string, until time.Time, msg string) 
 	state.CooldownUntil = until
 	state.LastReason = msg
 	accountMu.Unlock()
-	log.Printf("[ModelCooldown] 账号 %s 模型 %s 触发模型级频率限制，仅屏蔽该模型至 %s；其他模型仍可调度", acc.Path, model, until.Format("2006-01-02 15:04:05"))
+	log.Printf("[ModelCooldown] 账号 %s 模型 %s 触发模型级频率限制，仅屏蔽该模型至 %s；其他模型仍可调度", acc.Path, model, formatDisplayTime(until))
 	writeStatusSnapshot()
 }
 
@@ -1416,7 +1426,7 @@ func ensureValidTokenFor(acc *Account) error {
 	}
 	now := time.Now()
 	if now.Unix() > expiresAt-900 {
-		log.Printf("[Auth] 账号 %s Token 需要续期，当前过期时间=%s，刷新阈值=过期前15分钟，开始调用上游刷新接口", acc.Path, time.Unix(expiresAt, 0).Format("2006-01-02 15:04:05"))
+		log.Printf("[Auth] 账号 %s Token 需要续期，当前过期时间=%s，刷新阈值=过期前15分钟，开始调用上游刷新接口", acc.Path, formatDisplayTime(time.Unix(expiresAt, 0)))
 		if err := doRefreshTokenFor(acc); err != nil {
 			accountMu.Lock()
 			isDisabled := acc.Disabled
@@ -1437,7 +1447,7 @@ func ensureValidToken() error {
 	}
 	// 如果距过期不足 15 分钟，则自动刷新
 	if time.Now().Unix() > sa.Auth.ExpiresAt-900 {
-		log.Printf("[Auth] 访问令牌即将或已经过期 (ExpiresAt=%s)，正在自动刷新...", time.Unix(sa.Auth.ExpiresAt, 0).Format("2006-01-02 15:04:05"))
+		log.Printf("[Auth] 访问令牌即将或已经过期 (ExpiresAt=%s)，正在自动刷新...", formatDisplayTime(time.Unix(sa.Auth.ExpiresAt, 0)))
 		return doRefreshToken(sa)
 	}
 	return nil
@@ -1453,7 +1463,7 @@ func doRefreshToken(sa *StoredAuth) error {
 	if err := saveAuth(sa); err != nil {
 		return fmt.Errorf("写回凭据失败: %w", err)
 	}
-	log.Printf("[Auth] Token 刷新成功！新过期时间: %s", time.Unix(sa.Auth.ExpiresAt, 0).Format("2006-01-02 15:04:05"))
+	log.Printf("[Auth] Token 刷新成功！新过期时间: %s", formatDisplayTime(time.Unix(sa.Auth.ExpiresAt, 0)))
 	return nil
 }
 
@@ -1478,7 +1488,7 @@ func doRefreshTokenFor(acc *Account) error {
 	oldExpiresAt := refreshed.Auth.ExpiresAt
 	accountMu.Unlock()
 
-	log.Printf("[Auth] 账号 %s 开始刷新 Token，站点=%s，刷新前过期时间=%s", path, profileForEdition(refreshed.Edition).Label, time.Unix(oldExpiresAt, 0).Format("2006-01-02 15:04:05"))
+	log.Printf("[Auth] 账号 %s 开始刷新 Token，站点=%s，刷新前过期时间=%s", path, profileForEdition(refreshed.Edition).Label, formatDisplayTime(time.Unix(oldExpiresAt, 0)))
 	status, err := refreshTokenPayload(&refreshed)
 	if err != nil {
 		log.Printf("[Auth] 账号 %s Token 刷新失败，HTTP=%d，原因=%v，旧凭据未覆盖", path, status, err)
@@ -1508,7 +1518,7 @@ func doRefreshTokenFor(acc *Account) error {
 		acc.fingerprint = fingerprint
 	}
 	accountMu.Unlock()
-	log.Printf("[Auth] 账号 %s Token 刷新成功，过期时间由 %s 更新为 %s，凭据已安全写回", path, time.Unix(oldExpiresAt, 0).Format("2006-01-02 15:04:05"), time.Unix(refreshed.Auth.ExpiresAt, 0).Format("2006-01-02 15:04:05"))
+	log.Printf("[Auth] 账号 %s Token 刷新成功，过期时间由 %s 更新为 %s，凭据已安全写回", path, formatDisplayTime(time.Unix(oldExpiresAt, 0)), formatDisplayTime(time.Unix(refreshed.Auth.ExpiresAt, 0)))
 	writeStatusSnapshot()
 	return nil
 }
@@ -2031,7 +2041,7 @@ func backgroundDailyCheckin() {
 	go checkinAllAccounts(context.Background())
 	for {
 		next := nextDailyCheckin(time.Now())
-		log.Printf("[Checkin] 下一次定时签到时间=%s", next.Format("2006-01-02 15:04:05 MST"))
+		log.Printf("[Checkin] 下一次定时签到时间=%s", next.In(displayLoc).Format("2006-01-02 15:04:05 MST"))
 		timer := time.NewTimer(time.Until(next))
 		select {
 		case <-timer.C:
@@ -2099,14 +2109,14 @@ func formatAccountStatus(acc *Account, idx int, now time.Time) string {
 	}
 	if acc.CooldownUntil.After(now) {
 		sb.WriteString(fmt.Sprintf("冷却状态:     冷却中 (解封: %s, 剩余 %v)\n",
-			acc.CooldownUntil.Format("2006-01-02 15:04:05"),
+			formatDisplayTime(acc.CooldownUntil),
 			time.Until(acc.CooldownUntil).Round(time.Minute)))
 		sb.WriteString(fmt.Sprintf("冷却原因:     %s\n", truncate(acc.CooldownMsg, 120)))
 	} else {
 		sb.WriteString("冷却状态:     可用\n")
 	}
 	sb.WriteString(fmt.Sprintf("Token 状态:   %s\n", statusStr))
-	sb.WriteString(fmt.Sprintf("过期时间:     %s (剩余 %v)\n", expTime.Format("2006-01-02 15:04:05"), remaining.Round(time.Minute)))
+	sb.WriteString(fmt.Sprintf("过期时间:     %s (剩余 %v)\n", formatDisplayTime(expTime), remaining.Round(time.Minute)))
 	return sb.String()
 }
 
@@ -2369,7 +2379,7 @@ func renderAccountTable(accs []accountSnapshot) string {
 			plan = ifEmpty(a.PlanLabel, "免费")
 		}
 		if a.TokenExpiresAt > 0 {
-			expires = time.Unix(a.TokenExpiresAt, 0).Format("2006-01-02 15:04:05")
+			expires = formatDisplayTime(time.Unix(a.TokenExpiresAt, 0))
 		}
 		switch a.State {
 		case "cooldown":
@@ -2505,7 +2515,7 @@ func runMonitor() {
 		} else {
 			fmt.Println()
 		}
-		fmt.Printf("更新时间: %s\n", time.Now().Format("2006-01-02 15:04:05"))
+		fmt.Printf("更新时间: %s\n", formatDisplayTime(time.Now()))
 
 		data, err := os.ReadFile(statusSnapshotFile)
 		if err != nil {
@@ -2667,7 +2677,7 @@ func runLogin() {
 			fmt.Printf("站点:         %s (%s)\n", prof.Label, strings.TrimPrefix(prof.Base, "https://"))
 			fmt.Printf("欢迎，%s (UID: %s)\n", sa.Account.Nickname, sa.Account.UID)
 			fmt.Printf("凭据已成功保存至: %s\n", cfg.AuthFile)
-			fmt.Printf("令牌有效期至: %s\n", time.Unix(sa.Auth.ExpiresAt, 0).Format("2006-01-02 15:04:05"))
+			fmt.Printf("令牌有效期至: %s\n", formatDisplayTime(time.Unix(sa.Auth.ExpiresAt, 0)))
 			fmt.Println("\n现在您可以运行以下命令启动网关服务：")
 			fmt.Println("  workbuddy-gateway serve")
 			return
