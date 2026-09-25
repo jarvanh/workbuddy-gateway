@@ -1780,6 +1780,9 @@ func observeModelCredit(acc *Account, model string, usage map[string]any, reqID 
 	path := acc.Path
 	accountMu.Unlock()
 	recordModelCredit(model, credit)
+	if n, ok := usageTotalTokens(usage); ok {
+		recordSitePriceSample(acc.Profile().Key, model, n, credit)
+	}
 	consumeBudget(acc.Profile().Key, model, credit, time.Now())
 	recordModelCostClass(model, acc.Profile().Key, credit <= 0)
 

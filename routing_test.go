@@ -255,39 +255,57 @@ func TestSortSitesByPricePrefersCheapest(t *testing.T) {
 	}
 }
 
-func TestLedgerLargeSamplePreferredForUnitPrice(t *testing.T) {
-	// 决策 17：ledger（真实大样本）优先于 probe（小样本，单价高估约 14 倍）
-	// 真实大样本：ja 事故实测 10.74 credit / 4,663,000 tokens ≈ 2.3e-6 credit/token
-	recordModelCredit("m-ledger", 10.74)
-	modelStatsMu.Lock()
-	if st := modelStats[normalizeModelName("m-ledger")]; st != nil {
-		st.Tokens = 4663000
-	}
-	modelStatsMu.Unlock()
+func TestSiteLedgerCalibration(t *testing.T) {
+	// 站点级 ledger + 同源锚点校准：cn 锚点 0.06，intl 实测为 cn 的 1/6 → intl ≈ 0.01
+	catalogModels = map[string][]catalogModel{}
+	defer func() { catalogModels = map[string][]catalogModel{} }()
 
-	r, ok := modelCreditRate("m-ledger")
-	if !ok {
-		t.Fatal("ledger 大样本应可读出单价")
-	}
-	if r <= 0 || r >= 1e-5 {
-		t.Fatalf("ledger 单价应在大样本量级（~2.3e-6 credit/token），实际=%v", r)
-	}
+	cfg := defaultRoutingConfig() // anchor: glm-5.3-flash@cn = 0.06
+	setTestRouting(t, cfg)
+	loc := routingLocation(cfg)
 
-	// probe 小样本：302 tokens / 0.01 credit ≈ 3.31e-5（约为 ledger 的 14 倍）
-	// 同一模型同时有 ledger 与 probe 数据时，measuredRate 必须取 ledger
-	modelProbes[probeKey("cn", "m-both")] = modelPriceProbe{Verdict: "paid", Credit: 0.01, Tokens: 302}
-	defer delete(modelProbes, probeKey("cn", "m-both"))
+	recordSitePriceSample("cn", "glm-5.3-flash", 1000000, 6)   // 6e-6 credit/token
+	recordSitePriceSample("intl", "glm-5.3-flash", 1000000, 1) // 1e-6 credit/token
 
-	recordModelCredit("m-both", 10.74)
-	modelStatsMu.Lock()
-	if st := modelStats[normalizeModelName("m-both")]; st != nil {
-		st.Tokens = 4663000
+	if got := effectiveMultiplier("intl", "glm-5.3-flash"); got < 0.01-1e-9 || got > 0.01+1e-9 {
+		t.Fatalf("intl 校准应得 0.01，实际=%v", got)
 	}
-	modelStatsMu.Unlock()
+	if got := effectiveMultiplier("cn", "glm-5.3-flash"); got < 0.06-1e-9 || got > 0.06+1e-9 {
+		t.Fatalf("cn 自校准应得 0.06，实际=%v", got)
+	}
+	// probe-only 付费模型：不参与数值定价（决策 17），价格闸不得封禁
+	modelProbes[probeKey("intl", "hy4-preview")] = modelPriceProbe{Verdict: "paid", Credit: 0.05, Tokens: 385}
+	defer delete(modelProbes, probeKey("intl", "hy4-preview"))
+	if got := effectiveMultiplier("intl", "hy4-preview"); got != 0 {
+		t.Fatalf("probe-only 付费模型数值应为 0（未知），实际=%v", got)
+	}
+	rule := routingSiteRule{Site: "intl"}
+	if got := evaluateSite(rule, "hy4-preview", time.Now(), loc, cfg); got != siteAllowed {
+		t.Fatalf("probe-only 付费模型不应被价格闸封禁，实际=%v", got)
+	}
+}
 
-	gotRate, _ := measuredRate("cn", "m-both")
-	if gotRate >= 1e-5 {
-		t.Fatalf("应优先采用 ledger 大样本单价（~2.3e-6），而非 probe 小样本（~3.3e-5），实际=%v", gotRate)
+func TestProbePaidUnknownGuarded(t *testing.T) {
+	catalogModels = map[string][]catalogModel{}
+	defer func() { catalogModels = map[string][]catalogModel{} }()
+	cfg := defaultRoutingConfig()
+	setTestRouting(t, cfg)
+
+	modelProbes[probeKey("intl", "m-ghost")] = modelPriceProbe{Verdict: "paid", Credit: 0.05, Tokens: 385}
+	defer delete(modelProbes, probeKey("intl", "m-ghost"))
+
+	// 付费未知：数值不封禁，但受保底余额约束（防 ja 式烧穿）
+	low := &Account{Auth: &StoredAuth{Edition: "intl"}, QuotaKnown: true, QuotaRemaining: 8}
+	if guardMinBalance(low, "m-ghost") {
+		t.Fatal("probe-paid 未知价模型应受保底余额约束")
+	}
+	rich := &Account{Auth: &StoredAuth{Edition: "intl"}, QuotaKnown: true, QuotaRemaining: 50}
+	if !guardMinBalance(rich, "m-ghost") {
+		t.Fatal("余额充足应放行")
+	}
+	// 完全未知（无任何数据）：放行，避免误杀潜在免费模型
+	if !guardMinBalance(low, "m-never-seen") {
+		t.Fatal("完全未知价格应放行")
 	}
 }
 

@@ -133,39 +133,102 @@ func routingLocation(cfg routingConfig) *time.Location {
 // 价格解析：catalog > ledger > probe，并经 priceAnchor 校准
 // -----------------------------------------------------------------------------
 
-// measuredRate 返回实测「每 token 消耗 credit」。ledger 真实大样本优先，probe 小样本兜底。
-func measuredRate(site, model string) (float64, bool) {
-	if r, ok := modelCreditRate(model); ok {
-		return r, true
+// -----------------------------------------------------------------------------
+// 站点级价格样本：按 站点×模型 累计真实消耗（ledger 大样本）
+// -----------------------------------------------------------------------------
+
+type sitePriceSample struct {
+	Credit float64
+	Tokens int64
+}
+
+var (
+	sitePriceMu      sync.Mutex
+	sitePriceSamples = map[string]*sitePriceSample{} // key: site|model
+)
+
+// recordSitePriceSample 累加一次真实请求的 (tokens, credit) 样本。
+// 仅由 observeModelCredit（真实业务流量）调用；探测小样本不进入此处。
+// credit=0 的免费样本同样入账——这正是「免费模型」结论的数据来源。
+func recordSitePriceSample(site, model string, tokens int64, credit float64) {
+	if site == "" || tokens <= 0 {
+		return
 	}
-	if p, ok := modelProbes[probeKey(site, model)]; ok && p.Tokens > 0 {
-		return p.Credit / float64(p.Tokens), true
+	key := site + "|" + normalizeModelName(model)
+	sitePriceMu.Lock()
+	s := sitePriceSamples[key]
+	if s == nil {
+		s = &sitePriceSample{}
+		sitePriceSamples[key] = s
 	}
-	return 0, false
+	s.Tokens += tokens
+	s.Credit += credit
+	sitePriceMu.Unlock()
+}
+
+// siteCreditRate 返回该站点该模型的实测「每 token 消耗 credit」。
+func siteCreditRate(site, model string) (float64, bool) {
+	sitePriceMu.Lock()
+	s := sitePriceSamples[site+"|"+normalizeModelName(model)]
+	sitePriceMu.Unlock()
+	if s == nil || s.Tokens <= 0 {
+		return 0, false
+	}
+	return s.Credit / float64(s.Tokens), true
+}
+
+// priceConfidence 价格结论可信度。
+type priceConfidence int
+
+const (
+	priceUnknown priceConfidence = iota // 无任何数据
+	priceFree                           // 确认免费
+	pricePaidNum                        // 付费且数值可信（catalog / 同源 ledger 校准）
+	pricePaidUnk                        // 付费但数值不可信（仅 probe 存在性判断）
+)
+
+// classifyPrice 返回价格结论与可信度。
+// 口径（决策 17）：catalog（促销有效）> 站点级 ledger 校准 > probe 存在性。
+// 校准要求锚点与目标同源（同为站点级 ledger）；混源比率会被小样本偏差污染（约 14 倍）。
+func classifyPrice(site, model string) (float64, priceConfidence) {
+	// 1) 官方倍率：仅在促销有效时可信
+	if e, ok := modelEntry(site, model); ok && e.HasMultiplier && !e.PromoExpired {
+		if e.Multiplier <= 0 {
+			return 0, priceFree
+		}
+		return e.Multiplier, pricePaidNum
+	}
+	// 2) 站点级 ledger
+	if rate, ok := siteCreditRate(site, model); ok {
+		if rate <= 0 {
+			return 0, priceFree
+		}
+		anchor := routingSnapshot().PriceAnchor
+		if anchor != nil && anchor.Multiplier > 0 {
+			if anchorRate, ok := siteCreditRate(anchor.Site, anchor.Model); ok && anchorRate > 0 {
+				return anchor.Multiplier * (rate / anchorRate), pricePaidNum
+			}
+		}
+		return 0, pricePaidUnk // 付费但无法定标
+	}
+	// 3) probe 存在性判断（不参与数值）
+	switch modelProbeVerdict(site, model) {
+	case "free":
+		return 0, priceFree
+	case "paid":
+		return 0, pricePaidUnk
+	}
+	return 0, priceUnknown
 }
 
 // effectiveMultiplier 返回该站点该模型的「有效倍率」，用于价格闸与 cheapest-first。
-// 返回值 0 表示免费或未知（不因猜测而拒绝；保底与预算另行兜底）。
+// 仅 pricePaidNum 返回数值；免费/未知/付费未知一律返回 0（不因猜测而拒绝）。
 func effectiveMultiplier(site, model string) float64 {
-	cfg := routingSnapshot()
-	// 1) 官方倍率：仅在促销有效时可信
-	if e, ok := modelEntry(site, model); ok && e.HasMultiplier && !e.PromoExpired {
-		return e.Multiplier
+	mult, conf := classifyPrice(site, model)
+	if conf == pricePaidNum {
+		return mult
 	}
-	// 2) 实测校准
-	rate, ok := measuredRate(site, model)
-	if !ok || rate <= 0 {
-		return 0
-	}
-	anchor := cfg.PriceAnchor
-	if anchor == nil || anchor.Multiplier <= 0 {
-		return 0
-	}
-	anchorRate, ok := measuredRate(anchor.Site, anchor.Model)
-	if !ok || anchorRate <= 0 {
-		return 0
-	}
-	return anchor.Multiplier * (rate / anchorRate)
+	return 0
 }
 
 // sortSitesByPrice 按有效倍率升序（cheapest-first）。
@@ -415,7 +478,8 @@ func guardMinBalance(acc *Account, model string) bool {
 	if cfg.MinBalanceGuard <= 0 || acc == nil {
 		return true
 	}
-	if effectiveMultiplier(accountSite(acc), model) <= 0 {
+	_, conf := classifyPrice(accountSite(acc), model)
+	if conf == priceFree || conf == priceUnknown {
 		return true
 	}
 	if !acc.QuotaKnown {
