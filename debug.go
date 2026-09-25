@@ -45,6 +45,8 @@ type runtimeFileConfig struct {
 		// Allowlist：白名单；非空时只允许列表内的模型，其余一律拒绝。
 		Allowlist []string `json:"allowlist"`
 	} `json:"models"`
+	// Routing 段可选：v6 价格驱动路由（站点五态/价格闸/保底/预算）。缺失字段回落默认值。
+	Routing routingConfig `json:"routing"`
 	// Checkin 段可选，控制每日签到与 Buddy 旅行自动化。
 	// 省略字段用默认值（全部开启），显式 false 关闭。
 	Checkin struct {
@@ -113,6 +115,9 @@ func loadRuntimeConfig(path string) error {
 
 	// 模型黑白名单：先清空再按配置重建，避免热加载时残留旧规则。
 	setModelFilter(fileCfg.Models.Blocklist, fileCfg.Models.Allowlist)
+
+	// v6 站点路由：装载后缺失字段回落默认值（defaultPolicy=allow，未配置规则时兼容现状）。
+	setRouting(fileCfg.Routing)
 
 	// 上游超时覆盖：仅当配置为正数时生效，否则保持内置默认值。
 	upstreamHeaderTimeout = upstreamHeaderTimeoutDefault

@@ -14,7 +14,9 @@ package main
 //     被保底拦截时请求根本没发出，零扣费，故不消耗 fallbackBudget。
 
 import (
+	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -336,6 +338,23 @@ func routingRejection(model string, now time.Time) (bool, map[string]siteState) 
 	}
 	_ = freeExists
 	return true, states
+}
+
+// routingRejectionWithReason 返回 (blocked, 人类可读原因)，供入口 403 使用。
+func routingRejectionWithReason(model string, now time.Time) (bool, string) {
+	blocked, states := routingRejection(model, now)
+	if !blocked {
+		return false, ""
+	}
+	if states == nil {
+		return true, "模型未匹配任何 routing 规则，且 defaultPolicy=reject"
+	}
+	parts := make([]string, 0, len(states))
+	for site, st := range states {
+		parts = append(parts, fmt.Sprintf("%s=%s", site, st))
+	}
+	sort.Strings(parts)
+	return true, "模型在所有允许站点均不可调度: " + strings.Join(parts, ", ")
 }
 
 // -----------------------------------------------------------------------------

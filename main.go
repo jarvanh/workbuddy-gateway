@@ -1053,6 +1053,12 @@ func nextAccountForModel(model string, attempted map[*Account]bool) (*Account, a
 	// 站点优先级必须在加锁前计算：preferredFreeSites 会读取账号账本并自行获取 accountMu，
 	// 若在持锁期间调用会自锁。语义：该模型「一个站点免费、另一个站点收费」时优先用免费站点，
 	// 直到该站点账号全部不可用；其余情况不搞优先，正常轮询。
+	// v6：站点五态在选号前计算（不持 accountMu，避免锁序问题）。
+	// 回退换号会重新进入本函数，FORBIDDEN 因此穿透所有 pick 轮（含代偿轮）。
+	blocked, routingStates := routingRejection(model, time.Now())
+	if routingStates == nil {
+		routingStates = map[string]siteState{}
+	}
 	preferred := preferredFreeSites(model)
 
 	accountMu.Lock()
@@ -1074,8 +1080,16 @@ func nextAccountForModel(model string, attempted map[*Account]bool) (*Account, a
 				if siteFilter != nil && !siteFilter(accSiteLocked(acc)) {
 					continue
 				}
+				// v6：FORBIDDEN 站点穿透所有轮（含兜底）
+				if st := routingStates[accSiteLocked(acc)]; st == siteForbidden {
+					continue
+				}
 				kind, ok := usableForModelLocked(acc, model, now)
 				if !ok || kind != wanted {
+					continue
+				}
+				// v6：保底余额（账号安全闸，优先于预算破例；拦截即零消耗不扣预算）
+				if !guardMinBalance(acc, model) {
 					continue
 				}
 				if kind == selectionProbeExhausted {
@@ -1088,13 +1102,33 @@ func nextAccountForModel(model string, attempted map[*Account]bool) (*Account, a
 		return nil, "", false
 	}
 
+	freeNow := func(site string) bool {
+		if blocked {
+			return false
+		}
+		st, ok := routingStates[site]
+		return !ok || st.isFreeNow()
+	}
+	budgetedSite := func(site string) bool {
+		if blocked {
+			return false
+		}
+		st, ok := routingStates[site]
+		return ok && st == siteBudgeted
+	}
+	// 轮1：免费站优先 ∩ FREE_NOW（现有语义保留）
 	if len(preferred) > 0 {
-		if acc, kind, ok := pick(func(site string) bool { return preferred[site] }); ok {
+		if acc, kind, ok := pick(func(site string) bool { return preferred[site] && freeNow(site) }); ok {
 			return acc, kind, nil
 		}
 		log.Printf("[FreeSite] 模型 %s 的免费站点账号当前均不可用，回退到其余站点代偿", model)
 	}
-	if acc, kind, ok := pick(nil); ok {
+	// 轮2：其余 FREE_NOW 站点（v6：取代原 pick(nil) 全池兜底，FORBIDDEN 已在 pick 内穿透）
+	if acc, kind, ok := pick(freeNow); ok {
+		return acc, kind, nil
+	}
+	// 轮3：BUDGETED 破例（按实际 credit 累计，见 observeModelCredit 的 consumeBudget）
+	if acc, kind, ok := pick(budgetedSite); ok {
 		return acc, kind, nil
 	}
 
@@ -1742,6 +1776,7 @@ func observeModelCredit(acc *Account, model string, usage map[string]any, reqID 
 	path := acc.Path
 	accountMu.Unlock()
 	recordModelCredit(model, credit)
+	consumeBudget(acc.Profile().Key, model, credit, time.Now())
 	recordModelCostClass(model, acc.Profile().Key, credit <= 0)
 
 	if credit <= 0 {
@@ -2781,6 +2816,13 @@ func runServe() {
 	} else {
 		fmt.Printf("   模型黑白名单:  未启用 (%s 中 models 段可配置)\n", runtimeConfigFile)
 	}
+	if rc := routingSnapshot(); len(rc.Rules) > 0 {
+		fmt.Printf("   站点路由:     已启用 (规则 %d 条 / maxPrice %.2f / 保底余额 %.0f / 账号序 %s)\n",
+			len(rc.Rules), rc.MaxPrice, rc.MinBalanceGuard, rc.AccountOrder)
+	} else {
+		fmt.Printf("   站点路由:     未配置规则 (defaultPolicy=%s / maxPrice %.2f / 保底余额 %.0f 仍然生效)\n",
+			rc.DefaultPolicy, rc.MaxPrice, rc.MinBalanceGuard)
+	}
 
 	// 启动时展示所有账号状态（与 status 命令一致）
 	accountMu.Lock()
@@ -3298,6 +3340,14 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// v6 站点路由拦截：全站 FORBIDDEN（超价/区间外拒绝/预算耗尽）时入口拒绝，零额度消耗。
+	if rBlocked, rReason := routingRejectionWithReason(modelName, time.Now()); rBlocked {
+		log.Printf("[请求被拒绝] traceId=%s requestId=%d 拦截层=站点路由 模型=%s 结果=拒绝 返回状态码=403 业务影响=请求未进入上游调用",
+			w.Header().Get("X-Trace-ID"), reqID, modelName)
+		writeOpenAIError(w, http.StatusForbidden, "model_routing_blocked", rReason)
+		return
+	}
+
 	// 腾讯上游强制要求 stream 必须为 true，非流式会被拦截 (code 11101)
 	reqObj["stream"] = true
 
@@ -3494,6 +3544,10 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 	modelIDs, source := mergedModelIDs()
 	modelsList := make([]map[string]any, 0, len(modelIDs))
 	for _, id := range modelIDs {
+		// v6：被站点路由全禁的模型不出现在 /v1/models
+		if rBlocked, _ := routingRejection(id, time.Now()); rBlocked {
+			continue
+		}
 		modelsList = append(modelsList, map[string]any{
 			"id": id, "object": "model", "owned_by": "workbuddy", "permission": []any{},
 		})

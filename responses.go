@@ -77,6 +77,14 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// v6 站点路由拦截：全站 FORBIDDEN 时入口拒绝，零额度消耗。
+	if rBlocked, rReason := routingRejectionWithReason(modelName, time.Now()); rBlocked {
+		log.Printf("[请求被拒绝] traceId=%s requestId=%d 拦截层=站点路由 模型=%s 结果=拒绝 返回状态码=403 业务影响=请求未进入上游调用",
+			w.Header().Get("X-Trace-ID"), reqID, modelName)
+		writeOpenAIError(w, http.StatusForbidden, "model_routing_blocked", rReason)
+		return
+	}
+
 	chatReq, err := responsesToChatRequest(respReq, modelName)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
