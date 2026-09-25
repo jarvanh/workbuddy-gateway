@@ -290,3 +290,41 @@ func TestLedgerLargeSamplePreferredForUnitPrice(t *testing.T) {
 		t.Fatalf("应优先采用 ledger 大样本单价（~2.3e-6），而非 probe 小样本（~3.3e-5），实际=%v", gotRate)
 	}
 }
+
+func TestInWindowBypassesPriceGate(t *testing.T) {
+	// 修订场景：目录价 0.29x 的模型，窗口期是政策免费时段，应放行而非被价格闸封死
+	cfg := defaultRoutingConfig()
+	cfg.MaxPrice = 0.06
+	setTestRouting(t, cfg)
+	loc := routingLocation(cfg)
+
+	catalogModels = map[string][]catalogModel{
+		"cn": {{ID: "m-night", HasMultiplier: true, Multiplier: 0.29, FromLive: true}},
+	}
+	defer func() { catalogModels = map[string][]catalogModel{} }()
+
+	rule := routingSiteRule{Site: "cn", Window: &routingWindow{Start: "23:00", End: "08:00"}}
+	if got := evaluateSite(rule, "m-night", time.Date(2026, 9, 25, 23, 30, 0, 0, loc), loc, cfg); got != siteInWindow {
+		t.Fatalf("窗口内应视为免费期放行（不受 0.29x 价格闸影响），实际=%v", got)
+	}
+	if got := evaluateSite(rule, "m-night", time.Date(2026, 9, 25, 12, 0, 0, 0, loc), loc, cfg); got != siteForbidden {
+		t.Fatalf("窗口外 0.29x 应被价格闸封死，实际=%v", got)
+	}
+}
+
+func TestOutsidePreferAllowsAfterPriceGate(t *testing.T) {
+	cfg := defaultRoutingConfig()
+	cfg.MaxPrice = 0.06
+	setTestRouting(t, cfg)
+	loc := routingLocation(cfg)
+
+	catalogModels = map[string][]catalogModel{
+		"cn": {{ID: "m-pref", HasMultiplier: true, Multiplier: 0.05, FromLive: true}},
+	}
+	defer func() { catalogModels = map[string][]catalogModel{} }()
+
+	rule := routingSiteRule{Site: "cn", Window: &routingWindow{Start: "23:00", End: "08:00"}, Outside: "prefer"}
+	if got := evaluateSite(rule, "m-pref", time.Date(2026, 9, 25, 12, 0, 0, 0, loc), loc, cfg); got != siteAllowed {
+		t.Fatalf("outside=prefer 且价格达标应放行，实际=%v", got)
+	}
+}

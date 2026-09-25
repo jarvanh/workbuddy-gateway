@@ -1069,11 +1069,15 @@ func nextAccountForModel(model string, attempted map[*Account]bool) (*Account, a
 	}
 	now := time.Now()
 
+	// v6：按账号序策略排列候选（expiringFirst：授权快到期优先消耗）。
+	// orderedAccounts 是 accounts 的稳定排序副本，长度一致，rrIndex 语义不变。
+	orderedAccounts := sortedAccounts(accounts)
+
 	pick := func(siteFilter func(string) bool) (*Account, accountSelectionKind, bool) {
 		for _, wanted := range []accountSelectionKind{selectionFreeExhausted, selectionNormal, selectionProbeExhausted} {
-			for i := 0; i < len(accounts); i++ {
-				idx := (rrIndex + i) % len(accounts)
-				acc := accounts[idx]
+			for i := 0; i < len(orderedAccounts); i++ {
+				idx := (rrIndex + i) % len(orderedAccounts)
+				acc := orderedAccounts[idx]
 				if attempted != nil && attempted[acc] {
 					continue
 				}

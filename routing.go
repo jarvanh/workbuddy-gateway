@@ -233,11 +233,7 @@ func resetRoutingSpend() {
 
 // evaluateSite 判定单个站点在给定时刻的状态。
 func evaluateSite(r routingSiteRule, model string, now time.Time, loc *time.Location, cfg routingConfig) siteState {
-	// 1) 价格闸：任何状态下，超过价格上限即禁止
-	if mult := effectiveMultiplier(r.Site, model); mult > cfg.MaxPrice {
-		return siteForbidden
-	}
-	// 2) 生效区间
+	// 1) 生效区间
 	if r.Active != nil {
 		var from, until time.Time
 		if r.Active.From != "" {
@@ -261,28 +257,43 @@ func evaluateSite(r routingSiteRule, model string, now time.Time, loc *time.Loca
 			return siteExpired
 		}
 	}
-	// 3) 时段窗口
-	if r.Window == nil {
-		return siteAllowed
-	}
-	startMin, ok1 := parseClock(r.Window.Start)
-	endMin, ok2 := parseClock(r.Window.End)
-	if !ok1 || !ok2 {
-		return siteAllowed
-	}
-	lt := now.In(loc)
-	cur := lt.Hour()*60 + lt.Minute()
+	// 2) 时段窗口：窗口内视为该站免费期（政策表达），直接放行、不受价格闸影响。
+	//    窗口必须先于价格闸：如 hy4-preview cn 夜间免费而目录价仍标 0.29x，
+	//    价格闸先行会把免费窗口一并封死（以方案 §九 运行推演为准）。
 	inWindow := false
-	if startMin > endMin {
-		// 跨午夜，如 23:00-08:00
-		inWindow = cur >= startMin || cur < endMin
-	} else {
-		inWindow = cur >= startMin && cur < endMin
+	hasWindow := false
+	if r.Window != nil {
+		startMin, ok1 := parseClock(r.Window.Start)
+		endMin, ok2 := parseClock(r.Window.End)
+		if !ok1 || !ok2 {
+			// 窗口配置不合法：视为无限制
+			return siteAllowed
+		}
+		hasWindow = true
+		lt := now.In(loc)
+		cur := lt.Hour()*60 + lt.Minute()
+		if startMin > endMin {
+			// 跨午夜，如 23:00-08:00
+			inWindow = cur >= startMin || cur < endMin
+		} else {
+			inWindow = cur >= startMin && cur < endMin
+		}
+		if inWindow {
+			return siteInWindow
+		}
 	}
-	if inWindow {
-		return siteInWindow
+	// 3) 价格闸（无窗口或窗口外）：超过上限即禁止
+	if mult := effectiveMultiplier(r.Site, model); mult > cfg.MaxPrice {
+		return siteForbidden
 	}
-	// 4) 窗口外：走 fallbackBudget
+	if !hasWindow {
+		return siteAllowed
+	}
+	// 4) 窗口外：outside 策略 + fallbackBudget
+	if strings.EqualFold(strings.TrimSpace(r.Outside), "prefer") {
+		// 放行但降权：cheapest-first 按倍率排序，天然靠后
+		return siteAllowed
+	}
 	if r.FallbackBudget == nil || r.FallbackBudget.Credits <= 0 {
 		// 未配预算 → 默认拒绝（决策 3）
 		return siteForbidden
