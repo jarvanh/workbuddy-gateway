@@ -1035,6 +1035,9 @@ func TestWriteStatusSnapshotMarksExpiredToken(t *testing.T) {
 
 func TestRenderAccountTableUsesFullYearAndNoEmoji(t *testing.T) {
 	expires := time.Date(2027, 9, 5, 1, 36, 55, 0, time.Local)
+	// 表格渲染恒为北京时间（displayLoc）：期望值按时区无关方式推导，
+	// 不要把某个时区下的快照写死——否则 CI 跑在 UTC 时会与修复后的渲染串不符。
+	wantExpiry := expires.In(displayLoc).Format("2006-01-02 15:04:05")
 	table := renderAccountTable([]accountSnapshot{{
 		Path:           "workbuddy4.json",
 		Edition:        "intl",
@@ -1050,7 +1053,7 @@ func TestRenderAccountTableUsesFullYearAndNoEmoji(t *testing.T) {
 		FreeModels:     1,
 		ModelCooldowns: 2,
 	}})
-	for _, want := range []string{"凭据文件", "workbuddy4.json", "国际站", "付费耗尽", "2027-09-05 01:36:55", "总额度", "已用", "剩余", "套餐", "免费模型", "模型冷却", "1100", "免费"} {
+	for _, want := range []string{"凭据文件", "workbuddy4.json", "国际站", "付费耗尽", wantExpiry, "总额度", "已用", "剩余", "套餐", "免费模型", "模型冷却", "1100", "免费"} {
 		if !strings.Contains(table, want) {
 			t.Fatalf("table missing %q:\n%s", want, table)
 		}
