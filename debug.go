@@ -47,6 +47,8 @@ type runtimeFileConfig struct {
 	} `json:"models"`
 	// Routing 段可选：v6 价格驱动路由（站点五态/价格闸/保底/预算）。缺失字段回落默认值。
 	Routing routingConfig `json:"routing"`
+	// Notify 段可选：事件告警（冷却/模型冷却/无可用账号）。默认关闭，不影响现有行为。
+	Notify notifyConfig `json:"notify"`
 	// Checkin 段可选，控制每日签到与 Buddy 旅行自动化。
 	// 省略字段用默认值（全部开启），显式 false 关闭。
 	Checkin struct {
@@ -118,6 +120,9 @@ func loadRuntimeConfig(path string) error {
 
 	// v6 站点路由：装载后缺失字段回落默认值（defaultPolicy=allow，未配置规则时兼容现状）。
 	setRouting(fileCfg.Routing)
+
+	// 事件告警：默认关闭；配置见 config.example.json 的 notify 段。
+	setNotify(fileCfg.Notify)
 
 	// 上游超时覆盖：仅当配置为正数时生效，否则保持内置默认值。
 	upstreamHeaderTimeout = upstreamHeaderTimeoutDefault

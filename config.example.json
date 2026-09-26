@@ -94,5 +94,17 @@
     "intl": {
       "enabled": true
     }
+  },
+  "notify": {
+    "enabled": false,
+    "type": "telegram",
+    "minIntervalSeconds": 60,
+    "events": [
+      "cooldown",
+      "model_cooldown",
+      "no_account"
+    ],
+    "botTokenEnv": "TELEGRAM_BOT_TOKEN",
+    "chatIdEnv": "TELEGRAM_CHAT_ID"
   }
 }

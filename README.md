@@ -572,6 +572,34 @@ workbuddy-gateway serve -auth-dir ./auths
 
 ---
 
+## 事件告警（notify）
+
+网关内的**账号冷却 / 模型冷却 / 无可用账号（503）** 事件可即时推送到 Telegram 或任意 webhook（默认关闭，不影响现有行为）。
+
+```json
+{
+  "notify": {
+    "enabled": true,
+    "type": "telegram",
+    "minIntervalSeconds": 60,
+    "events": ["cooldown", "model_cooldown", "no_account"],
+    "botTokenEnv": "TELEGRAM_BOT_TOKEN",
+    "chatIdEnv": "TELEGRAM_CHAT_ID"
+  }
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `type` | `telegram`（调用 Bot API）/ `webhook`（POST JSON 到 `webhook` 字段的 URL） |
+| `botTokenEnv` / `chatIdEnv` | **推荐**：从环境变量读取凭据，避免 token 落盘；取不到时回落 `botToken` / `chatId` 明文字段 |
+| `minIntervalSeconds` | 同一事件 Key 的最小发送间隔（默认 60s），防止冷却风暴刷屏 |
+| `events` | 允许的事件类型；省略表示全部 |
+
+**设计约束**：全程异步（绝不阻塞调度）；发送失败只记日志；队列满丢弃。
+
+---
+
 ## 站点路由
 
 v1.14+ 提供「价格驱动的站点路由」：在调度前判定**该模型允许走哪些站点、是否允许在免费时段外花钱**，付费模型不再依赖黑白名单一刀切。

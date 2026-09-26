@@ -1171,6 +1171,13 @@ func nextAccountForModel(model string, attempted map[*Account]bool) (*Account, a
 	if !earliest.IsZero() {
 		msg += "，最早恢复=" + formatDisplayTime(earliest)
 	}
+	sendNotify(notifyEvent{
+		Kind:  notifyEventNoAccount,
+		Key:   "no_account|" + model,
+		Level: "error",
+		Title: "🚫 workbuddy 无可用账号（请求将被 503 拒绝）",
+		Body:  msg,
+	})
 	return nil, "", fmt.Errorf("%s", msg)
 }
 
@@ -1187,6 +1194,13 @@ func markCooldown(acc *Account, until time.Time, msg string) {
 	accountMu.Unlock()
 	log.Printf("[Cooldown] 账号 %s 触发频率限制，自动屏蔽至 %s (提示: %s)",
 		acc.Path, formatDisplayTime(until), msg)
+	sendNotify(notifyEvent{
+		Kind:  notifyEventCooldown,
+		Key:   "cooldown|" + acc.Path,
+		Level: "warn",
+		Title: "⚠️ workbuddy 账号冷却（频率限制）",
+		Body:  fmt.Sprintf("账号: %s\n屏蔽至: %s\n原因: %s", acc.Path, formatDisplayTime(until), truncate(msg, 200)),
+	})
 }
 
 func markModelCooldown(acc *Account, model string, until time.Time, msg string) {
@@ -1197,6 +1211,13 @@ func markModelCooldown(acc *Account, model string, until time.Time, msg string) 
 	accountMu.Unlock()
 	log.Printf("[ModelCooldown] 账号 %s 模型 %s 触发模型级频率限制，仅屏蔽该模型至 %s；其他模型仍可调度", acc.Path, model, formatDisplayTime(until))
 	writeStatusSnapshot()
+	sendNotify(notifyEvent{
+		Kind:  notifyEventModelCooldown,
+		Key:   "model_cooldown|" + acc.Path + "|" + model,
+		Level: "warn",
+		Title: "⚠️ workbuddy 模型冷却（仅该模型）",
+		Body:  fmt.Sprintf("账号: %s\n模型: %s\n屏蔽至: %s\n原因: %s", acc.Path, model, formatDisplayTime(until), truncate(msg, 200)),
+	})
 }
 
 // markModelQuotaBlocked 记录一次「账号额度耗尽」观测。
