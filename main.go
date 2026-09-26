@@ -11,8 +11,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"os/exec"
@@ -23,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -68,16 +71,150 @@ const (
 
 	// defaultRequestTimeout 用于令牌刷新、额度查询、模型目录等控制类短请求。
 	defaultRequestTimeout = 60 * time.Second
+
+	// upstreamTransientRetries 是「请求体发送阶段」遇到瞬时网络错误的额外重试次数。
+	//
+	// 背景：网关与上游 CDN 边缘节点之间的单条 TCP 连接可能被对端重置
+	// （connection reset by peer）、被关闭（use of closed network connection）、
+	// 或命中已被回收的 keep-alive 连接。这类错误属于瞬时故障，且与请求体大小无关
+	// （实测 >5MB 请求 95% 成功，而 0.5MB 请求也会偶发失败）。
+	//
+	// 只有确认请求头尚未写出时才重试；没有收到响应头不能证明上游没处理 POST。
+	// 重试强制使用新连接，默认最多额外尝试 2 次，可在 config.json 覆盖。
+	upstreamTransientRetriesDefault = 2
+
+	// upstreamRetryBackoff 是两次重试之间的等待，给上游边缘节点留出恢复时间。
+	upstreamRetryBackoffDefault = 300 * time.Millisecond
 )
+
+var errModelAccountPolicy = errors.New("model account policy rejected all accounts")
+
+// errStreamClosedWithoutFinish 表示上游连接正常读完（没有读错误），
+// 但整段流里从未出现非空 finish_reason。空串不算：上游会在每个中间分片上带 finish_reason:""。
+// 这种结束不能当成完整回复，否则下游会把残缺输出当成成功结果。
+var errStreamClosedWithoutFinish = errors.New("上游流正常结束，但没有 finish_reason，不能当成完整回复")
 
 // 生效的超时值（默认取上面的 Default，可由 config.json 的 upstream 段覆盖）。
 // 定义为变量既便于测试调小阈值，也便于运维按网络状况调整。
 var (
-	upstreamHeaderTimeout     = upstreamHeaderTimeoutDefault
-	upstreamIdleTimeout       = upstreamIdleTimeoutDefault
-	upstreamNetworkRetries    = upstreamNetworkRetriesDefault
-	upstreamNetworkRetryDelay = upstreamNetworkRetryDelayDefault
+	upstreamHeaderTimeout = upstreamHeaderTimeoutDefault
+	upstreamIdleTimeout   = upstreamIdleTimeoutDefault
+	// upstreamTransientRetries 为生效的瞬时网络错误重试次数。
+	upstreamTransientRetries = upstreamTransientRetriesDefault
+	// upstreamRetryBackoff 为生效的重试间隔（测试可调小）。
+	upstreamRetryBackoff = upstreamRetryBackoffDefault
 )
+
+// isTransientNetworkError 判断错误是否为「瞬时网络故障」，这类错误值得重试。
+//
+// 覆盖：连接被重置/中止（RST）、连接被对端关闭、管道破裂、连接被强制关闭，
+// 以及 Go 在复用 keep-alive 连接时常见的 "server closed idle connection"。
+// 注意：context.Canceled 与 DeadlineExceeded 不属于此类——前者是客户端主动断开，
+// 后者是明确超时，重试都无意义甚至有害。
+func isTransientNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// 客户端取消或超时：不重试
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		// 网络层超时（如 ResponseHeaderTimeout）说明上游确实没响应，可重试
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"connection reset by peer",
+		"connection reset",
+		"broken pipe",
+		"use of closed network connection",
+		"connection refused",
+		"server closed idle connection",
+		"unexpected eof",
+		"http2: server sent goaway",
+		"stream error",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// doUpstreamRequest 发送上游请求，并对瞬时网络错误做有界重试。
+//
+// 仅在「尚未写出完整请求头」时重试；已发送 POST 后收到 EOF 无法判定上游
+// 是否执行过生成，不能安全重放。每次重试都重建请求对象与请求体 reader。
+//
+// 返回的 cancel 用于在流式读取结束后取消上游 context（调用方负责）。
+func doUpstreamRequest(r *http.Request, acc *Account, prof *upstreamProfile, upstreamBytes []byte, reqID uint64, traceID string) (*http.Response, context.CancelFunc, error) {
+	var lastErr error
+	for try := 0; try <= upstreamTransientRetries; try++ {
+		upstreamCtx, upstreamCancel := context.WithCancel(r.Context())
+		var headersWritten, bodyWritten atomic.Bool
+		trace := &httptrace.ClientTrace{
+			WroteHeaders: func() { headersWritten.Store(true) },
+			WroteRequest: func(info httptrace.WroteRequestInfo) {
+				if info.Err == nil {
+					bodyWritten.Store(true)
+				}
+			},
+		}
+		req, err := http.NewRequestWithContext(httptrace.WithClientTrace(upstreamCtx, trace), http.MethodPost, prof.chatURL(), bytes.NewReader(upstreamBytes))
+		if err != nil {
+			upstreamCancel()
+			return nil, nil, err
+		}
+		backendHeaders(req, acc.Auth, prof)
+		if cfg.DebugEnabled {
+			req.Header.Set("X-Trace-ID", debugTraceID(r))
+			req.Header.Set("X-Parent-Request-ID", strconv.FormatUint(reqID, 10))
+		}
+		if try > 0 {
+			// 重试时不复用已被对端关闭的空闲连接。
+			req.Close = true
+			cfg.HttpClient.CloseIdleConnections()
+			log.Printf("[网络重试] traceId=%s requestId=%d 账号=%s 第 %d/%d 次重试，上一尝试请求头未写出，已重建连接（错误: %s）",
+				traceID, reqID, acc.Path, try, upstreamTransientRetries, safeDebugError(lastErr))
+		}
+
+		resp, err := cfg.HttpClient.Do(req)
+		if err == nil {
+			return resp, upstreamCancel, nil
+		}
+		upstreamCancel()
+		lastErr = err
+		if !isTransientNetworkError(err) {
+			return nil, nil, err
+		}
+		if headersWritten.Load() || bodyWritten.Load() {
+			log.Printf("[网络重试跳过] traceId=%s requestId=%d 账号=%s 请求头已写出=%t 请求体已写完=%t 原因=上游可能已处理POST，重放可能重复生成 错误=%s",
+				traceID, reqID, acc.Path, headersWritten.Load(), bodyWritten.Load(), safeDebugError(err))
+			debugEvent(r, "warn", "upstream_retry_skipped", map[string]any{
+				"reason": "request_may_have_reached_upstream", "headers_written": headersWritten.Load(),
+				"body_written": bodyWritten.Load(), "business_impact": "避免重复执行模型请求",
+			})
+			return nil, nil, err
+		}
+		if try < upstreamTransientRetries {
+			debugEvent(r, "warn", "upstream_send_retry", map[string]any{
+				"retry": try + 1, "reason": "request_headers_not_written",
+				"business_impact": "换新连接重试尚未发出的模型请求",
+			})
+			select {
+			case <-r.Context().Done():
+				return nil, nil, err
+			case <-time.After(upstreamRetryBackoff):
+			}
+		}
+	}
+	return nil, nil, lastErr
+}
 
 // -----------------------------------------------------------------------------
 // 上游站点 Profile（国内站 / 国际站）
@@ -1067,6 +1204,15 @@ func nextAccountForModel(model string, attempted map[*Account]bool) (*Account, a
 	if len(accounts) == 0 {
 		return nil, "", fmt.Errorf("账号池为空")
 	}
+	allowed := 0
+	for _, acc := range accounts {
+		if ok, _ := modelAccountAllowed(model, acc, accounts); ok {
+			allowed++
+		}
+	}
+	if allowed == 0 && modelAccountRuleConfigured(model) {
+		return nil, "", fmt.Errorf("%w: 模型 %s 没有符合账号黑白名单的凭据文件", errModelAccountPolicy, model)
+	}
 	now := time.Now()
 
 	// v6：按账号序策略排列候选（expiringFirst：授权快到期优先消耗）。
@@ -1079,6 +1225,9 @@ func nextAccountForModel(model string, attempted map[*Account]bool) (*Account, a
 				idx := (rrIndex + i) % len(orderedAccounts)
 				acc := orderedAccounts[idx]
 				if attempted != nil && attempted[acc] {
+					continue
+				}
+				if ok, _ := modelAccountAllowed(model, acc, accounts); !ok {
 					continue
 				}
 				if siteFilter != nil && !siteFilter(accSiteLocked(acc)) {
@@ -1136,9 +1285,13 @@ func nextAccountForModel(model string, attempted map[*Account]bool) (*Account, a
 		return acc, kind, nil
 	}
 
-	disabled, accountCooling, modelCooling, quotaBlocked, probeWaiting := 0, 0, 0, 0, 0
+	disabled, accountCooling, modelCooling, quotaBlocked, probeWaiting, policyBlocked := 0, 0, 0, 0, 0, 0
 	earliest := time.Time{}
 	for _, acc := range accounts {
+		if ok, _ := modelAccountAllowed(model, acc, accounts); !ok {
+			policyBlocked++
+			continue
+		}
 		switch {
 		case acc.Disabled:
 			disabled++
@@ -1167,7 +1320,7 @@ func nextAccountForModel(model string, attempted map[*Account]bool) (*Account, a
 			}
 		}
 	}
-	msg := fmt.Sprintf("当前模型 %s 暂无可用账号：授权失效=%d，账号冷却=%d，模型冷却=%d，额度阻断=%d，等待探测=%d", model, disabled, accountCooling, modelCooling, quotaBlocked, probeWaiting)
+	msg := fmt.Sprintf("当前模型 %s 暂无可用账号：账号名单排除=%d，授权失效=%d，账号冷却=%d，模型冷却=%d，额度阻断=%d，等待探测=%d", model, policyBlocked, disabled, accountCooling, modelCooling, quotaBlocked, probeWaiting)
 	if !earliest.IsZero() {
 		msg += "，最早恢复=" + formatDisplayTime(earliest)
 	}
@@ -2837,8 +2990,10 @@ func runServe() {
 	} else {
 		fmt.Printf("   JSON 调试日志: 已关闭 (%s 中 debug.enabled=false)\n", runtimeConfigFile)
 	}
-	fmt.Printf("   上游超时:      响应头等待 %v / 流空闲 %v / 网络错误重试 %d 次 (%s 可覆盖)\n",
-		upstreamHeaderTimeout, upstreamIdleTimeout, upstreamNetworkRetries, runtimeConfigFile)
+	fmt.Printf("   上游超时:      响应头等待 %v / 流空闲 %v (%s 可覆盖)\n",
+		upstreamHeaderTimeout, upstreamIdleTimeout, runtimeConfigFile)
+	fmt.Printf("   网络容错:      瞬时错误重试 %d 次 / 间隔 %v（仅未输出前重试，%s 可覆盖）\n",
+		upstreamTransientRetries, upstreamRetryBackoff, runtimeConfigFile)
 	if modelFilterConfigured() {
 		blocked, allowed := modelFilterSummary()
 		fmt.Printf("   模型黑白名单:  已启用 (黑名单 %d 个 / 白名单 %d 个，被禁模型已从列表隐藏并拒绝请求)\n", blocked, allowed)
@@ -2852,6 +3007,7 @@ func runServe() {
 		fmt.Printf("   站点路由:     未配置规则 (defaultPolicy=%s / maxPrice %.2f / 保底余额 %.0f 仍然生效)\n",
 			rc.DefaultPolicy, rc.MaxPrice, rc.MinBalanceGuard)
 	}
+	fmt.Printf("   模型账号名单:  %d 个模型配置了凭据文件规则（%s）\n", modelAccountRuleCount(), runtimeConfigFile)
 
 	// 启动时展示所有账号状态（与 status 命令一致）
 	accountMu.Lock()
@@ -3055,6 +3211,15 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 	for attempt := 0; attempt < poolSize; attempt++ {
 		acc, selection, err := nextAccountForModel(modelName, attempted)
 		if err != nil {
+			if errors.Is(err, errModelAccountPolicy) {
+				log.Printf("[请求被拒绝] traceId=%s requestId=%d 模型=%s 原因=账号黑白名单没有匹配的凭据 返回状态码=403 业务影响=未进入上游", traceID, reqID, modelName)
+				debugEvent(r, "warn", "model_account_policy_rejected", map[string]any{
+					"status_code": http.StatusForbidden, "reason": "没有符合模型账号名单的凭据", "business_impact": "未进入上游调用",
+				})
+				recordModelFailure(modelName, "账号名单拒绝")
+				writeOpenAIError(w, http.StatusForbidden, "model_account_disabled", fmt.Sprintf("模型 %s 没有可用的凭据文件：已被账号黑白名单禁用", modelName))
+				return nil, nil, nil, false
+			}
 			// 所有账号均不可用（冷却或失效）
 			msg := fmt.Sprintf("无可用账号: %v", err)
 			if lastAuthErr != "" {
@@ -3085,6 +3250,13 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			"selection": string(selection),
 			"attempt":   attempt + 1,
 		})
+		if modelAccountRuleConfigured(modelName) {
+			// 仅在实际命中账号的日志里附一个短标记，不再逐账号刷名单日志。
+			log.Printf("[#%d] 账号名单命中: 模型=%s 凭据=%s（已按 config.json 账号黑白名单筛选）", reqID, modelName, filepath.Base(acc.Path))
+			debugEvent(r, "debug", "model_account_policy_hit", map[string]any{
+				"model": modelName, "account_file": filepath.Base(acc.Path),
+			})
+		}
 		switch selection {
 		case selectionFreeExhausted:
 			log.Printf("[FreeModel] requestId=%d 请求的是已知免费模型 %s，选择付费余额耗尽账号 %s 发起请求", reqID, modelName, acc.Path)
@@ -3107,76 +3279,36 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 		// 按账号所属站点（国内站/国际站）路由上游与指纹 Header
 		prof := acc.Profile()
 
-		upstreamCtx, upstreamCancel := context.WithCancel(r.Context())
-		// 网络层失败（EOF、use of closed network connection 等瞬时错误）处理策略：
-		// 1) 同一账号先原地重试（陈旧 keep-alive 连接重连一次通常即恢复）；
-		// 2) 仍失败则回退到账号池中的下一个账号继续尝试；
-		// 3) 所有账号的网络调用都失败，才向客户端返回 502。
-		var resp *http.Response
-		var netErr error
-		for netAttempt := 0; ; netAttempt++ {
-			upstreamReq, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, prof.chatURL(), bytes.NewReader(upstreamBytes))
-			if err != nil {
-				upstreamCancel()
-				debugEvent(r, "error", "upstream_request_create_failed", map[string]any{
-					"error_type": debugErrorType(err),
-					"error":      safeDebugError(err),
-				})
-				recordModelFailure(modelName, "req_create_error")
-				writeOpenAIError(w, http.StatusInternalServerError, "req_create_error", err.Error())
-				return nil, nil, nil, false
-			}
-			// 注入 CodeBuddy 凭据与指纹 Header
-			// 限制同一账号向腾讯上游的请求严格单并发串行排队，防止并发双发触发腾讯风控
-			acc.lock.Lock()
-			backendHeaders(upstreamReq, acc.Auth, prof)
-			if cfg.DebugEnabled {
-				upstreamReq.Header.Set("X-Trace-ID", debugTraceID(r))
-				upstreamReq.Header.Set("X-Parent-Request-ID", strconv.FormatUint(reqID, 10))
-			}
-			debugEvent(r, "info", "upstream_request_started", map[string]any{
-				"upstream_host": prof.Base,
-				"attempt":       attempt + 1,
-				"retry":         netAttempt,
-				"payload_bytes": len(upstreamBytes),
-			})
-			resp, netErr = cfg.HttpClient.Do(upstreamReq)
-			acc.lock.Unlock()
-			if netErr == nil {
-				break
-			}
-			// 客户端已断开或请求上下文被取消：重试与回退均无意义，直接终止
-			if upstreamCtx.Err() != nil || errors.Is(netErr, context.Canceled) {
-				break
-			}
-			if netAttempt >= upstreamNetworkRetries {
-				break
-			}
-			log.Printf("[#%d] 账号 %s [%s] 上游网络错误 (%v)，%v 后进行第 %d/%d 次重试",
-				reqID, acc.Path, prof.Label, netErr, upstreamNetworkRetryDelay, netAttempt+1, upstreamNetworkRetries)
-			select {
-			case <-time.After(upstreamNetworkRetryDelay):
-			case <-upstreamCtx.Done():
-				netErr = upstreamCtx.Err()
-			}
-		}
-		if netErr != nil {
-			clientGone := upstreamCtx.Err() != nil || errors.Is(netErr, context.Canceled)
-			upstreamCancel()
+		debugEvent(r, "info", "upstream_request_started", map[string]any{
+			"upstream_host": prof.Base,
+			"attempt":       attempt + 1,
+			"payload_bytes": len(upstreamBytes),
+		})
+		// 注入 CodeBuddy 凭据与指纹 Header
+		// 限制同一账号向腾讯上游的请求严格单并发串行排队，防止并发双发触发腾讯风控
+		acc.lock.Lock()
+		resp, upstreamCancel, err := doUpstreamRequest(r, acc, prof, upstreamBytes, reqID, traceID)
+		acc.lock.Unlock()
+		if err != nil {
+			// 网络层失败处理策略：
+			// 1) 同一账号先原地重试（仅请求头未写出时才安全重放，由 doUpstreamRequest 判定）；
+			// 2) 仍失败则回退到账号池中的下一个账号继续尝试；
+			// 3) 所有账号的网络调用都失败，才向客户端返回 502。
+			clientGone := r.Context().Err() != nil || errors.Is(err, context.Canceled)
 			debugEvent(r, "error", "upstream_request_failed", map[string]any{
 				"upstream_host": prof.Base,
-				"error_type":    debugErrorType(netErr),
-				"error":         safeDebugError(netErr),
+				"error_type":    debugErrorType(err),
+				"error":         safeDebugError(err),
 			})
-			log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游网络调用 账号=%s 异常=%v 业务影响=本次模型请求失败 是否已处理=是", traceID, reqID, acc.Path, netErr)
-			log.Printf("[#%d] 账号 %s [%s] 上游请求失败: %v", reqID, acc.Path, prof.Label, netErr)
+			log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游网络调用 账号=%s 异常=%v 业务影响=本次模型请求失败 是否已处理=是", traceID, reqID, acc.Path, err)
+			log.Printf("[#%d] 账号 %s [%s] 上游请求失败: %v", reqID, acc.Path, prof.Label, err)
 			recordModelFailure(modelName, "网络错误")
 			if clientGone {
 				// 客户端已断开：不再回退其他账号，直接结束
-				writeOpenAIError(w, http.StatusBadGateway, "upstream_network_error", fmt.Sprintf("网络转发失败: %v", netErr))
+				writeOpenAIError(w, http.StatusBadGateway, "upstream_network_error", fmt.Sprintf("网络转发失败: %v", err))
 				return nil, nil, nil, false
 			}
-			lastNetErr = netErr.Error()
+			lastNetErr = err.Error()
 			continue // 回退到下一个账号
 		}
 
@@ -3391,6 +3523,8 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	ensureLeadingSystemMessage(reqObj)
 	repairReport := repairToolMessageSequence(reqObj)
 	logToolSequenceRepair(r, w.Header().Get("X-Trace-ID"), reqID, modelName, repairReport)
+	// 11155 防护：与 Responses 入口共用出站推理历史回填，不伪造思维链正文。
+	logReasoningHistoryRepair(r, reqID, modelName, repairReasoningHistory(reqObj))
 
 	upstreamBytes, err := json.Marshal(reqObj)
 	if err != nil {
@@ -3438,14 +3572,17 @@ func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Respo
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	var usage map[string]any
+	finishReason := ""
+	sawDone := false
 	for scanner.Scan() {
 		cleanData := stripDataPrefix(scanner.Text())
 		if cleanData == "" {
 			continue
 		}
 		if cleanData == "[DONE]" {
-			_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-			flusher.Flush()
+			// 先记住，等确认有真实 finish_reason 再转发。
+			// 没有结束原因时转发 [DONE]，等于告诉客户端这次是正常结束。
+			sawDone = true
 			break
 		}
 		var chunk map[string]any
@@ -3453,22 +3590,24 @@ func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Respo
 			if u, ok := chunk["usage"].(map[string]any); ok {
 				usage = u
 			}
+			finishReason = noteFinishReason(finishReason, chunk)
 		}
 		if cleanedChunk := cleanChunkJSON(cleanData); cleanedChunk != "" {
 			_, _ = fmt.Fprintf(w, "data: %s\n\n", cleanedChunk)
 			flusher.Flush()
 		}
 	}
-	if err := scanner.Err(); err != nil {
+	scanErr := scanner.Err()
+	if scanErr != nil {
 		// 流被中断（上游卡死 / 超时 / 客户端取消）时，绝不补发 [DONE]：
 		// 补发等于告诉下游「正常结束」，会让残缺的工具调用被当成完整结果执行。
 		// 改为下发一条标准错误事件，让 CPA / 客户端明确知道这次响应不完整。
 		debugEvent(r, "error", "stream_response_failed", map[string]any{
-			"error_type": debugErrorType(err),
-			"error":      safeDebugError(err),
+			"error_type": debugErrorType(scanErr),
+			"error":      safeDebugError(scanErr),
 		})
 		reason := "上游流式响应中断，本次回复不完整"
-		if errors.Is(err, context.DeadlineExceeded) {
+		if errors.Is(scanErr, context.DeadlineExceeded) {
 			reason = fmt.Sprintf("上游超过 %v 无数据，判定连接卡死并中断，本次回复不完整", upstreamIdleTimeout)
 		}
 		errPayload, _ := json.Marshal(map[string]any{
@@ -3480,15 +3619,45 @@ func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Respo
 		})
 		_, _ = fmt.Fprintf(w, "data: %s\n\n", errPayload)
 		flusher.Flush()
-		log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游流式读取 账号=%s 异常=%v 业务影响=本次响应不完整，已向客户端下发中断错误而非伪造结束", debugTraceID(r), reqID, acc.Path, err)
+		log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游流式读取 账号=%s 异常=%v 业务影响=本次响应不完整，已向客户端下发中断错误而非伪造结束", debugTraceID(r), reqID, acc.Path, scanErr)
+	} else if finishReason == "" {
+		// 连接是正常关掉的（没有读错误），但整段流没有非空 finish_reason。
+		// 这不是成功：不能补 [DONE]，也不能记成 stream_response_completed。
+		debugEvent(r, "error", "stream_closed_without_finish", map[string]any{
+			"error_type":      "stream_closed_without_finish",
+			"finish_reason":   "",
+			"saw_done":        sawDone,
+			"business_impact": "上游干净结束但没有 finish_reason，已拒绝当成成功，未补发 [DONE]",
+		})
+		errPayload, _ := json.Marshal(map[string]any{
+			"error": map[string]any{
+				"message": errStreamClosedWithoutFinish.Error(),
+				"type":    "upstream_stream_incomplete",
+				"code":    "stream_closed_without_finish",
+			},
+		})
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", errPayload)
+		flusher.Flush()
+		log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游流结束 账号=%s 结果=拒绝当成成功 原因=连接正常关闭但没有非空 finish_reason 是否看到DONE=%t 业务影响=不补发 [DONE]，客户端收到 stream_closed_without_finish 是否已处理=是",
+			debugTraceID(r), reqID, acc.Path, sawDone)
 	} else {
-		debugEvent(r, "info", "stream_response_completed", map[string]any{"status_code": http.StatusOK})
+		if sawDone {
+			_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+		}
+		debugEvent(r, "info", "stream_response_completed", map[string]any{
+			"status_code":   http.StatusOK,
+			"finish_reason": finishReason,
+			"saw_done":      sawDone,
+		})
 	}
 	observeModelCredit(acc, modelName, usage, reqID)
 	recordModelTokens(modelName, usage, reqID)
 	recordModelTTFT(modelName, body.duration())
 	recordModelLatency(modelName, time.Since(startTime))
-	log.Printf("[#%d] 流式输出完成 (账号 %s [%s], 耗时 %v, 首字 %v)", reqID, acc.Path, prof.Label, time.Since(startTime), body.duration())
+	if scanErr == nil && finishReason != "" {
+		log.Printf("[#%d] 流式输出完成 (账号 %s [%s], 结束原因=%s, 耗时 %v, 首字 %v)", reqID, acc.Path, prof.Label, finishReason, time.Since(startTime), body.duration())
+	}
 }
 
 // maxNonStreamAttempts 限制非流式聚合的端到端尝试次数（含首次）。
@@ -3860,6 +4029,36 @@ func applyToolCallDelta(toolCalls map[int]*mergedToolCall, order *[]int, tcs []a
 	}
 }
 
+// logAggregateFailure 记录非流式聚合失败。没有 finish_reason 的干净结束单独说明，
+// 避免和网络中断混在同一句「聚合失败」里。
+func logAggregateFailure(r *http.Request, reqID uint64, err error) {
+	if errors.Is(err, errStreamClosedWithoutFinish) {
+		log.Printf("[异常] traceId=%s requestId=%d 发生阶段=聚合上游流 结果=拒绝当成成功 原因=上游连接正常结束但没有 finish_reason 返回状态码=500 业务影响=不把残缺输出伪装成完整回复 是否已处理=是",
+			debugTraceID(r), reqID)
+		return
+	}
+	log.Printf("[#%d] 聚合响应失败: %v", reqID, err)
+}
+
+// noteFinishReason 记下分片里的真实结束原因。
+// 空串必须忽略：上游会在每一个中间分片上都带 finish_reason:""，那不是结束。
+func noteFinishReason(current string, chunk map[string]any) string {
+	if chunk == nil {
+		return current
+	}
+	choices, _ := chunk["choices"].([]any)
+	for _, c := range choices {
+		choice, ok := c.(map[string]any)
+		if !ok {
+			continue
+		}
+		if v, ok := choice["finish_reason"].(string); ok && v != "" {
+			return v
+		}
+	}
+	return current
+}
+
 func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 	var content, reasoning, role, respModel, respID, finish string
 	var created int64
@@ -3907,9 +4106,7 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 					applyToolCallDelta(toolCalls, &toolOrder, tcs)
 				}
 			}
-			if v, ok := choice["finish_reason"].(string); ok && v != "" {
-				finish = v
-			}
+			finish = noteFinishReason(finish, map[string]any{"choices": []any{choice}})
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -3917,6 +4114,10 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 		// 绝不把已聚合的部分内容伪装成完整结果（finish_reason=stop）返回，
 		// 交由上层判断是否回退其他账号重试。
 		return nil, fmt.Errorf("上游流式响应读取中断: %w", err)
+	}
+	// 上游连接正常结束却从未给出 finish_reason：不能当成完整回复。
+	if finish == "" {
+		return nil, errStreamClosedWithoutFinish
 	}
 
 	message := map[string]any{"role": ifEmpty(role, "assistant"), "content": content}
@@ -3954,7 +4155,7 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 		"choices": []map[string]any{{
 			"index":         0,
 			"message":       message,
-			"finish_reason": ifEmpty(finish, "stop"),
+			"finish_reason": finish,
 		}},
 	}
 	if usage != nil {

@@ -67,35 +67,51 @@ func retryWriteSSE(t *testing.T, w http.ResponseWriter) {
 	t.Helper()
 	w.Header().Set("Content-Type", "text/event-stream")
 	f, _ := w.(http.Flusher)
-	_, _ = io.WriteString(w, `data: {"id":"c1","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":""}]}`+"\n\n")
+	_, _ = io.WriteString(w, `data: {"id":"c1","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}`+"\n\n")
 	f.Flush()
 	_, _ = io.WriteString(w, "data: [DONE]\n\n")
 	f.Flush()
 }
 
-// 网络层失败（EOF）：同一账号应先原地重试（默认 3 次），重连恢复时不回退账号。
+// 网络层失败：同一账号应先原地重试，重连恢复时不回退账号。
+//
+// 语义边界：只有「请求头尚未写出」的失败才允许重放，因为此时上游不可能处理过
+// 这次 POST。已经到达服务端、由服务端断开的情况不会重放，而是回退下一个账号
+// （见 netretry_test.go 的 TestUpstreamDoesNotRetryAfterServerReceivesRequest）。
 func TestNetworkErrorRetriesSameAccountThenSucceeds(t *testing.T) {
-	oldDelay := upstreamNetworkRetryDelay
-	upstreamNetworkRetryDelay = 5 * time.Millisecond
-	defer func() { upstreamNetworkRetryDelay = oldDelay }()
+	oldRetries, oldDelay := upstreamTransientRetries, upstreamRetryBackoff
+	upstreamTransientRetries, upstreamRetryBackoff = 3, time.Millisecond
+	defer func() { upstreamTransientRetries, upstreamRetryBackoff = oldRetries, oldDelay }()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		retryWriteSSE(t, w)
+	}))
+	defer upstream.Close()
+	oldBase, oldOrigin := profileCN.Base, profileCN.Origin
+	oldClient := cfg.HttpClient
+	profileCN.Base, profileCN.Origin = upstream.URL, upstream.URL
+	defer func() {
+		profileCN.Base, profileCN.Origin = oldBase, oldOrigin
+		cfg.HttpClient = oldClient
+	}()
 
 	var hits atomic.Int64
-	setupRetryUpstream(t, func(w http.ResponseWriter, r *http.Request) {
-		// 前 3 次模拟持续网络抖动：不写任何响应直接断开（客户端收到 EOF）
-		if hits.Add(1) <= 3 {
-			panic(http.ErrAbortHandler)
+	// 前 3 次在建连阶段就失败（请求头未写出），属于可安全重放的瞬时故障。
+	cfg.HttpClient = &http.Client{Transport: retryTransportFunc(func(req *http.Request) (*http.Response, error) {
+		if hits.Add(1) <= int64(upstreamTransientRetries) {
+			return nil, io.EOF
 		}
-		retryWriteSSE(t, w)
-	})
+		return http.DefaultTransport.RoundTrip(req)
+	})}
 	setupRetryAccounts(t, retryAccount("retry.json", "token-a"))
 
 	rec := retryPostChat(t)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("原地重试应恢复成功, status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if n := hits.Load(); n != 1+upstreamNetworkRetriesDefault {
-		t.Fatalf("默认重试 %d 次时上游应恰好收到 %d 次请求，实际 %d",
-			upstreamNetworkRetriesDefault, 1+upstreamNetworkRetriesDefault, n)
+	if n := hits.Load(); n != 1+int64(upstreamTransientRetries) {
+		t.Fatalf("重试 %d 次时上游应恰好收到 %d 次请求，实际 %d",
+			upstreamTransientRetries, 1+upstreamTransientRetries, n)
 	}
 	if !strings.Contains(rec.Body.String(), "[DONE]") {
 		t.Fatalf("重试成功后流应完整结束:\n%s", rec.Body.String())
@@ -104,9 +120,9 @@ func TestNetworkErrorRetriesSameAccountThenSucceeds(t *testing.T) {
 
 // 网络层失败且原地重试仍失败：应回退到账号池下一个账号，而不是直接 502。
 func TestNetworkErrorFallsBackToNextAccount(t *testing.T) {
-	oldRetries, oldDelay := upstreamNetworkRetries, upstreamNetworkRetryDelay
-	upstreamNetworkRetries, upstreamNetworkRetryDelay = 0, time.Millisecond
-	defer func() { upstreamNetworkRetries, upstreamNetworkRetryDelay = oldRetries, oldDelay }()
+	oldRetries, oldDelay := upstreamTransientRetries, upstreamRetryBackoff
+	upstreamTransientRetries, upstreamRetryBackoff = 0, time.Millisecond
+	defer func() { upstreamTransientRetries, upstreamRetryBackoff = oldRetries, oldDelay }()
 
 	var aHits, bHits atomic.Int64
 	setupRetryUpstream(t, func(w http.ResponseWriter, r *http.Request) {
@@ -133,9 +149,9 @@ func TestNetworkErrorFallsBackToNextAccount(t *testing.T) {
 
 // 上游 408/5xx 瞬时错误：应换下一个账号代偿。
 func TestUpstream5xxFallsBackToNextAccount(t *testing.T) {
-	oldRetries, oldDelay := upstreamNetworkRetries, upstreamNetworkRetryDelay
-	upstreamNetworkRetries, upstreamNetworkRetryDelay = 0, time.Millisecond
-	defer func() { upstreamNetworkRetries, upstreamNetworkRetryDelay = oldRetries, oldDelay }()
+	oldRetries, oldDelay := upstreamTransientRetries, upstreamRetryBackoff
+	upstreamTransientRetries, upstreamRetryBackoff = 0, time.Millisecond
+	defer func() { upstreamTransientRetries, upstreamRetryBackoff = oldRetries, oldDelay }()
 
 	var aHits, bHits atomic.Int64
 	setupRetryUpstream(t, func(w http.ResponseWriter, r *http.Request) {
@@ -164,9 +180,9 @@ func TestUpstream5xxFallsBackToNextAccount(t *testing.T) {
 
 // 所有账号的网络调用都失败：应返回 502 upstream_network_error，且完成原地重试。
 func TestAllAccountsNetworkFailureReturns502(t *testing.T) {
-	oldRetries, oldDelay := upstreamNetworkRetries, upstreamNetworkRetryDelay
-	upstreamNetworkRetries, upstreamNetworkRetryDelay = 1, 5*time.Millisecond
-	defer func() { upstreamNetworkRetries, upstreamNetworkRetryDelay = oldRetries, oldDelay }()
+	oldRetries, oldDelay := upstreamTransientRetries, upstreamRetryBackoff
+	upstreamTransientRetries, upstreamRetryBackoff = 1, 5*time.Millisecond
+	defer func() { upstreamTransientRetries, upstreamRetryBackoff = oldRetries, oldDelay }()
 
 	var hits atomic.Int64
 	setupRetryUpstream(t, func(w http.ResponseWriter, r *http.Request) {
@@ -182,16 +198,18 @@ func TestAllAccountsNetworkFailureReturns502(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "upstream_network_error") {
 		t.Fatalf("错误体应包含 upstream_network_error:\n%s", rec.Body.String())
 	}
-	if n := hits.Load(); n != 2 {
-		t.Fatalf("单账号应完成 1 失败 + 1 重试共 2 次请求，实际 %d", n)
+	// 服务端已收到完整请求头后才断开：POST 可能已被处理，不得重放，
+	// 因此每个账号只尝试 1 次，失败即回退下一个账号（此处账号池已耗尽 → 502）。
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("请求头已写出时不得重放，单账号应只尝试 1 次，实际 %d", n)
 	}
 }
 
 // 上游返回 400 类请求级错误：换账号无意义，不应回退。
 func TestUpstream400DoesNotFallBack(t *testing.T) {
-	oldRetries, oldDelay := upstreamNetworkRetries, upstreamNetworkRetryDelay
-	upstreamNetworkRetries, upstreamNetworkRetryDelay = 0, time.Millisecond
-	defer func() { upstreamNetworkRetries, upstreamNetworkRetryDelay = oldRetries, oldDelay }()
+	oldRetries, oldDelay := upstreamTransientRetries, upstreamRetryBackoff
+	upstreamTransientRetries, upstreamRetryBackoff = 0, time.Millisecond
+	defer func() { upstreamTransientRetries, upstreamRetryBackoff = oldRetries, oldDelay }()
 
 	var aHits, bHits atomic.Int64
 	setupRetryUpstream(t, func(w http.ResponseWriter, r *http.Request) {

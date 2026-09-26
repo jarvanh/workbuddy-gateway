@@ -2,9 +2,15 @@
   "debug": {
     "enabled": false
   },
+  "upstream": {
+    "headerTimeoutSeconds": 300,
+    "idleTimeoutSeconds": 120,
+    "transientRetries": 2
+  },
   "models": {
     "blocklist": [],
-    "allowlist": []
+    "allowlist": [],
+    "accounts": {}
   },
   "routing": {
     "tz": "Asia/Shanghai",
