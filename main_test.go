@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -1765,4 +1766,94 @@ func TestChatCompletionToResponses(t *testing.T) {
 		t.Fatalf("usage total = %#v", usage["total_tokens"])
 	}
 	t.Logf("responses object output items: %d", len(output))
+}
+
+// 验证冷却告警会附带「其他仍在冷却中的账号/模型」清单：
+// 主人要求“发这个通知的时候如果还有其他账号在冷却也一起加上”。
+func TestCooldownNotifyIncludesOtherCooling(t *testing.T) {
+	resetNotifyState()
+	got := make(chan string, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var m map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&m)
+		select {
+		case got <- fmt.Sprintf("%v", m["body"]):
+		default:
+		}
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	setNotify(notifyConfig{Enabled: true, Type: "webhook", Webhook: srv.URL, MinIntervalSeconds: 0})
+	defer setNotify(notifyConfig{})
+
+	accountMu.Lock()
+	oldAccounts := accounts
+	accA := &Account{Path: "/tmp/a.json", Auth: &StoredAuth{}, CooldownUntil: time.Now().Add(2 * time.Hour)}
+	accB := &Account{Path: "/tmp/b.json", Auth: &StoredAuth{}, ModelStates: map[string]*modelRuntimeState{
+		"other-model": {CooldownUntil: time.Now().Add(30 * time.Minute)},
+	}}
+	accounts = []*Account{accA, accB}
+	accountMu.Unlock()
+	defer func() {
+		accountMu.Lock()
+		accounts = oldAccounts
+		accountMu.Unlock()
+	}()
+
+	// 触发 accB 的 hy4 模型冷却；清单里应带上 accA（账号冷却）+ accB 的 other-model，
+	// 但不能重复本次触发的 hy4 本身。
+	markModelCooldown(accB, "hy4-preview-f", time.Now().Add(time.Hour), "6004 rate limited")
+
+	select {
+	case body := <-got:
+		for _, want := range []string{"其他冷却中", "a.json", "other-model"} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("通知应包含 %q，实际: %s", want, body)
+			}
+		}
+		if strings.Contains(body, "hy4-preview-f 冷却至") {
+			t.Fatalf("不应重复列出本次触发的模型: %s", body)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("未收到冷却通知")
+	}
+}
+
+// 无其他冷却项时不应追加空标题。
+func TestCooldownNotifyNoOtherCooling(t *testing.T) {
+	resetNotifyState()
+	got := make(chan string, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var m map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&m)
+		select {
+		case got <- fmt.Sprintf("%v", m["body"]):
+		default:
+		}
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	setNotify(notifyConfig{Enabled: true, Type: "webhook", Webhook: srv.URL, MinIntervalSeconds: 0})
+	defer setNotify(notifyConfig{})
+
+	accountMu.Lock()
+	oldAccounts := accounts
+	acc := &Account{Path: "/tmp/only.json", Auth: &StoredAuth{}}
+	accounts = []*Account{acc}
+	accountMu.Unlock()
+	defer func() {
+		accountMu.Lock()
+		accounts = oldAccounts
+		accountMu.Unlock()
+	}()
+
+	markCooldown(acc, time.Now().Add(10*time.Minute), "429")
+	select {
+	case body := <-got:
+		if strings.Contains(body, "其他冷却中") {
+			t.Fatalf("无其他冷却项时不该追加清单: %s", body)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("未收到冷却通知")
+	}
 }
