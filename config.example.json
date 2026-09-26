@@ -69,6 +69,20 @@
             "site": "cn"
           }
         ]
+      },
+      {
+        "models": [
+          "some-expensive-model"
+        ],
+        "maxPrice": 0.5,
+        "sites": [
+          {
+            "site": "intl"
+          },
+          {
+            "site": "cn"
+          }
+        ]
       }
     ]
   },
