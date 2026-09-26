@@ -5,6 +5,7 @@ package main
 // 站点五态机（含跨午夜窗口与生效区间）、账号快过期优先、锚点校准、样本优先级、cheapest-first。
 
 import (
+	"os"
 	"testing"
 	"time"
 )
@@ -459,5 +460,70 @@ func TestGhostGuardHonorsTimeLimitedFree(t *testing.T) {
 	recordSitePriceSample("cn", "limited-free", 1000000, 0)
 	if ghostPaidBlocked("limited-free", cfg) {
 		t.Fatal("限时免费期内护栏应放行（累积 credit 不得误判，不得阻断学习闭环）")
+	}
+}
+
+func TestRoutingSpendPersistsAcrossRestart(t *testing.T) {
+	chdirTemp(t) // 隔离工作目录，避免污染真实 wb-routing-spend.json
+	cfg := defaultRoutingConfig()
+	cfg.Rules = nil
+	setTestRouting(t, cfg)
+	loc := routingLocation(cfg)
+	now := time.Now()
+
+	consumeBudget("cn", "m-budget-persist", 0.4, now)
+	if _, err := os.Stat(routingSpendFile); err != nil {
+		t.Fatalf("扣费后应落盘 %s，实际 err=%v", routingSpendFile, err)
+	}
+	before := budgetUsed("cn", "m-budget-persist", now, loc)
+	if before < 0.4-1e-9 {
+		t.Fatalf("内存态应为 0.4，实际=%v", before)
+	}
+	// 模拟重启：清空内存后从文件恢复
+	resetRoutingSpend()
+	if got := budgetUsed("cn", "m-budget-persist", now, loc); got != 0 {
+		t.Fatalf("清空后应为 0，实际=%v", got)
+	}
+	loadRoutingSpend()
+	if got := budgetUsed("cn", "m-budget-persist", now, loc); got < 0.4-1e-9 {
+		t.Fatalf("重启恢复后应仍为 0.4（不再清零），实际=%v", got)
+	}
+}
+
+func TestFreeRequestDoesNotTouchDisk(t *testing.T) {
+	chdirTemp(t)
+	cfg := defaultRoutingConfig()
+	cfg.Rules = nil
+	setTestRouting(t, cfg)
+	now := time.Now()
+
+	_ = os.Remove(routingSpendFile)
+	consumeBudget("cn", "m-free-no-io", 0, now) // 免费请求
+	if _, err := os.Stat(routingSpendFile); err == nil {
+		t.Fatal("免费请求（credit=0）不应产生落盘 IO")
+	}
+}
+
+func TestRoutingSpendPrunesStaleDays(t *testing.T) {
+	chdirTemp(t)
+	cfg := defaultRoutingConfig()
+	cfg.Rules = nil
+	setTestRouting(t, cfg)
+	loc := routingLocation(cfg)
+
+	// 写入一条 10 天前的记录（key 第三段为日期）
+	stale := time.Now().In(loc).AddDate(0, 0, -10).Format("2006-01-02")
+	routingMu.Lock()
+	routingSpend["cn|m-stale|"+stale] = 9.9
+	persistRoutingSpendLocked()
+	routingMu.Unlock()
+
+	resetRoutingSpend()
+	loadRoutingSpend()
+	routingMu.RLock()
+	_, kept := routingSpend["cn|m-stale|"+stale]
+	routingMu.RUnlock()
+	if kept {
+		t.Fatal("过期日期记录应被淘汰")
 	}
 }

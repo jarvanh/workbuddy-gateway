@@ -2734,6 +2734,7 @@ func runLogin() {
 
 func runServe() {
 	loadModelsCache()
+	loadRoutingSpend() // v6：恢复站点模型预算消耗（重启不再清零）
 	if err := loadAccounts(); err != nil {
 		fmt.Printf("警告: 未检测到有效凭据 (%v)。\n请先执行: workbuddy-gateway login 扫码登录，或确保凭据文件存在。\n\n", err)
 	} else {

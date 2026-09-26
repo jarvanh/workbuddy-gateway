@@ -14,7 +14,9 @@ package main
 //     被保底拦截时请求根本没发出，零扣费，故不消耗 fallbackBudget。
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -77,9 +79,84 @@ var (
 	routingMu sync.RWMutex
 	// routingCurrent 为生效配置；未显式配置时使用默认值。
 	routingCurrent = defaultRoutingConfig()
-	// routingSpend 记录预算消耗：key（站点|模型|日期）-> 已消耗 credit。仅内存态，重启清零。
+	// routingSpend 记录预算消耗：key（站点|模型|日期）-> 已消耗 credit。
+	// 已持久化到 routingSpendFile，重启后自动恢复（不再清零）。
 	routingSpend = map[string]float64{}
 )
+
+const (
+	// routingSpendFile 预算消耗落盘文件（相对工作目录，与 status/models cache 同目录）。
+	routingSpendFile   = "wb-routing-spend.json"
+	routingSpendSchema = 1
+	// routingSpendKeepDays 保留天数：预算按自然日计量，过期记录只让文件无意义膨胀。
+	routingSpendKeepDays = 3
+)
+
+// routingSpendFileData 落盘格式。
+type routingSpendFileData struct {
+	Schema    int                `json:"schema"`
+	UpdatedAt int64              `json:"updatedAt"`
+	Spend     map[string]float64 `json:"spend"`
+}
+
+// pruneRoutingSpendLocked 淘汰过期日期的记录（调用方持有 routingMu 写锁）。
+func pruneRoutingSpendLocked() {
+	cfg := routingCurrent
+	loc := routingLocation(cfg)
+	keep := map[string]bool{}
+	for i := 0; i < routingSpendKeepDays; i++ {
+		keep[time.Now().In(loc).AddDate(0, 0, -i).Format("2006-01-02")] = true
+	}
+	out := make(map[string]float64, len(routingSpend))
+	for k, v := range routingSpend {
+		parts := strings.Split(k, "|")
+		if len(parts) == 3 && keep[parts[2]] {
+			out[k] = v
+		}
+	}
+	routingSpend = out
+}
+
+// persistRoutingSpendLocked 把预算消耗原子落盘（调用方持有 routingMu 写锁）。
+// 注意：锁内必须直接读 routingCurrent，不可调用 routingSnapshot()——
+// Go 的 sync.RWMutex 不可重入，持写锁再加读锁会自锁。
+func persistRoutingSpendLocked() {
+	pruneRoutingSpendLocked()
+	data, err := json.MarshalIndent(routingSpendFileData{
+		Schema:    routingSpendSchema,
+		UpdatedAt: time.Now().Unix(),
+		Spend:     routingSpend,
+	}, "", "  ")
+	if err != nil {
+		return
+	}
+	tmp := routingSpendFile + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, routingSpendFile)
+}
+
+// loadRoutingSpend 启动时恢复预算消耗；文件缺失/损坏则忽略（按空预算起步）。
+func loadRoutingSpend() {
+	data, err := os.ReadFile(routingSpendFile)
+	if err != nil {
+		return
+	}
+	var d routingSpendFileData
+	if err := json.Unmarshal(data, &d); err != nil || d.Schema != routingSpendSchema {
+		return
+	}
+	routingMu.Lock()
+	defer routingMu.Unlock()
+	if routingSpend == nil {
+		routingSpend = map[string]float64{}
+	}
+	for k, v := range d.Spend {
+		routingSpend[k] = v
+	}
+	pruneRoutingSpendLocked()
+}
 
 func defaultRoutingConfig() routingConfig {
 	return routingConfig{
@@ -307,6 +384,10 @@ func consumeBudget(site, model string, credit float64, now time.Time) {
 	routingMu.Lock()
 	defer routingMu.Unlock()
 	routingSpend[budgetKey(site, model, now, loc)] += credit
+	// 仅真扣费才落盘：免费模型 credit=0 累加无意义，不该产生磁盘 IO。
+	if credit > 0 {
+		persistRoutingSpendLocked()
+	}
 }
 
 func resetRoutingSpend() {
