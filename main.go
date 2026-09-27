@@ -1365,6 +1365,7 @@ func markCooldown(acc *Account, until time.Time, msg string) {
 	// 纯文本正文（webhook 通道用）
 	body := fmt.Sprintf("账号: %s\n屏蔽至: %s\n剩余: %s\n原因: %s\n账号池: %s", name, formatDisplayTime(until), formatCooldownRemaining(now, until), reason, cooldownPoolLine(now))
 	body += cooldownListText(items, now)
+	body += quotaBlockedListText(collectQuotaBlocked())
 
 	// Telegram HTML 正文（与全库通知版式同源）
 	var b strings.Builder
@@ -1375,6 +1376,7 @@ func markCooldown(acc *Account, until time.Time, msg string) {
 	b.WriteString(tgKV("原因", reason))
 	b.WriteString(tgKV("账号池", cooldownPoolLine(now)))
 	b.WriteString(cooldownSectionHTML(items, now))
+	b.WriteString(quotaBlockedSectionHTML(collectQuotaBlocked()))
 
 	sendNotify(notifyEvent{
 		Kind:  notifyEventCooldown,
@@ -1536,6 +1538,101 @@ func cooldownListText(items []cooldownEntry, now time.Time) string {
 	return b.String()
 }
 
+// quotaBlockEntry 一条额度阻断记录（模型级或账号级）。
+type quotaBlockEntry struct {
+	acc    string    // 凭据文件名
+	model  string    // 空串 = 账号级额度冻结（整号不可用）
+	at     time.Time // 观测到阻断的时刻（账号级可能为零值）
+	reason string
+}
+
+// collectQuotaBlocked 汇总当前处于额度阻断的账号/模型。
+//
+// 为什么单独一段：额度阻断与冷却同样会让请求调度不了，但它**没有恢复时刻**
+// （markModelQuotaBlocked 只置 QuotaBlocked=true，等额度到账后自动解除），
+// 所以它进不了按恢复时间排序的冷却清单。缺了这段，「清单为空」会被误读成
+// 「全都能用」，而实际上这些账号/模型同样不可用。
+//
+// 账号级（acc.QuotaExhausted）整号冻结，后果覆盖该账号全部模型，
+// 故整号冻结时不再重复列出该账号下的模型级阻断。
+func collectQuotaBlocked() []quotaBlockEntry {
+	var items []quotaBlockEntry
+	accountMu.Lock()
+	for _, acc := range accounts {
+		name := filepath.Base(acc.Path)
+		if acc.Disabled {
+			continue
+		}
+		if acc.QuotaExhausted {
+			items = append(items, quotaBlockEntry{acc: name})
+			continue
+		}
+		for model, state := range acc.ModelStates {
+			if state == nil || !state.QuotaBlocked {
+				continue
+			}
+			items = append(items, quotaBlockEntry{acc: name, model: model, at: state.ObservedAt, reason: state.LastReason})
+		}
+	}
+	accountMu.Unlock()
+	// 账号级（整号冻结）排在前：后果比单模型阻断严重；其余按观测时刻升序
+	sort.Slice(items, func(i, j int) bool {
+		iAcc, jAcc := items[i].model == "", items[j].model == ""
+		if iAcc != jAcc {
+			return iAcc
+		}
+		return items[i].at.Before(items[j].at)
+	})
+	return items
+}
+
+// quotaBlockItemMeta 单条额度阻断的时间说明。
+// 额度阻断没有恢复时刻，只能给「何观测到」，故措辞与冷却刻意区分：
+// 不给「N 分钟后恢复」，否则读者会以为它到点自动恢复。
+func quotaBlockItemMeta(it quotaBlockEntry) string {
+	if it.at.IsZero() {
+		return "额度耗尽"
+	}
+	return "额度耗尽 · 观测 " + it.at.In(displayLoc).Format(cooldownTimeLayout)
+}
+
+// quotaBlockedSectionHTML 渲染「额度阻断」分节（HTML 树形条目）。无阻断项返回空串。
+func quotaBlockedSectionHTML(items []quotaBlockEntry) string {
+	if len(items) == 0 {
+		return ""
+	}
+	entries := make([]string, 0, len(items))
+	for _, it := range items {
+		if it.model == "" {
+			entries = append(entries, tgEntry(it.acc, "整号额度冻结"))
+		} else {
+			entries = append(entries, "<code>"+escapeHTML(it.acc)+"</code> · 模型 <code>"+
+				escapeHTML(it.model)+"</code> · "+escapeHTML(quotaBlockItemMeta(it)))
+		}
+	}
+	var b strings.Builder
+	tgSection(&b, fmt.Sprintf("💸 额度阻断 · %d", len(items)))
+	b.WriteString(treeLines(entries) + "\n")
+	return b.String()
+}
+
+// quotaBlockedListText 额度阻断清单的纯文本形态（webhook 通道用），与 HTML 版同口径。
+func quotaBlockedListText(items []quotaBlockEntry) string {
+	if len(items) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n\n额度阻断 · %d", len(items))
+	for _, it := range items {
+		if it.model == "" {
+			fmt.Fprintf(&b, "\n· %s 整号额度冻结", it.acc)
+		} else {
+			fmt.Fprintf(&b, "\n· %s 模型 %s %s", it.acc, it.model, quotaBlockItemMeta(it))
+		}
+	}
+	return b.String()
+}
+
 func markModelCooldown(acc *Account, model string, until time.Time, msg string) {
 	accountMu.Lock()
 	state := modelStateLocked(acc, model)
@@ -1552,6 +1649,7 @@ func markModelCooldown(acc *Account, model string, until time.Time, msg string) 
 	// 纯文本正文（webhook 通道用）
 	body := fmt.Sprintf("账号: %s\n模型: %s\n屏蔽至: %s\n剩余: %s\n原因: %s\n账号池: %s", name, model, formatDisplayTime(until), formatCooldownRemaining(now, until), reason, cooldownPoolLine(now))
 	body += cooldownListText(items, now)
+	body += quotaBlockedListText(collectQuotaBlocked())
 
 	// Telegram HTML 正文（与全库通知版式同源）
 	var b strings.Builder
@@ -1563,6 +1661,7 @@ func markModelCooldown(acc *Account, model string, until time.Time, msg string) 
 	b.WriteString(tgKV("原因", reason))
 	b.WriteString(tgKV("账号池", cooldownPoolLine(now)))
 	b.WriteString(cooldownSectionHTML(items, now))
+	b.WriteString(quotaBlockedSectionHTML(collectQuotaBlocked()))
 
 	sendNotify(notifyEvent{
 		Kind:  notifyEventModelCooldown,
