@@ -1359,19 +1359,22 @@ func markCooldown(acc *Account, until time.Time, msg string) {
 		acc.Path, formatDisplayTime(until), msg)
 	name := filepath.Base(acc.Path)
 	reason := truncate(msg, 200)
-	items := collectCooldowns(time.Now(), acc, "")
+	now := time.Now()
+	items := collectCooldowns(now, acc, "")
 
 	// 纯文本正文（webhook 通道用）
-	body := fmt.Sprintf("账号: %s\n屏蔽至: %s\n原因: %s", name, formatDisplayTime(until), reason)
-	body += cooldownListText(items)
+	body := fmt.Sprintf("账号: %s\n屏蔽至: %s\n剩余: %s\n原因: %s\n账号池: %s", name, formatDisplayTime(until), formatCooldownRemaining(now, until), reason, cooldownPoolLine(now))
+	body += cooldownListText(items, now)
 
 	// Telegram HTML 正文（与全库通知版式同源）
 	var b strings.Builder
 	b.WriteString(tgTitle("⚠️ workbuddy 账号冷却（频率限制）"))
 	b.WriteString(tgPath("账号", name))
 	b.WriteString(tgKV("屏蔽至", formatDisplayTime(until)))
+	b.WriteString(tgKV("剩余", formatCooldownRemaining(now, until)))
 	b.WriteString(tgKV("原因", reason))
-	b.WriteString(cooldownSectionHTML(items))
+	b.WriteString(tgKV("账号池", cooldownPoolLine(now)))
+	b.WriteString(cooldownSectionHTML(items, now))
 
 	sendNotify(notifyEvent{
 		Kind:  notifyEventCooldown,
@@ -1420,43 +1423,115 @@ func collectCooldowns(now time.Time, excludeAcc *Account, excludeModel string) [
 	return items
 }
 
+// cooldownTimeLayout 冷却清单里时间的统一布局（MM-DD HH:MM）。
+//
+// 为什么不是完整日期时间也不是纯 HH:MM：账号级冷却原先给完整时间戳、模型级只给 HH:MM，
+// 同一份清单里两种口径并存（跨天的那条尤其难读）；纯 HH:MM 又会让跨天的项看起来比
+// 当天的项更早恢复。MM-DD HH:MM 是两者折中——长度可控且跨天无歧义。
+const cooldownTimeLayout = "01-02 15:04"
+
+// formatCooldownTime 冷却时刻的统一渲染（displayLoc 时区 + MM-DD HH:MM）。
+func formatCooldownTime(t time.Time) string {
+	return t.In(displayLoc).Format(cooldownTimeLayout)
+}
+
+// formatCooldownRemaining 渲染「距恢复还有多久」。
+//
+// 冷却动辄几十分钟到几小时，读者第一眼要的是「还要等多久」，而不是拿绝对时刻去心算；
+// 但只给时长又没法对照日志排查，所以时刻与时长并列展示。
+func formatCooldownRemaining(now, until time.Time) string {
+	d := until.Sub(now)
+	switch {
+	case d <= 0:
+		return "已可恢复"
+	case d < time.Minute:
+		return "不到 1 分钟"
+	case d < time.Hour:
+		return fmt.Sprintf("约 %d 分钟", int(d/time.Minute))
+	case d < 24*time.Hour:
+		if m := int(d % time.Hour / time.Minute); m > 0 {
+			return fmt.Sprintf("约 %d 小时 %d 分钟", int(d/time.Hour), m)
+		}
+		return fmt.Sprintf("约 %d 小时", int(d/time.Hour))
+	default:
+		if h := int(d % (24 * time.Hour) / time.Hour); h > 0 {
+			return fmt.Sprintf("约 %d 天 %d 小时", int(d/(24*time.Hour)), h)
+		}
+		return fmt.Sprintf("约 %d 天", int(d/(24*time.Hour)))
+	}
+}
+
+// cooldownItemText 单条冷却记录的正文（HTML 与纯文本共用口径）。
+//
+// 账号级（整号）与模型级必须一眼分得开：前者该账号下全部模型都不可用，
+// 后果比单模型冷却严重得多，混在同一措辞里会让人低估。
+func cooldownItemText(it cooldownEntry, now time.Time) string {
+	when := formatCooldownTime(it.until) + " 恢复（" + formatCooldownRemaining(now, it.until) + "后）"
+	if it.model == "" {
+		return it.acc + " · 整号冷却 · " + when
+	}
+	return it.acc + " · 模型 " + it.model + " · " + when
+}
+
+// cooldownItemMeta 单条冷却记录的时间+剩余时长部分（供 HTML 分节拼装）。
+func cooldownItemMeta(it cooldownEntry, now time.Time) string {
+	return formatCooldownTime(it.until) + " 恢复（" + formatCooldownRemaining(now, it.until) + "后）"
+}
+
+// cooldownPoolLine 账号池可用性概览（冷却告警用）。
+//
+// 只列「谁在冷却」不够——读者真正想知道的是「这次冷却会不会让请求直接 503」，
+// 所以补一行可用/冷却/失效计数。口径：冷却=账号级冷却中，失效=授权失效，其余计可用
+// （单模型冷却不影响该账号承载别的模型，故仍计入可用）。
+func cooldownPoolLine(now time.Time) string {
+	accountMu.Lock()
+	var avail, cooling, disabled int
+	for _, acc := range accounts {
+		switch {
+		case acc.Disabled:
+			disabled++
+		case acc.CooldownUntil.After(now):
+			cooling++
+		default:
+			avail++
+		}
+	}
+	total := len(accounts)
+	accountMu.Unlock()
+	return fmt.Sprintf("可用 %d · 冷却 %d · 失效 %d · 共 %d", avail, cooling, disabled, total)
+}
+
 // cooldownSectionHTML 渲染「冷却中」分节（HTML 树形条目）。无冷却项返回空串。
 // 全量展示、不折叠：读者要逐条核对「现在还有谁不可用、什么时候恢复」，
 // 折叠等于把最需要看的部分藏起来。
-// 时间口径照规范：账号级给完整日期时间（跨天无歧义），模型级只给 HH:MM
-// （模型可能很多，完整日期会把条目撑爆）。
-func cooldownSectionHTML(items []cooldownEntry) string {
+func cooldownSectionHTML(items []cooldownEntry, now time.Time) string {
 	if len(items) == 0 {
 		return ""
 	}
 	entries := make([]string, 0, len(items))
 	for _, it := range items {
 		if it.model == "" {
-			entries = append(entries, tgEntry(it.acc, "账号冷却 至 "+formatDisplayTime(it.until)))
+			entries = append(entries, tgEntry(it.acc, cooldownItemMeta(it, now)))
 		} else {
 			entries = append(entries, "<code>"+escapeHTML(it.acc)+"</code> · 模型 <code>"+
-				escapeHTML(it.model)+"</code> · 冷却 至 "+escapeHTML(it.until.In(displayLoc).Format("15:04")))
+				escapeHTML(it.model)+"</code> · "+escapeHTML(cooldownItemMeta(it, now)))
 		}
 	}
 	var b strings.Builder
-	tgSection(&b, fmt.Sprintf("🔒 冷却中 · %d", len(items)))
+	tgSection(&b, fmt.Sprintf("🔒 其他冷却中 · %d", len(items)))
 	b.WriteString(treeLines(entries) + "\n")
 	return b.String()
 }
 
 // cooldownListText 冷却清单的纯文本形态（webhook 通道用），与 HTML 版同口径。
-func cooldownListText(items []cooldownEntry) string {
+func cooldownListText(items []cooldownEntry, now time.Time) string {
 	if len(items) == 0 {
 		return ""
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "\n\n冷却中 · %d", len(items))
+	fmt.Fprintf(&b, "\n\n其他冷却中 · %d", len(items))
 	for _, it := range items {
-		if it.model == "" {
-			fmt.Fprintf(&b, "\n· %s 账号冷却 至 %s", it.acc, formatDisplayTime(it.until))
-		} else {
-			fmt.Fprintf(&b, "\n· %s 模型 %s 冷却 至 %s", it.acc, it.model, it.until.In(displayLoc).Format("15:04"))
-		}
+		fmt.Fprintf(&b, "\n· %s", cooldownItemText(it, now))
 	}
 	return b.String()
 }
@@ -1471,11 +1546,12 @@ func markModelCooldown(acc *Account, model string, until time.Time, msg string) 
 	writeStatusSnapshot()
 	name := filepath.Base(acc.Path)
 	reason := truncate(msg, 200)
-	items := collectCooldowns(time.Now(), acc, model)
+	now := time.Now()
+	items := collectCooldowns(now, acc, model)
 
 	// 纯文本正文（webhook 通道用）
-	body := fmt.Sprintf("账号: %s\n模型: %s\n屏蔽至: %s\n原因: %s", name, model, formatDisplayTime(until), reason)
-	body += cooldownListText(items)
+	body := fmt.Sprintf("账号: %s\n模型: %s\n屏蔽至: %s\n剩余: %s\n原因: %s\n账号池: %s", name, model, formatDisplayTime(until), formatCooldownRemaining(now, until), reason, cooldownPoolLine(now))
+	body += cooldownListText(items, now)
 
 	// Telegram HTML 正文（与全库通知版式同源）
 	var b strings.Builder
@@ -1483,8 +1559,10 @@ func markModelCooldown(acc *Account, model string, until time.Time, msg string) 
 	b.WriteString(tgPath("账号", name))
 	b.WriteString(tgPath("模型", model))
 	b.WriteString(tgKV("屏蔽至", formatDisplayTime(until)))
+	b.WriteString(tgKV("剩余", formatCooldownRemaining(now, until)))
 	b.WriteString(tgKV("原因", reason))
-	b.WriteString(cooldownSectionHTML(items))
+	b.WriteString(tgKV("账号池", cooldownPoolLine(now)))
+	b.WriteString(cooldownSectionHTML(items, now))
 
 	sendNotify(notifyEvent{
 		Kind:  notifyEventModelCooldown,

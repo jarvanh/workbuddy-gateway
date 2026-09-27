@@ -1807,14 +1807,14 @@ func TestCooldownNotifyIncludesOtherCooling(t *testing.T) {
 
 	select {
 	case body := <-got:
-		for _, want := range []string{"冷却中 · 2", "a.json", "other-model"} {
+		for _, want := range []string{"其他冷却中 · 2", "a.json", "other-model"} {
 			if !strings.Contains(body, want) {
 				t.Fatalf("通知应包含 %q，实际: %s", want, body)
 			}
 		}
 		// 本次触发的模型只应出现在告警头部（「模型: hy4-preview-f」），
-		// 清单段（「模型 hy4-preview-f 冷却 至」）不得重复列出。
-		if strings.Contains(body, "模型 hy4-preview-f 冷却") {
+		// 清单段（「· <账号> · 模型 hy4-preview-f · …」）不得重复列出。
+		if strings.Contains(body, "模型 hy4-preview-f · ") {
 			t.Fatalf("清单不应重复列出本次触发的模型: %s", body)
 		}
 	case <-time.After(3 * time.Second):
@@ -1853,8 +1853,14 @@ func TestCooldownNotifyNoOtherCooling(t *testing.T) {
 	markCooldown(acc, time.Now().Add(10*time.Minute), "429")
 	select {
 	case body := <-got:
-		if strings.Contains(body, "冷却中 · ") {
+		if strings.Contains(body, "其他冷却中 · ") {
 			t.Fatalf("无其他冷却项时不该追加清单: %s", body)
+		}
+		// 账号池概览行与「剩余」时长是无冷却项时也必有的定位信息
+		for _, want := range []string{"账号池", "剩余"} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("通知应包含 %q，实际: %s", want, body)
+			}
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("未收到冷却通知")
@@ -1892,8 +1898,8 @@ func TestCooldownNotifyListsAllCooling(t *testing.T) {
 			t.Fatalf("清单未按恢复时间升序: %v", items)
 		}
 	}
-	html := cooldownSectionHTML(items)
-	if !strings.Contains(html, "冷却中 · 9") {
+	html := cooldownSectionHTML(items, now)
+	if !strings.Contains(html, "其他冷却中 · 9") {
 		t.Fatalf("分节计数应为 9: %s", html)
 	}
 	if strings.Contains(html, "未列出") {
