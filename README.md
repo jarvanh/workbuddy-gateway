@@ -646,6 +646,21 @@ workbuddy-gateway serve -auth-dir ./auths
 
 **设计约束**：全程异步（绝不阻塞调度）；发送失败只记日志；队列满丢弃。
 
+### 通知版式
+
+Telegram 通道使用与全库通知统一的 HTML 版式（真源：`jarvanh/actions` 的
+`.github/scripts/telegram/tg_notify.sh` 与 `docs/telegram-notify.md`）：
+标题 + 分隔线、`标签：值` 取值行、分节 `{emoji} 分节 · N`、树形条目
+`<code>  ├─/└─ </code>`，机器值走等宽 `<code>`、动态内容一律转义。
+超过 4000 字符按换行分片发送（不切断 UTF-8 多字节字符）。
+
+webhook 通道仍发送纯文本 `title`/`body`（webhook 是通用 JSON 消费者，不假设 HTML）。
+
+**冷却告警会列出当前全部仍在冷却中的账号与模型**（按恢复时间升序、全量不折叠），
+让读者在一条告警里看清「现在还有谁不可用、什么时候恢复」。账号级给完整日期时间，
+模型级只给 `HH:MM`（模型可能很多，完整日期会撑爆条目）。本次触发的账号/模型已写在
+告警头部，不在清单里重复。
+
 ---
 
 ## 站点路由

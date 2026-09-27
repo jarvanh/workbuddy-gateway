@@ -15,6 +15,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // TestMain 将整个测试进程切到临时工作目录，确保任何写状态/缓存/日志的测试
@@ -1768,8 +1769,8 @@ func TestChatCompletionToResponses(t *testing.T) {
 	t.Logf("responses object output items: %d", len(output))
 }
 
-// 验证冷却告警会附带「其他仍在冷却中的账号/模型」清单：
-// 主人要求“发这个通知的时候如果还有其他账号在冷却也一起加上”。
+// 验证冷却告警会附带「当前仍在冷却中的账号/模型」清单：
+// 主人要求“要把所有在冷却中的账号发出来”。
 func TestCooldownNotifyIncludesOtherCooling(t *testing.T) {
 	resetNotifyState()
 	got := make(chan string, 4)
@@ -1806,20 +1807,22 @@ func TestCooldownNotifyIncludesOtherCooling(t *testing.T) {
 
 	select {
 	case body := <-got:
-		for _, want := range []string{"其他冷却中", "a.json", "other-model"} {
+		for _, want := range []string{"冷却中 · 2", "a.json", "other-model"} {
 			if !strings.Contains(body, want) {
 				t.Fatalf("通知应包含 %q，实际: %s", want, body)
 			}
 		}
-		if strings.Contains(body, "hy4-preview-f 冷却至") {
-			t.Fatalf("不应重复列出本次触发的模型: %s", body)
+		// 本次触发的模型只应出现在告警头部（「模型: hy4-preview-f」），
+		// 清单段（「模型 hy4-preview-f 冷却 至」）不得重复列出。
+		if strings.Contains(body, "模型 hy4-preview-f 冷却") {
+			t.Fatalf("清单不应重复列出本次触发的模型: %s", body)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("未收到冷却通知")
 	}
 }
 
-// 无其他冷却项时不应追加空标题。
+// 无其他冷却项时不追加清单分节。
 func TestCooldownNotifyNoOtherCooling(t *testing.T) {
 	resetNotifyState()
 	got := make(chan string, 4)
@@ -1850,10 +1853,129 @@ func TestCooldownNotifyNoOtherCooling(t *testing.T) {
 	markCooldown(acc, time.Now().Add(10*time.Minute), "429")
 	select {
 	case body := <-got:
-		if strings.Contains(body, "其他冷却中") {
+		if strings.Contains(body, "冷却中 · ") {
 			t.Fatalf("无其他冷却项时不该追加清单: %s", body)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("未收到冷却通知")
+	}
+}
+
+// 冷却清单全量展示、不折叠：超过 5 项也必须逐条列出（主人要求“所有”）。
+func TestCooldownNotifyListsAllCooling(t *testing.T) {
+	now := time.Now()
+	accountMu.Lock()
+	oldAccounts := accounts
+	var list []*Account
+	for i := 0; i < 9; i++ {
+		list = append(list, &Account{
+			Path:          fmt.Sprintf("/tmp/acc%d.json", i),
+			Auth:          &StoredAuth{},
+			CooldownUntil: now.Add(time.Duration(i+1) * time.Minute),
+		})
+	}
+	accounts = list
+	accountMu.Unlock()
+	defer func() {
+		accountMu.Lock()
+		accounts = oldAccounts
+		accountMu.Unlock()
+	}()
+
+	items := collectCooldowns(now, nil, "")
+	if len(items) != 9 {
+		t.Fatalf("应汇总全部 9 个冷却账号，实际 %d", len(items))
+	}
+	// 升序：最早恢复的排最前
+	for i := 1; i < len(items); i++ {
+		if items[i].until.Before(items[i-1].until) {
+			t.Fatalf("清单未按恢复时间升序: %v", items)
+		}
+	}
+	html := cooldownSectionHTML(items)
+	if !strings.Contains(html, "冷却中 · 9") {
+		t.Fatalf("分节计数应为 9: %s", html)
+	}
+	if strings.Contains(html, "未列出") {
+		t.Fatalf("不应折叠任何冷却项: %s", html)
+	}
+	// 每个账号都应出现在清单里
+	for i := 0; i < 9; i++ {
+		if !strings.Contains(html, fmt.Sprintf("acc%d.json", i)) {
+			t.Fatalf("清单缺少 acc%d.json: %s", i, html)
+		}
+	}
+}
+
+// Telegram 通道发的是全库统一版式（HTML）：标题 + 分隔线、树形条目、机器值等宽、
+// 动态内容转义。webhook 通道仍发纯文本，不受影响。
+func TestTelegramNotifyUsesHTMLLayout(t *testing.T) {
+	resetNotifyState()
+	got := make(chan map[string]any, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var m map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&m)
+		select {
+		case got <- m:
+		default:
+		}
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	// 覆盖 Telegram API 地址不可注入，故直接验证 sendTelegram 走 HTML 的分支：
+	// 用 webhook 通道验证 Body 仍是纯文本，同时用 sendTelegram 的载荷构造间接验证。
+	accountMu.Lock()
+	oldAccounts := accounts
+	acc := &Account{Path: "/tmp/a&b.json", Auth: &StoredAuth{}}
+	accounts = []*Account{acc}
+	accountMu.Unlock()
+	defer func() {
+		accountMu.Lock()
+		accounts = oldAccounts
+		accountMu.Unlock()
+	}()
+
+	setNotify(notifyConfig{Enabled: true, Type: "webhook", Webhook: srv.URL, MinIntervalSeconds: 0})
+	defer setNotify(notifyConfig{})
+	markCooldown(acc, time.Now().Add(10*time.Minute), "429 rate limited")
+	select {
+	case m := <-got:
+		// webhook 通道：body 为纯文本，不含 HTML 标签
+		if strings.Contains(fmt.Sprintf("%v", m["body"]), "<code>") {
+			t.Fatalf("webhook 通道不应含 HTML 标签: %v", m["body"])
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("未收到通知")
+	}
+
+	// 直接验证 HTML 版式构建：转义 + 分隔线 + 树形前缀
+	var b strings.Builder
+	b.WriteString(tgTitle("⚠️ workbuddy 账号冷却（频率限制）"))
+	b.WriteString(tgPath("账号", "a&b.json"))
+	if !strings.Contains(b.String(), tgSep) {
+		t.Fatalf("标题块应含分隔线: %s", b.String())
+	}
+	if !strings.Contains(b.String(), "<code>a&amp;b.json</code>") {
+		t.Fatalf("机器值应等宽且转义: %s", b.String())
+	}
+}
+
+// 分片：长消息按 4000 字符切分，且不切断 UTF-8 多字节字符。
+func TestChunkMessagePreservesUTF8(t *testing.T) {
+	long := strings.Repeat("中文测试内容", 1200) // 远超 4000 字符
+	chunks := chunkMessage(long, 4000)
+	if len(chunks) < 2 {
+		t.Fatalf("长消息应分片，实际 %d 片", len(chunks))
+	}
+	var joined strings.Builder
+	for _, c := range chunks {
+		if !utf8.ValidString(c) {
+			t.Fatalf("分片切断了 UTF-8 字符")
+		}
+		joined.WriteString(c)
+	}
+	if joined.String() != long {
+		t.Fatalf("分片重组后与原文不一致")
 	}
 }

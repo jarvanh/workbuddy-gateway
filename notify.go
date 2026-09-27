@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // 事件类型
@@ -53,7 +54,12 @@ type notifyEvent struct {
 	Level string
 	Title string
 	Body  string
-	Time  time.Time
+	// HTML 是 Telegram 用的完整 HTML 正文（含标题/分隔线/树形条目）。
+	// 与全库通知版式同源（.github/scripts/telegram/tg_notify.sh 与
+	// docs/telegram-notify.md），故 Telegram 通道优先发它；webhook 通道仍发
+	// Title/Body 纯文本（webhook 是通用 JSON 消费者，不假设 HTML）。
+	HTML string
+	Time time.Time
 }
 
 var (
@@ -133,10 +139,15 @@ func dispatchNotify(ev notifyEvent) {
 	notifyLast[ev.Key] = ev.Time
 	notifyMu.Unlock()
 
-	text := ev.Title + "\n" + ev.Body
 	var err error
 	if strings.EqualFold(strings.TrimSpace(cfg.Type), "telegram") {
-		err = sendTelegram(cfg, text)
+		// Telegram 走全库统一版式（HTML）：有 HTML 正文就用它，
+		// 否则退回纯文本 Title+Body（调用方尚未提供 HTML 的兜底）。
+		html := ev.HTML
+		if html == "" {
+			html = escapeHTML(ev.Title) + "\n" + escapeHTML(ev.Body)
+		}
+		err = sendTelegram(cfg, html)
 	} else {
 		err = sendWebhook(cfg, ev)
 	}
@@ -184,18 +195,138 @@ func sendTelegram(cfg notifyConfig, text string) error {
 		return fmt.Errorf("telegram 配置不完整（botToken/chatId 均缺失）")
 	}
 	url := "https://api.telegram.org/bot" + token + "/sendMessage"
-	payload, err := json.Marshal(map[string]string{"chat_id": chat, "text": text})
-	if err != nil {
-		return err
-	}
-	resp, err := notifyClient.Post(url, "application/json", bytes.NewReader(payload))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
+	// 按 4000 字符分片（与 tg_notify.sh send_tg_chunked 同口径，Telegram 上限 4096），
+	// 尽量在换行处断开，避免切断 UTF-8 多字节字符。
+	for _, chunk := range chunkMessage(text, 4000) {
+		payload, err := json.Marshal(map[string]any{
+			"chat_id":                  chat,
+			"text":                     chunk,
+			"parse_mode":               "HTML",
+			"disable_web_page_preview": true,
+		})
+		if err != nil {
+			return err
+		}
+		resp, err := notifyClient.Post(url, "application/json", bytes.NewReader(payload))
+		if err != nil {
+			return err
+		}
 		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("telegram HTTP %d: %s", resp.StatusCode, truncate(string(b), 200))
+		resp.Body.Close()
+		if resp.StatusCode >= 300 {
+			// HTML 解析失败不退化重发：消息本就没发出去，退化只会把版式 bug 藏起来
+			// （与 tg_notify.sh _tg_send_once 同口径）。
+			return fmt.Errorf("telegram HTTP %d: %s", resp.StatusCode, truncate(string(b), 200))
+		}
 	}
 	return nil
+}
+
+// chunkMessage 按 max 字符分片，尽量在换行处断开，不切断 UTF-8 多字节字符。
+// 与 tg_notify.sh send_tg_chunked 同口径（那边走 python 实现，此处是 Go 等价物）。
+func chunkMessage(s string, max int) []string {
+	if max <= 0 || len(s) <= max {
+		return []string{s}
+	}
+	var chunks []string
+	for len(s) > max {
+		end := max
+		// 回退到换行处（仅当断点不过分靠前时采用，避免碎成大量短消息）
+		if idx := strings.LastIndex(s[:end], "\n"); idx > end/2 {
+			end = idx + 1
+		} else {
+			// 无合适换行：回退到不切断 UTF-8 的边界
+			for end > 0 && !utf8.RuneStart(s[end]) {
+				end--
+			}
+		}
+		chunks = append(chunks, s[:end])
+		s = s[end:]
+	}
+	if len(s) > 0 {
+		chunks = append(chunks, s)
+	}
+	return chunks
+}
+
+// ===== Telegram 版式助手（与 .github/scripts/telegram/tg_notify.sh 同源）=====
+//
+// 版式真源是 docs/telegram-notify.md：标题 + 分隔线、`标签：值` 取值行、
+// 分节 `{emoji} 分节 · N`、树形条目 `<code>  ├─/└─ </code>`、收尾区。
+// 全库只有三种标签：<code>（机器值）、<pre>（多行块）、<a>（链接），其余裸文本，
+// 动态内容必须转义（& < > 会触发 400）。
+
+// tgSep 统一分隔线（18 个全角横线）。
+const tgSep = "━━━━━━━━━━━━━━━━━━"
+
+// escapeHTML HTML 实体转义（Telegram parse_mode=HTML）。
+func escapeHTML(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	return s
+}
+
+// tgTitle 标题块："标题\n分隔线\n"。
+func tgTitle(title string) string {
+	return escapeHTML(title) + "\n" + tgSep + "\n"
+}
+
+// tgKV 取值行（自然语言值，裸文本）："标签：值\n"。
+func tgKV(label, value string) string {
+	return label + "：" + escapeHTML(value) + "\n"
+}
+
+// tgPath 取值行（机器值，等宽）："标签：<code>值</code>\n"。
+func tgPath(label, value string) string {
+	return label + "：<code>" + escapeHTML(value) + "</code>\n"
+}
+
+// tgSection 分节标题："\n{标题}\n"（段前空一行与上一区块分隔；
+// 紧跟标题分隔线时不再补空行，与 tg_notify.sh tg_add_section 同口径）。
+func tgSection(b *strings.Builder, title string) {
+	cur := b.String()
+	switch {
+	case cur == "" || strings.HasSuffix(cur, tgSep+"\n"):
+	case strings.HasSuffix(cur, "\n"):
+		b.WriteString("\n")
+	default:
+		b.WriteString("\n\n")
+	}
+	b.WriteString(escapeHTML(title) + "\n")
+}
+
+// tgEntry 条目行（主体是机器值）："<code>主体</code> · 元数据…"（无尾换行）。
+func tgEntry(subject string, meta ...string) string {
+	out := "<code>" + escapeHTML(subject) + "</code>"
+	for _, m := range meta {
+		if m != "" {
+			out += " · " + escapeHTML(m)
+		}
+	}
+	return out
+}
+
+// treeLines 多行条目 → 树形列表（末条 └─，其余 ├─；前缀等宽，无尾换行）。
+func treeLines(entries []string) string {
+	var sb strings.Builder
+	for i, e := range entries {
+		if i == len(entries)-1 {
+			sb.WriteString("<code>  └─ </code>" + e)
+		} else {
+			sb.WriteString("<code>  ├─ </code>" + e)
+		}
+		if i != len(entries)-1 {
+			sb.WriteString("\n")
+		}
+	}
+	return sb.String()
+}
+
+// treeSub 树形子行前缀（与 treeLines 的 ├─/└─ 定宽一致，5 字符）。
+func treeSub(isLast bool) string {
+	if isLast {
+		return "<code>     </code>"
+	}
+	return "<code>  │  </code>"
 }
