@@ -916,6 +916,7 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 	}
 	observeModelCredit(acc, modelName, usage, reqID)
 	recordModelTokens(modelName, usage, reqID)
+	recordUsageLine(r, modelName, usage)
 	emit("response.completed", map[string]any{"response": final})
 
 	_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")

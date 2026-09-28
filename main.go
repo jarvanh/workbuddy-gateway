@@ -3963,6 +3963,7 @@ func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Respo
 	}
 	observeModelCredit(acc, modelName, usage, reqID)
 	recordModelTokens(modelName, usage, reqID)
+	recordUsageLine(r, modelName, usage)
 	recordModelTTFT(modelName, body.duration())
 	recordModelLatency(modelName, time.Since(startTime))
 	if scanErr == nil && finishReason != "" {
@@ -4033,6 +4034,7 @@ func handleNonStreamUpstream(
 		}
 		observeModelCredit(acc, modelName, usage, reqID)
 		recordModelTokens(modelName, usage, reqID)
+		recordUsageLine(r, modelName, usage)
 		recordModelTTFT(modelName, body.duration())
 		recordModelLatency(modelName, time.Since(startTime))
 		w.Header().Set("Content-Type", "application/json")
