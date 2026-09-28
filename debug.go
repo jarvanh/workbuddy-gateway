@@ -37,6 +37,10 @@ type runtimeFileConfig struct {
 		// TransientRetries：请求体发送阶段遇到瞬时网络错误的额外重试次数。
 		// 用指针区分「未配置」（用默认值）与「显式设为 0」（禁用重试）。
 		TransientRetries *int `json:"transientRetries"`
+		// EarlyFlushGraceSeconds：流式「响应头先行」宽限期（秒）。宽限期内失败
+		// 保持真实 HTTP 状态码；超期提前下发 200+SSE 头规避 CDN 524。指针区分
+		// 「未配置」（默认 30s）与「显式设为 0」（完全禁用，回到旧行为）。
+		EarlyFlushGraceSeconds *int `json:"earlyFlushGraceSeconds"`
 	} `json:"upstream"`
 	// Models 段可选，用于按模型名做黑白名单控制（大小写不敏感）。
 	Models struct {
@@ -151,6 +155,11 @@ func loadRuntimeConfig(path string) error {
 	}
 	if n := fileCfg.Upstream.TransientRetries; n != nil && *n >= 0 {
 		upstreamTransientRetries = *n
+	}
+	// 响应头先行宽限期：未配置用默认 30s，显式 0 完全禁用（回到旧行为）。
+	upstreamEarlyFlushGrace = upstreamEarlyFlushGraceDefault
+	if n := fileCfg.Upstream.EarlyFlushGraceSeconds; n != nil && *n >= 0 {
+		upstreamEarlyFlushGrace = time.Duration(*n) * time.Second
 	}
 
 	// 签到与 Buddy 旅行开关：省略字段恢复默认开启，显式 false 关闭。

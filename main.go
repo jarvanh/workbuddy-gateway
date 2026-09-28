@@ -3485,8 +3485,12 @@ func authMiddleware(next http.Handler) http.Handler {
 // upstreamChat 完成「多账号轮询 + 429 冷却代偿 + 授权失效禁用 + 单账号串行」的上游调度。
 // 成功时返回 200 响应（调用方负责关闭 Body）与命中的账号/站点；失败时函数内部已写回
 // 错误响应并返回 ok=false。Chat Completions 与 Responses 两个入口共用此逻辑。
-func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelName string, upstreamBytes []byte, startTime time.Time) (*http.Response, *Account, *upstreamProfile, bool) {
-	traceID := w.Header().Get("X-Trace-ID")
+// ef 为「响应头先行」闸门：流式路径传入（nil 表示禁用/非流式），失败出口经
+// ef.fail 保序；生命周期由本函数 defer stop 收尾，避免定时器在流式直写阶段触发。
+// traceID 由调用方在创建闸门之前读取后显式传入：早发定时器触发后会并发写
+// 响应头，主流程此后再碰 Header() 即构成数据竞争（race detector 实锤过）。
+func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID uint64, modelName string, upstreamBytes []byte, startTime time.Time, ef *earlyFlushGate) (*http.Response, *Account, *upstreamProfile, bool) {
+	defer ef.stop()
 	log.Printf("[业务入口] traceId=%s requestId=%d 业务=上游模型调用 请求体字节数=%d", traceID, reqID, len(upstreamBytes))
 	recordModelRequest(modelName)
 	accountMu.Lock()
@@ -3499,7 +3503,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			"business_impact": "没有可用登录凭据，未调用上游模型",
 		})
 		recordModelFailure(modelName, "no_auth")
-		writeOpenAIError(w, http.StatusUnauthorized, "no_auth", "未找到有效登录凭据，请先执行 login 命令扫码登录")
+		ef.fail(w, http.StatusUnauthorized, "no_auth", "未找到有效登录凭据，请先执行 login 命令扫码登录")
 		return nil, nil, nil, false
 	}
 
@@ -3517,7 +3521,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 					"status_code": http.StatusForbidden, "reason": "没有符合模型账号名单的凭据", "business_impact": "未进入上游调用",
 				})
 				recordModelFailure(modelName, "账号名单拒绝")
-				writeOpenAIError(w, http.StatusForbidden, "model_account_disabled", fmt.Sprintf("模型 %s 没有可用的凭据文件：已被账号黑白名单禁用", modelName))
+				ef.fail(w, http.StatusForbidden, "model_account_disabled", fmt.Sprintf("模型 %s 没有可用的凭据文件：已被账号黑白名单禁用", modelName))
 				return nil, nil, nil, false
 			}
 			// 所有账号均不可用（冷却或失效）
@@ -3541,7 +3545,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 				"business_impact": "未调用上游模型",
 			})
 			recordModelFailure(modelName, "无可用账号")
-			writeOpenAIError(w, http.StatusServiceUnavailable, "no_available_account", msg)
+			ef.fail(w, http.StatusServiceUnavailable, "no_available_account", msg)
 			return nil, nil, nil, false
 		}
 		attempted[acc] = true
@@ -3605,7 +3609,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			recordModelFailure(modelName, "网络错误")
 			if clientGone {
 				// 客户端已断开：不再回退其他账号，直接结束
-				writeOpenAIError(w, http.StatusBadGateway, "upstream_network_error", fmt.Sprintf("网络转发失败: %v", err))
+				ef.fail(w, http.StatusBadGateway, "upstream_network_error", fmt.Sprintf("网络转发失败: %v", err))
 				return nil, nil, nil, false
 			}
 			lastNetErr = err.Error()
@@ -3632,7 +3636,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 					msg := fmt.Sprintf("当前模型 %s 已在余额耗尽账号 %s 上完成受控探测并确认需要付费额度，本次不再探测其他耗尽账号", modelName, acc.Path)
 					log.Printf("[#%d] %s", reqID, msg)
 					recordModelFailure(modelName, modelStatusFromError(resp.StatusCode, errStr))
-					writeOpenAIError(w, http.StatusServiceUnavailable, "model_requires_quota", msg)
+					ef.fail(w, http.StatusServiceUnavailable, "model_requires_quota", msg)
 					return nil, nil, nil, false
 				}
 				lastRateErr = errStr
@@ -3648,7 +3652,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 				if selection == selectionProbeExhausted {
 					msg := fmt.Sprintf("当前模型 %s 在余额耗尽账号 %s 的受控探测中触发模型级限流，本次不再探测其他耗尽账号", modelName, acc.Path)
 					recordModelFailure(modelName, modelStatusFromError(resp.StatusCode, errStr))
-					writeOpenAIError(w, http.StatusServiceUnavailable, "model_rate_limited", msg)
+					ef.fail(w, http.StatusServiceUnavailable, "model_rate_limited", msg)
 					return nil, nil, nil, false
 				}
 				lastRateErr = errStr
@@ -3691,7 +3695,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			}
 
 			recordModelFailure(modelName, modelStatusFromError(resp.StatusCode, errStr))
-			writeOpenAIError(w, resp.StatusCode, "upstream_error", fmt.Sprintf("upstream %d: %s", resp.StatusCode, errStr))
+			ef.fail(w, resp.StatusCode, "upstream_error", fmt.Sprintf("upstream %d: %s", resp.StatusCode, errStr))
 			return nil, nil, nil, false
 		}
 
@@ -3715,7 +3719,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			"tried_accounts":  poolSize,
 			"business_impact": "所有账号上游网络调用均失败",
 		})
-		writeOpenAIError(w, http.StatusBadGateway, "upstream_network_error",
+		ef.fail(w, http.StatusBadGateway, "upstream_network_error",
 			fmt.Sprintf("已依次尝试全部 %d 个账号仍网络转发失败，最近一次错误: %s", poolSize, truncate(lastNetErr, 200)))
 		return nil, nil, nil, false
 	}
@@ -3726,7 +3730,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			"tried_accounts":  poolSize,
 			"business_impact": "所有账号上游均返回瞬时错误",
 		})
-		writeOpenAIError(w, http.StatusBadGateway, "upstream_error",
+		ef.fail(w, http.StatusBadGateway, "upstream_error",
 			fmt.Sprintf("已依次尝试全部 %d 个账号仍失败，最近一次上游错误: %s", poolSize, truncate(lastUpstreamErr, 200)))
 		return nil, nil, nil, false
 	}
@@ -3736,7 +3740,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 		"reason":          "all_accounts_cooldown",
 		"business_impact": "未调用上游模型",
 	})
-	writeOpenAIError(w, http.StatusTooManyRequests, "all_accounts_cooldown", "所有账号均处于冷却状态")
+	ef.fail(w, http.StatusTooManyRequests, "all_accounts_cooldown", "所有账号均处于冷却状态")
 	return nil, nil, nil, false
 }
 
@@ -3839,7 +3843,13 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if isStream {
-		resp, acc, prof, ok := upstreamChat(w, r, reqID, modelName, upstreamBytes, startTime)
+		// 响应头先行：宽限期内失败仍返回真实 HTTP 状态码（CliRelay 可按码重试）；
+		// 超期则提前下发 200+SSE 头，规避 CDN 边缘 ~100s 无响应头硬超时（524）。
+		// traceID 先于建闸读取：早发定时器触发后会并发写响应头，之后主流程
+		// 再碰 Header() 即构成数据竞争。
+		traceID := w.Header().Get("X-Trace-ID")
+		ef := newEarlyFlushGate(w, true, traceID, reqID)
+		resp, acc, prof, ok := upstreamChat(w, r, traceID, reqID, modelName, upstreamBytes, startTime, ef)
 		if !ok {
 			return
 		}
@@ -3980,8 +3990,11 @@ func handleNonStreamUpstream(
 	startTime time.Time,
 	buildResponse func(completionJSON []byte) (finalJSON []byte, usage map[string]any, err error),
 ) {
+	// 非流式不建闸门，此处读 Header 安全；upstreamChat 统一要求显式传 traceID。
+	traceID := w.Header().Get("X-Trace-ID")
 	for attempt := 1; ; attempt++ {
-		resp, acc, prof, ok := upstreamChat(w, r, reqID, modelName, upstreamBytes, startTime)
+		// 非流式：响应头必须承载真实状态码与完整 JSON，不启用早发（传 nil）。
+		resp, acc, prof, ok := upstreamChat(w, r, traceID, reqID, modelName, upstreamBytes, startTime, nil)
 		if !ok {
 			return
 		}

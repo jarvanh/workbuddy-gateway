@@ -137,7 +137,9 @@ func TestFallbackBudgetByCredits(t *testing.T) {
 		Window:         &routingWindow{Start: "23:00", End: "08:00"},
 		FallbackBudget: &routingBudget{Credits: 1},
 	}
-	now := time.Date(2026, 9, 25, 12, 0, 0, 0, loc) // 窗口外
+	// 窗口外取「今天 12:00」而非固定日期：预算记录按「保留今天±1 天」清扫，
+	// 固定日期跨天后会被清掉导致断言失败（曾用 2026-09-25，09-28 起必挂）。
+	now := time.Date(time.Now().In(loc).Year(), time.Now().In(loc).Month(), time.Now().In(loc).Day(), 12, 0, 0, 0, loc) // 窗口外
 
 	if got := evaluateSite(rule, "m-budget", now, loc, cfg); got != siteBudgeted {
 		t.Fatalf("窗口外且预算未耗时应为 BUDGETED，实际=%v", got)

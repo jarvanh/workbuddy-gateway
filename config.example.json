@@ -5,7 +5,8 @@
   "upstream": {
     "headerTimeoutSeconds": 300,
     "idleTimeoutSeconds": 120,
-    "transientRetries": 2
+    "transientRetries": 2,
+    "earlyFlushGraceSeconds": 30
   },
   "models": {
     "blocklist": [],

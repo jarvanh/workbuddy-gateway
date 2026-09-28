@@ -110,7 +110,11 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[#%d] POST /v1/responses -> Upstream [Model: %s, Stream: %v]", reqID, modelName, isStream)
 
 	if isStream {
-		resp, acc, prof, ok := upstreamChat(w, r, reqID, modelName, upstreamBytes, startTime)
+		// 与 /v1/chat/completions 同款「响应头先行」，规避 CDN 边缘 524。
+		// traceID 先于建闸读取，避免与早发定时器并发写响应头构成数据竞争。
+		traceID := w.Header().Get("X-Trace-ID")
+		ef := newEarlyFlushGate(w, true, traceID, reqID)
+		resp, acc, prof, ok := upstreamChat(w, r, traceID, reqID, modelName, upstreamBytes, startTime, ef)
 		if !ok {
 			return
 		}

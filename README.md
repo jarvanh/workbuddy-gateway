@@ -258,17 +258,24 @@ workbuddy-gateway serve -models-refresh 0
 | 非流式聚合期间流中断 | 聚合完成前未向客户端写出任何字节 → 回退账号池重新请求（最多 3 次），绝不返回截断内容 |
 | 流式传输中途断流 | 已有部分内容发出，无法透明重试 → 下发 `upstream_stream_interrupted` 明确错误事件（不伪造正常结束） |
 
-两个上游超时与重试次数可在工作目录 `config.json` 的 `upstream` 段覆盖（超时单位秒，省略或非正数则用默认值；`networkRetries` 省略用默认值，显式 `0` 关闭原地重试）：
+两个上游超时与重试次数可在工作目录 `config.json` 的 `upstream` 段覆盖（超时单位秒，省略或非正数则用默认值；`networkRetries` 省略用默认值，显式 `0` 关闭原地重试；`earlyFlushGraceSeconds` 省略用默认 30 秒，显式 `0` 完全禁用响应头先行）：
 
 ```json
 {
   "upstream": {
     "headerTimeoutSeconds": 300,
     "idleTimeoutSeconds": 120,
-    "transientRetries": 2
+    "transientRetries": 2,
+    "earlyFlushGraceSeconds": 30
   }
 }
 ```
+
+**响应头先行（early flush）**
+
+客户端经 Cloudflare Tunnel 等反向代理访问时，CDN 边缘对「已建连但迟迟拿不到响应头」的请求有 ~100 秒硬超时（HTTP 524）。实测大上下文请求 + 并发排队时，账号调度与上游首字延迟叠加会把首字节时间（TTFB）推过 100 秒：请求明明活着，却被边缘掐断。
+
+流式请求启用响应头先行：宽限期内失败仍返回真实 HTTP 状态码（下游可按码重试）；宽限期耗尽仍没等到上游响应，网关提前下发 `200 + text/event-stream` 响应头，CDN 的等待计时随之停止。此后上游若失败，降级为 SSE `error` 事件（与流中断同一红线：不伪造 `[DONE]`）；若成功则照常透传流，客户端无感。仅流式路径启用；非流式在本地聚合，不适用。
 
 **瞬时网络错误重试**
 
