@@ -258,6 +258,12 @@ var (
 	}
 )
 
+// allRoutingSites 返回全部已知站点 key，供 routing「站点白名单」语义使用：
+// 规则命中的模型，未声明的站点一律 FORBIDDEN（2026-09-29 事故修复）。
+func allRoutingSites() []string {
+	return []string{profileCN.Key, profileINTL.Key}
+}
+
 // profileForEdition 根据凭据文件中的 edition 标识返回上游站点参数；空值/未知值回退国内站。
 func profileForEdition(edition string) *upstreamProfile {
 	switch strings.ToLower(strings.TrimSpace(edition)) {
@@ -401,6 +407,7 @@ type Account struct {
 	QuotaKnown     bool                          // 是否已成功获取过额度
 	QuotaExhausted bool                          // 已确认额度为 0；额度扫描发现恢复后自动解除
 	ModelStates    map[string]*modelRuntimeState // 按模型隔离的成本、限流和额度阻断状态
+	inFlight       map[uint64]inFlightReserve    // 在途预留：reqID → 预留 credit（运行时，不入盘）
 	fingerprint    string                        // 凭据文件变更指纹（mtime+size，凭据热加载用）
 	lock           sync.Mutex                    // 单账号串行锁（防止同账号并发触发 11128）
 }
@@ -1186,7 +1193,7 @@ func usableForModelLocked(acc *Account, model string, now time.Time) (accountSel
 }
 
 // nextAccountForModel 按「免费耗尽账号优先 → 有余额账号 → 零余额未知模型受控探测」选号。
-func nextAccountForModel(model string, attempted map[*Account]bool) (*Account, accountSelectionKind, error) {
+func nextAccountForModel(model string, attempted map[*Account]bool, reqID uint64) (*Account, accountSelectionKind, error) {
 	// 站点优先级必须在加锁前计算：preferredFreeSites 会读取账号账本并自行获取 accountMu，
 	// 若在持锁期间调用会自锁。语义：该模型「一个站点免费、另一个站点收费」时优先用免费站点，
 	// 直到该站点账号全部不可用；其余情况不搞优先，正常轮询。
@@ -1243,6 +1250,11 @@ func nextAccountForModel(model string, attempted map[*Account]bool) (*Account, a
 				}
 				// v6：保底余额（账号安全闸，优先于预算破例；拦截即零消耗不扣预算）
 				if !guardMinBalance(acc, model) {
+					continue
+				}
+				// v6.1：在途预留（并发烧穿护栏）：已在途请求按预留额记账，
+				// 避免「选号时余额够、请求过程中被烧穿」（2026-09-29 事故）
+				if !reserveInFlightLocked(acc, reqID, model) {
 					continue
 				}
 				if kind == selectionProbeExhausted {
@@ -1345,7 +1357,7 @@ func nextAccountForModel(model string, attempted map[*Account]bool) (*Account, a
 }
 
 func nextAccount() (*Account, error) {
-	acc, _, err := nextAccountForModel("", nil)
+	acc, _, err := nextAccountForModel("", nil, 0)
 	return acc, err
 }
 
@@ -2250,6 +2262,17 @@ func observeModelCredit(acc *Account, model string, usage map[string]any, reqID 
 		state.CostClass = modelCostPaid
 	}
 	state.ObservedAt = time.Now()
+	// 实时扣减额度：额度扫描间隔内并发请求会把额度烧穿而选号侧仍看到旧值，
+	// 这里按实际扣费先行扣减，让静态保底与在途预留都基于最新额度（扫描时以真值校准）。
+	if credit > 0 && acc.QuotaKnown {
+		acc.QuotaRemaining -= credit
+		if acc.QuotaRemaining < 0 {
+			acc.QuotaRemaining = 0
+		}
+		if acc.QuotaRemaining <= 0 {
+			acc.QuotaExhausted = true
+		}
+	}
 	quotaExhausted := acc.QuotaExhausted
 	path := acc.Path
 	accountMu.Unlock()
@@ -3209,6 +3232,7 @@ func runLogin() {
 func runServe() {
 	loadModelsCache()
 	loadRoutingSpend() // v6：恢复站点模型预算消耗（重启不再清零）
+	loadPriceLedger()  // 恢复站点价格账本：重启不得让价格记忆清零（2026-09-29 事故修复）
 	if err := loadAccounts(); err != nil {
 		fmt.Printf("警告: 未检测到有效凭据 (%v)。\n请先执行: workbuddy-gateway login 扫码登录，或确保凭据文件存在。\n\n", err)
 	} else {
@@ -3512,8 +3536,15 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 	var lastNetErr string
 	var lastUpstreamErr string
 	attempted := make(map[*Account]bool, poolSize)
+	// pendingRelease 记录本轮已提交在途预留的账号：换号/失败路径必须释放，
+	// 成功路径由调用方（流式写完后）释放，见 handleChatCompletions 的 defer。
+	var pendingRelease *Account
 	for attempt := 0; attempt < poolSize; attempt++ {
-		acc, selection, err := nextAccountForModel(modelName, attempted)
+		if pendingRelease != nil {
+			releaseInFlight(pendingRelease, reqID)
+			pendingRelease = nil
+		}
+		acc, selection, err := nextAccountForModel(modelName, attempted, reqID)
 		if err != nil {
 			if errors.Is(err, errModelAccountPolicy) {
 				log.Printf("[请求被拒绝] traceId=%s requestId=%d 模型=%s 原因=账号黑白名单没有匹配的凭据 返回状态码=403 业务影响=未进入上游", traceID, reqID, modelName)
@@ -3549,6 +3580,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 			return nil, nil, nil, false
 		}
 		attempted[acc] = true
+		pendingRelease = acc
 		debugSetAccount(r, acc.Path)
 		debugEvent(r, "debug", "account_selected", map[string]any{
 			"selection": string(selection),
@@ -3609,6 +3641,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 			recordModelFailure(modelName, "网络错误")
 			if clientGone {
 				// 客户端已断开：不再回退其他账号，直接结束
+				releasePendingInFlight(pendingRelease, reqID)
 				ef.fail(w, http.StatusBadGateway, "upstream_network_error", fmt.Sprintf("网络转发失败: %v", err))
 				return nil, nil, nil, false
 			}
@@ -3636,6 +3669,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 					msg := fmt.Sprintf("当前模型 %s 已在余额耗尽账号 %s 上完成受控探测并确认需要付费额度，本次不再探测其他耗尽账号", modelName, acc.Path)
 					log.Printf("[#%d] %s", reqID, msg)
 					recordModelFailure(modelName, modelStatusFromError(resp.StatusCode, errStr))
+					releasePendingInFlight(pendingRelease, reqID)
 					ef.fail(w, http.StatusServiceUnavailable, "model_requires_quota", msg)
 					return nil, nil, nil, false
 				}
@@ -3652,6 +3686,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 				if selection == selectionProbeExhausted {
 					msg := fmt.Sprintf("当前模型 %s 在余额耗尽账号 %s 的受控探测中触发模型级限流，本次不再探测其他耗尽账号", modelName, acc.Path)
 					recordModelFailure(modelName, modelStatusFromError(resp.StatusCode, errStr))
+					releasePendingInFlight(pendingRelease, reqID)
 					ef.fail(w, http.StatusServiceUnavailable, "model_rate_limited", msg)
 					return nil, nil, nil, false
 				}
@@ -3695,6 +3730,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 			}
 
 			recordModelFailure(modelName, modelStatusFromError(resp.StatusCode, errStr))
+			releasePendingInFlight(pendingRelease, reqID)
 			ef.fail(w, resp.StatusCode, "upstream_error", fmt.Sprintf("upstream %d: %s", resp.StatusCode, errStr))
 			return nil, nil, nil, false
 		}
@@ -3709,6 +3745,11 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 		// 关闭响应体时会一并取消上游 context，完成清理。
 		resp.Body = newIdleReadCloser(resp.Body, upstreamIdleTimeout, upstreamCancel)
 		return resp, acc, prof, true
+	}
+	// 账号全部尝试失败：释放在途预留，交由调用方报错（成功路径预留不在此释放）
+	if pendingRelease != nil {
+		releaseInFlight(pendingRelease, reqID)
+		pendingRelease = nil
 	}
 
 	// 账号池中每个账号都尝试过且均失败（网络错误 / 上游瞬时错误 / 冷却等）
@@ -3853,6 +3894,8 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			return
 		}
+		// 流式写完后释放在途预留（含 usage 记账，此时额度已按实际扣费更新）
+		defer releaseInFlight(acc, reqID)
 		streamChatResponse(w, r, resp, modelName, reqID, acc, prof, startTime)
 		return
 	}
@@ -4002,6 +4045,8 @@ func handleNonStreamUpstream(
 		body := newTTFTReader(resp.Body, startTime)
 		completionJSON, aggErr := aggregateCompletion(body, modelName)
 		resp.Body.Close()
+		// 本轮请求已结束（聚合完成/中断），释放在途预留；回退重试会重新预留
+		releaseInFlight(acc, reqID)
 		if aggErr != nil {
 			recordModelFailure(modelName, "聚合中断")
 			debugEvent(r, "error", "aggregate_response_failed", map[string]any{

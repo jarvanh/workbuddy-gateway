@@ -176,21 +176,21 @@ func TestModelAccountPolicySelectionAndNoFallback(t *testing.T) {
 		accounts, rrIndex = oldAccounts, oldRR
 		accountMu.Unlock()
 	})
-	selected, _, err := nextAccountForModel("m", nil)
+	selected, _, err := nextAccountForModel("m", nil, 0)
 	if err != nil || selected != a {
 		t.Fatalf("selection=%v err=%v", selected, err)
 	}
-	if selected, _, err := nextAccountForModel("m", map[*Account]bool{a: true}); selected != nil || err == nil {
+	if selected, _, err := nextAccountForModel("m", map[*Account]bool{a: true}, 0); selected != nil || err == nil {
 		t.Fatalf("fallback selected blocked account: %v, %v", selected, err)
 	}
-	selected, _, err = nextAccountForModel("other", nil)
+	selected, _, err = nextAccountForModel("other", nil, 0)
 	if err != nil || selected != b {
 		t.Fatalf("policy leaked to other model: %v, %v", selected, err)
 	}
 	if err := setModelAccountFilter(map[string]modelAccountFileConfig{"m": {Allowlist: []string{"absent.json"}}}); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err = nextAccountForModel("m", nil)
+	_, _, err = nextAccountForModel("m", nil, 0)
 	if !errors.Is(err, errModelAccountPolicy) {
 		t.Fatalf("expected policy-specific rejection, got %v", err)
 	}

@@ -272,7 +272,7 @@ func TestEarliestRecoveryRenderedUTC8(t *testing.T) {
 		accountMu.Unlock()
 	}()
 
-	_, _, err := nextAccountForModel("m", nil)
+	_, _, err := nextAccountForModel("m", nil, 0)
 	if err == nil {
 		t.Fatal("expected error when all accounts cooling")
 	}
@@ -312,7 +312,7 @@ func TestNextAccountForModelPrefersKnownFreeExhausted(t *testing.T) {
 	rrIndex = 0
 	accountMu.Unlock()
 
-	acc, kind, err := nextAccountForModel("free-model", nil)
+	acc, kind, err := nextAccountForModel("free-model", nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,11 +329,11 @@ func TestNextAccountForModelAllowsOneUnknownProbe(t *testing.T) {
 	rrIndex = 0
 	accountMu.Unlock()
 
-	acc, kind, err := nextAccountForModel("unknown-model", nil)
+	acc, kind, err := nextAccountForModel("unknown-model", nil, 0)
 	if err != nil || acc.Path != "a.json" || kind != selectionProbeExhausted {
 		t.Fatalf("expected one controlled probe, acc=%v kind=%s err=%v", acc, kind, err)
 	}
-	if _, _, err = nextAccountForModel("unknown-model", nil); err == nil || !strings.Contains(err.Error(), "等待探测=1") {
+	if _, _, err = nextAccountForModel("unknown-model", nil, 0); err == nil || !strings.Contains(err.Error(), "等待探测=1") {
 		t.Fatalf("expected probe cooldown error, got %v", err)
 	}
 }
@@ -347,7 +347,7 @@ func TestNextAccountForModelSkipsPaidAndQuotaBlocked(t *testing.T) {
 	}
 	rrIndex = 0
 	accountMu.Unlock()
-	if _, _, err := nextAccountForModel("paid-model", nil); err == nil || !strings.Contains(err.Error(), "额度阻断=1") {
+	if _, _, err := nextAccountForModel("paid-model", nil, 0); err == nil || !strings.Contains(err.Error(), "额度阻断=1") {
 		t.Fatalf("expected model quota block, got %v", err)
 	}
 }
@@ -359,10 +359,10 @@ func TestModelCooldownOnlyBlocksTriggeringModel(t *testing.T) {
 	}}}
 	rrIndex = 0
 	accountMu.Unlock()
-	if _, _, err := nextAccountForModel("limited-model", nil); err == nil || !strings.Contains(err.Error(), "模型冷却=1") {
+	if _, _, err := nextAccountForModel("limited-model", nil, 0); err == nil || !strings.Contains(err.Error(), "模型冷却=1") {
 		t.Fatalf("expected model cooldown, got %v", err)
 	}
-	acc, _, err := nextAccountForModel("other-model", nil)
+	acc, _, err := nextAccountForModel("other-model", nil, 0)
 	if err != nil || acc.Path != "a.json" {
 		t.Fatalf("other model should remain usable, acc=%v err=%v", acc, err)
 	}
@@ -485,7 +485,7 @@ func TestQuotaBlockedShortCircuitsScheduling(t *testing.T) {
 		accounts = oldAccounts
 		accountMu.Unlock()
 	}()
-	if _, _, err := nextAccountForModel("m", nil); err == nil {
+	if _, _, err := nextAccountForModel("m", nil, 0); err == nil {
 		t.Fatal("quota-blocked account must not be selected for the model")
 	}
 }

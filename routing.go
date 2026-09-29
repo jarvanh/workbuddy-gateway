@@ -16,10 +16,12 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -219,19 +221,108 @@ func routingLocation(cfg routingConfig) *time.Location {
 // -----------------------------------------------------------------------------
 
 type sitePriceSample struct {
-	Credit float64
-	Tokens int64
+	Credit float64 `json:"credit"`
+	Tokens int64   `json:"tokens"`
 	// LastCredit 记录最近一次真实请求的扣费。
 	// 免费/收费判定必须看「最近一次」而非累积：限时免费模型在免费期内
 	// 累积 Credit 仍可能 >0，用累积会把当期免费的模型误判为收费。
 	// 累积 Credit/Tokens 只用于数值定价（大样本校准），不做 free/paid 判定。
-	LastCredit float64
+	LastCredit float64 `json:"lastCredit"`
 }
 
 var (
 	sitePriceMu      sync.Mutex
 	sitePriceSamples = map[string]*sitePriceSample{} // key: site|model
 )
+
+// -----------------------------------------------------------------------------
+// 站点价格账本持久化（2026-09-29 事故修复）
+// -----------------------------------------------------------------------------
+//
+// 事故复盘：网关连续重启 6 次，内存中的站点价格样本全部清零；intl 站
+// hy4-preview 的目录条目促销已过期，价格退化成「未知」，价格闸按设计
+// 「不因猜测拒绝」放行，84 笔请求烧穿 4 个账号共 670.91 credits。
+// 落盘后重启不再失明；镜像到 Dropbox 后，runner 重置（/tmp 清空）也能恢复价格记忆。
+
+const (
+	priceLedgerSchema      = 1
+	priceLedgerMirrorEvery = 30 * time.Second // Dropbox 镜像节流间隔
+)
+
+var (
+	// priceLedgerFile 价格账本落盘路径（相对工作目录，与 status/models cache 同目录）。
+	priceLedgerFile = "wb-price-ledger.json"
+	// priceLedgerMirrorDir Dropbox 镜像目录；空串表示禁用镜像（测试用）。
+	priceLedgerMirrorDir = "/dropbox/self-hosted/workbuddy-gateway"
+	lastLedgerMirror     int64
+)
+
+type priceLedgerFileData struct {
+	Schema    int                         `json:"schema"`
+	UpdatedAt int64                       `json:"updatedAt"`
+	Samples   map[string]*sitePriceSample `json:"samples"`
+}
+
+// persistPriceLedgerLocked 原子落盘价格账本（调用方持有 sitePriceMu）。
+// Dropbox 镜像走 goroutine + 节流：fuse 挂载偶发卡顿不得阻塞计费路径。
+func persistPriceLedgerLocked() {
+	data, err := json.MarshalIndent(priceLedgerFileData{
+		Schema:    priceLedgerSchema,
+		UpdatedAt: time.Now().Unix(),
+		Samples:   sitePriceSamples,
+	}, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(priceLedgerFile+".tmp", data, 0600); err == nil {
+		_ = os.Rename(priceLedgerFile+".tmp", priceLedgerFile)
+	}
+	if priceLedgerMirrorDir == "" {
+		return
+	}
+	now := time.Now().Unix()
+	if now-atomic.LoadInt64(&lastLedgerMirror) < int64(priceLedgerMirrorEvery/time.Second) {
+		return
+	}
+	atomic.StoreInt64(&lastLedgerMirror, now)
+	dir, payload := priceLedgerMirrorDir, data
+	go func() {
+		tmp := dir + "/" + priceLedgerFile + ".tmp"
+		if err := os.WriteFile(tmp, payload, 0600); err != nil {
+			return
+		}
+		_ = os.Rename(tmp, dir+"/"+priceLedgerFile)
+	}()
+}
+
+// loadPriceLedger 启动时恢复价格账本：本地文件优先，缺失再取 Dropbox 镜像。
+// 只填补缺失项：进程内已有的样本（更实时）不被旧文件覆盖。
+func loadPriceLedger() {
+	candidates := []string{priceLedgerFile}
+	if priceLedgerMirrorDir != "" {
+		candidates = append(candidates, priceLedgerMirrorDir+"/"+priceLedgerFile)
+	}
+	for _, p := range candidates {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var d priceLedgerFileData
+		if err := json.Unmarshal(data, &d); err != nil || d.Schema != priceLedgerSchema {
+			continue
+		}
+		sitePriceMu.Lock()
+		for k, v := range d.Samples {
+			if v == nil || sitePriceSamples[k] != nil {
+				continue
+			}
+			sitePriceSamples[k] = v
+		}
+		sitePriceMu.Unlock()
+		log.Printf("[PriceLedger] 已恢复 %d 条站点价格样本（来源=%s）", len(d.Samples), p)
+		return
+	}
+}
 
 // recordSitePriceSample 累加一次真实请求的 (tokens, credit) 样本。
 // 仅由 observeModelCredit（真实业务流量）调用；探测小样本不进入此处。
@@ -250,6 +341,8 @@ func recordSitePriceSample(site, model string, tokens int64, credit float64) {
 	s.Tokens += tokens
 	s.Credit += credit
 	s.LastCredit = credit
+	// 落盘：重启不得让价格记忆清零（2026-09-29 事故根因之一）
+	persistPriceLedgerLocked()
 	sitePriceMu.Unlock()
 }
 
@@ -519,6 +612,14 @@ func routingRejection(model string, now time.Time) (bool, map[string]siteState) 
 			freeExists = true
 		}
 	}
+	// 站点白名单语义（2026-09-29 事故根因）：规则命中的模型，未声明的站点一律 FORBIDDEN。
+	// 事故中 hy4-preview 只声明 cn，intl 未声明却被当作「无限制」参与代偿调度，
+	// cn 站 429 冷却期间 84 笔请求全部涌向 intl，烧光 4 个小额度账号。
+	for _, site := range allRoutingSites() {
+		if _, ok := states[site]; !ok {
+			states[site] = siteForbidden
+		}
+	}
 	// 全站 FORBIDDEN 才在入口拒绝；BUDGETED 视为可用但受预算约束
 	for _, st := range states {
 		if st != siteForbidden {
@@ -634,4 +735,105 @@ func guardMinBalance(acc *Account, model string) bool {
 		return true // 额度未知时不做判断
 	}
 	return acc.QuotaRemaining >= cfg.MinBalanceGuard
+}
+
+// -----------------------------------------------------------------------------
+// 在途预留：并发烧穿护栏（2026-09-29 事故修复）
+// -----------------------------------------------------------------------------
+//
+// guardMinBalance 只在选号瞬间看静态余额，而额度要等请求完成后的额度扫描才回写。
+// 事故中 84 笔请求并发在途，每次选号时余额都还 ≥10（保护通过），
+// 额度却在请求过程中被烧穿，事后才发现归零。
+// 在途预留把「已选中但尚未结算」的请求按预留额记账，选号时以
+// 「余额 - 在途预留」判定，并发请求被挡在门外而不是一起冲进去烧穿。
+//
+// 预留额口径：
+//   - 确认免费（priceFree）：0 —— 免费模型不受限，零余额账号仍可服务；
+//   - 价格已知/可校准（pricePaidNum、pricePaidUnk）：minBalanceGuard；
+//   - 价格未知（priceUnknown）：minBalanceGuard × 10 —— 未知价可能极贵
+//     （事故中 intl hy4-preview 目录标 x0.00，实际等效 x66），按最坏情况预留。
+
+const (
+	inFlightReserveTTL    = 30 * time.Minute // 超时未释放的兜底回收阈值
+	inFlightUnknownFactor = 10              // 未知价模型的预留放大倍数
+)
+
+// inFlightReserve 单笔在途请求的预留记录。
+type inFlightReserve struct {
+	Credit float64   // 预留 credit
+	At     time.Time // 预留时刻：超时兜底回收依据
+}
+
+// reserveInFlightLocked 检查并提交一笔在途预留（调用方持有 accountMu）。
+func reserveInFlightLocked(acc *Account, reqID uint64, model string) bool {
+	cfg := routingSnapshot()
+	guard := cfg.MinBalanceGuard
+	if acc == nil || guard <= 0 {
+		return true // 保底关闭时整体停用（沿用原语义）
+	}
+	now := time.Now()
+	// 兜底回收：流式异常中断而未走到释放路径的残留
+	for id, r := range acc.inFlight {
+		if now.Sub(r.At) > inFlightReserveTTL {
+			delete(acc.inFlight, id)
+		}
+	}
+	// 账号已实测该模型为免费：不预留。零余额账号正是靠这一条服务免费模型。
+	if st := acc.ModelStates[normalizeModelName(model)]; st != nil && st.CostClass == modelCostFree {
+		return true
+	}
+	_, conf := classifyPrice(accountSite(acc), model)
+	if conf == priceFree {
+		return true
+	}
+	// 额度未知，或额度已归零：没有额度可保护，放行。
+	// 这正是「受控探测」（selectionProbeExhausted）与「免费耗尽账号」的路径：
+	// 单笔且有 5 分钟频控，护栏不得掐断价格学习闭环。
+	if !acc.QuotaKnown || acc.QuotaRemaining <= 0 {
+		return true
+	}
+	avail := acc.QuotaRemaining - inFlightReservedLocked(acc)
+	reserve := guard
+	if conf == priceUnknown {
+		reserve = guard * inFlightUnknownFactor
+	}
+	if avail-reserve < 0 {
+		log.Printf("[InFlight] 账号 %s 模型 %s 在途预留超限：剩余=%.2f 在途已占=%.2f 本笔预留=%.2f，跳过该账号",
+			acc.Path, model, acc.QuotaRemaining, acc.QuotaRemaining-avail, reserve)
+		return false
+	}
+	if reqID == 0 {
+		return true // 内部探测：只判定不占额
+	}
+	if acc.inFlight == nil {
+		acc.inFlight = map[uint64]inFlightReserve{}
+	}
+	acc.inFlight[reqID] = inFlightReserve{Credit: reserve, At: now}
+	return true
+}
+
+// releaseInFlight 释放一笔请求的在途预留（请求结束 / 换号 / 失败时调用）。
+func releaseInFlight(acc *Account, reqID uint64) {
+	if acc == nil || reqID == 0 {
+		return
+	}
+	accountMu.Lock()
+	delete(acc.inFlight, reqID)
+	accountMu.Unlock()
+}
+
+// releasePendingInFlight 释放换号/失败路径占用的预留（nil 安全）。
+func releasePendingInFlight(acc *Account, reqID uint64) {
+	if acc != nil {
+		releaseInFlight(acc, reqID)
+	}
+}
+
+// inFlightReservedLocked 汇总该账号在途预留总额（调用方持有 accountMu）。
+func inFlightReservedLocked(acc *Account) float64 {
+	var sum float64
+	for _, r := range acc.inFlight {
+		sum += r.Credit
+	}
+	return sum
 }

@@ -118,6 +118,8 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			return
 		}
+		// 流式写完后释放在途预留（含 usage 记账）
+		defer releaseInFlight(acc, reqID)
 		streamResponsesResponse(w, r, resp, modelName, reqID, acc, prof, startTime)
 		return
 	}
