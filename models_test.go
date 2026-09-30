@@ -403,3 +403,61 @@ func TestPickProbeAccountPrefersFundedThenUnknown(t *testing.T) {
 		t.Fatalf("known-exhausted account must be skipped, got %v", acc)
 	}
 }
+
+// 主动探测 / warmup 的选号必须过保底余额（minBalanceGuard）：
+// 探测与 warmup 都会真实扣费，余额只剩一点点的账号拿去探付费模型等于让它烧穿。
+func TestPickProbeAccountHonorsMinBalanceGuard(t *testing.T) {
+	oldAccounts := accounts
+	oldRouting := routingSnapshot()
+	defer func() {
+		accountMu.Lock()
+		accounts = oldAccounts
+		accountMu.Unlock()
+		setRouting(oldRouting)
+		modelsMu.Lock()
+		catalogModels = map[string][]catalogModel{}
+		modelsMu.Unlock()
+	}()
+
+	cfg := defaultRoutingConfig()
+	cfg.MinBalanceGuard = 10
+	setRouting(cfg)
+
+	// cn 站：m-paid 是明确付费模型（0.5x），m-free 是明确免费（0x）
+	modelsMu.Lock()
+	catalogModels = map[string][]catalogModel{
+		"cn": {
+			{ID: "m-paid", HasMultiplier: true, Multiplier: 0.5, FromLive: true},
+			{ID: "m-free", HasMultiplier: true, Multiplier: 0, FromLive: true},
+		},
+	}
+	modelsMu.Unlock()
+
+	setAccounts := func(list []*Account) {
+		accountMu.Lock()
+		accounts = list
+		accountMu.Unlock()
+	}
+	intl := func(name string, remaining float64) *Account {
+		return &Account{Path: name, Auth: &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "t"}},
+			QuotaKnown: true, QuotaRemaining: remaining}
+	}
+
+	// 1) 付费模型 + 余额低于保底 → 不得选中
+	setAccounts([]*Account{intl("low.json", 3)})
+	if acc := pickProbeAccountForModel("cn", "m-paid"); acc != nil {
+		t.Fatalf("余额 3 < 保底 10，不得用该账号探测付费模型，实际选中=%v", acc.Path)
+	}
+
+	// 2) 付费模型 + 余额充足 → 正常选中
+	setAccounts([]*Account{intl("low.json", 3), intl("rich.json", 100)})
+	if acc := pickProbeAccountForModel("cn", "m-paid"); acc == nil || acc.Path != "rich.json" {
+		t.Fatalf("余额充足的账号应被选中，实际=%v", acc)
+	}
+
+	// 3) 免费模型不受保底余额限制（零消耗，正是学习免费属性的途径）
+	setAccounts([]*Account{intl("low.json", 3)})
+	if acc := pickProbeAccountForModel("cn", "m-free"); acc == nil || acc.Path != "low.json" {
+		t.Fatalf("免费模型应不受保底余额限制，实际=%v", acc)
+	}
+}

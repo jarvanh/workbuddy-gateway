@@ -999,10 +999,21 @@ func pickProbeAccountForModel(site, model string) *Account {
 			continue
 		}
 		if acc.QuotaKnown {
-			if acc.QuotaRemaining > 0 {
-				return acc
+			// 已知耗尽：无法提供任何有效样本，跳过。
+			if acc.QuotaRemaining <= 0 {
+				continue
 			}
-			continue // 已知耗尽，跳过
+			// 余额为正还不够：必须满足保底余额（minBalanceGuard）。
+			// 探测与 warmup 都会真实扣费（学习「收费」属性的唯一方式），
+			// 余额只剩一点点的账号拿去探付费模型，等同于让它白白烧穿。
+			// 免费模型 / 价格未知 / 额度未知不受此限（guardMinBalance 内部已放行）。
+			if !guardMinBalance(acc, model) {
+				log.Printf("[ModelPrice] 站点=%s 模型=%s 凭据=%s 结果=跳过 原因=余额低于保底（剩余=%s < %s）",
+					site, model, filepath.Base(acc.Path), formatQuota(acc.QuotaRemaining),
+					formatQuota(routingSnapshot().MinBalanceGuard))
+				continue
+			}
+			return acc
 		}
 		if unknownQuota == nil {
 			unknownQuota = acc
