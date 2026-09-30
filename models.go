@@ -1011,18 +1011,52 @@ func pickProbeAccountForModel(site, model string) *Account {
 	return unknownQuota
 }
 
+// probeOutcome 是一次探测/触发请求的完整结果。
+// Status 用于上层判断「是否需要补触发」：ok 视为窗口已成功触发，
+// 其余状态均表示本次未真正发出一次成功请求。
+type probeOutcome struct {
+	Verdict string    // free | paid | ""（未判定）
+	Credit  float64   // usage.credit（仅成功时有意义）
+	Tokens  int64     // usage.total_tokens
+	HTTP    int       // 上游状态码（0 表示未收到响应）
+	Detail  string    // 人类可读说明
+	Status  string    // ok | unknown | quota | rate_limited | auth_failed | error | unavailable | lock_timeout | no_usage
+	RetryAt time.Time // rate_limited 时的建议重试时刻（上游给出的重置时间）
+}
+
+// probeOutcomeOK 判定该结果是否算「成功触发了一次模型调用」。
+// 只要上游真的处理了请求（HTTP 200）就算成功，与是否免费无关。
+func (o probeOutcome) ok() bool { return o.Status == "ok" }
+
+// probeOutcomeRetryable 判定该结果是否值得稍后补触发。
+// 授权失效属于账号本身不可用，重试没有意义。
+func (o probeOutcome) retryable() bool {
+	switch o.Status {
+	case "quota", "rate_limited", "error", "lock_timeout", "unavailable":
+		return true
+	}
+	return false
+}
+
 // probeModelPrice 发一次最小请求判定免费/收费；不修改账号调度状态。
 // 返回 verdict（free|paid|""）、credit、tokens、说明。
 func probeModelPrice(acc *Account, model string) (string, float64, int64, string) {
+	o := probeModelPriceEx(acc, model)
+	return o.Verdict, o.Credit, o.Tokens, o.Detail
+}
+
+// probeModelPriceEx 与 probeModelPrice 同源，但额外返回结构化状态，
+// 供 5 小时窗口主动触发（warmup）判断成败与是否补触发。
+func probeModelPriceEx(acc *Account, model string) probeOutcome {
 	if !lockAccountWithContext(context.Background(), &acc.lock) {
-		return "", 0, 0, "等待账号锁失败"
+		return probeOutcome{Status: "lock_timeout", Detail: "等待账号锁失败"}
 	}
 	defer acc.lock.Unlock()
 
 	accountMu.Lock()
 	if acc.Disabled || acc.Auth == nil {
 		accountMu.Unlock()
-		return "", 0, 0, "账号不可用"
+		return probeOutcome{Status: "unavailable", Detail: "账号不可用"}
 	}
 	auth := *acc.Auth
 	prof := acc.Profile()
@@ -1039,39 +1073,52 @@ func probeModelPrice(acc *Account, model string) (string, float64, int64, string
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, prof.chatURL(), strings.NewReader(string(payload)))
 	if err != nil {
-		return "", 0, 0, err.Error()
+		return probeOutcome{Status: "error", Detail: err.Error()}
 	}
 	backendHeaders(req, &auth, prof)
 	resp, err := cfg.HttpClient.Do(req)
 	if err != nil {
-		return "", 0, 0, "请求失败: " + err.Error()
+		return probeOutcome{Status: "error", Detail: "请求失败: " + err.Error()}
 	}
 	defer resp.Body.Close()
+	out := probeOutcome{HTTP: resp.StatusCode}
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		s := string(body)
 		switch {
 		case isQuotaExhausted(resp.StatusCode, s):
-			return "", 0, 0, "14018 额度耗尽，不覆盖"
+			out.Status, out.Detail = "quota", "14018 额度耗尽，不覆盖"
 		case isModelRateLimited(s):
-			return "", 0, 0, "6004 模型限流，不覆盖"
+			out.Status, out.Detail = "rate_limited", "6004 模型限流，不覆盖"
+			if until, ok := parseResetTime(s); ok {
+				out.RetryAt = until
+			}
+		case isAuthFailure(resp.StatusCode, s):
+			out.Status, out.Detail = "auth_failed", "授权失效，不覆盖"
 		default:
-			return "", 0, 0, fmt.Sprintf("HTTP %d，不覆盖", resp.StatusCode)
+			out.Status, out.Detail = "error", fmt.Sprintf("HTTP %d，不覆盖", resp.StatusCode)
 		}
+		return out
 	}
 	usage := readUsageFromSSE(resp.Body)
 	credit, ok := usageCredit(usage)
 	if !ok {
-		return "", 0, 0, "无 usage.credit，不覆盖"
+		out.Status, out.Detail = "no_usage", "无 usage.credit，不覆盖"
+		return out
 	}
 	tokens, _ := usageTotalTokens(usage)
+	out.Credit, out.Tokens = credit, tokens
+	out.Status = "ok"
 	if credit > 0 {
-		return "paid", credit, tokens, "usage.credit>0 收费"
+		out.Verdict, out.Detail = "paid", fmt.Sprintf("usage.credit=%s 收费", formatQuota(credit))
+		return out
 	}
 	if tokens < modelFreeMinTokens {
-		return "", credit, tokens, "credit=0 但样本过小，不判定"
+		out.Detail = fmt.Sprintf("credit=0 但样本过小（total_tokens=%d < %d），不判定", tokens, modelFreeMinTokens)
+		return out
 	}
-	return "free", credit, tokens, "usage.credit=0 免费"
+	out.Verdict, out.Detail = "free", fmt.Sprintf("usage.credit=0，total_tokens=%d 免费", tokens)
+	return out
 }
 
 // sortModelsForDisplay 保持稳定顺序：先实时接口顺序，再按 ID。

@@ -55,6 +55,12 @@ type runtimeFileConfig struct {
 	Routing routingConfig `json:"routing"`
 	// Notify 段可选：事件告警（冷却/模型冷却/无可用账号）。默认关闭，不影响现有行为。
 	Notify notifyConfig `json:"notify"`
+	// Warmup 段可选：5 小时窗口主动触发（默认开启，每日 04:00）。
+	Warmup warmupConfig `json:"warmup"`
+	// Probe 段可选：模型价格主动探测调度。
+	Probe struct {
+		Schedule probeScheduleConfig `json:"schedule"`
+	} `json:"probe"`
 	// Checkin 段可选，控制每日签到与 Buddy 旅行自动化。
 	// 省略字段用默认值（全部开启），显式 false 关闭。
 	Checkin struct {
@@ -110,6 +116,9 @@ func loadRuntimeConfig(path string) error {
 	if errors.Is(err, os.ErrNotExist) {
 		setModelFilter(nil, nil)
 		_ = setModelAccountFilter(nil)
+		// 无配置文件：warmup / 探测调度回落内置默认值（warmup 默认开启）。
+		setWarmup(warmupConfig{})
+		setProbeSchedule(probeScheduleConfig{})
 		return nil
 	}
 	if err != nil {
@@ -127,6 +136,10 @@ func loadRuntimeConfig(path string) error {
 		return fmt.Errorf("解析配置文件 %s: %w", path, err)
 	}
 	cfg.DebugEnabled = fileCfg.Debug.Enabled
+
+	// 5 小时窗口主动触发 + 主动探测调度（默认开启，缺失字段回落默认值）。
+	setWarmup(fileCfg.Warmup)
+	setProbeSchedule(fileCfg.Probe.Schedule)
 
 	// 模型黑白名单：先清空再按配置重建，避免热加载时残留旧规则。
 	setModelFilter(fileCfg.Models.Blocklist, fileCfg.Models.Allowlist)

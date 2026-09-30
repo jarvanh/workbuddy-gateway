@@ -564,6 +564,8 @@ func main() {
 		runMonitor()
 	case "probe":
 		runProbe()
+	case "warmup":
+		runWarmup()
 	case "reset":
 		runReset()
 	case "version", "-v", "--version":
@@ -608,6 +610,7 @@ func printHelp() {
   refresh     手动立即刷新所有账号访问令牌 (Access Token)
   monitor     前台实时监控：周期刷新展示账号状态 + 最近日志 (Ctrl+C 退出)
   probe       主动探测账号对指定模型的免费/收费属性（需 serve 正在运行）
+  warmup      5 小时窗口主动触发：开关 / 时刻 / 价格上限 / 指定模型（需 serve 正在运行）
   reset       清空除登录凭据外的全部本地数据（状态/缓存/日志/失效标记），并重新拉取模型与倍率
   version     查看版本信息
   help        查看帮助说明
@@ -634,6 +637,20 @@ probe 选项:
   -api-key <key>    设置后，调用网关必须携带 Bearer <key> 鉴权
   -proxy <url>      设置上游转发代理 (例如 http://127.0.0.1:7890 或 socks5://...)
   -verbose          输出详细调试日志 (请求/响应体)
+
+warmup 子命令（需 serve 正在运行，改动即时生效）:
+  warmup status              查看配置与最近触发结果
+  warmup on|off              开启 / 关闭 5 小时窗口主动触发（默认开启）
+  warmup time <HH:MM>        设置每日触发时刻（默认 04:00）
+  warmup price <n>           价格上限（默认 0.06；0 = 只触发已确认免费的模型）
+  warmup models <a,b>        指定模型（优先级高于价格筛选）；clear 恢复价格筛选
+  warmup catch-up <hours>    补触发窗口小时数（默认 4）
+  warmup retry <minutes>     补触发重试间隔（默认 10 分钟）
+  warmup notify on|off       每轮结束后推送结果（默认 off）
+  warmup probe-time <HH:MM>  warmup 关闭时的每日主动探测时刻（默认 06:00）
+  warmup probe-follow on|off 主动探测是否跟随 warmup 时刻（默认 on）
+  warmup run                 立即执行一轮
+  -addr/-port/-api-key       需与运行中的 serve 一致
 
 monitor 选项:
   -interval <sec>   状态刷新间隔秒数 (默认: 3)
@@ -3256,6 +3273,9 @@ func runServe() {
 	}
 	// 价格探测独立于目录刷新：即使关闭目录刷新，也仍可基于缓存探测价格。
 	go modelPriceProbeLoop()
+	// 5 小时窗口主动触发 + 每日主动探测调度。
+	go warmupLoop()
+	go probeScheduleLoop()
 
 	// 启动状态快照协程（monitor 命令实时读取展示）
 	go statusSnapshotLoop()
@@ -3275,6 +3295,8 @@ func runServe() {
 	mux.HandleFunc("/health", handleHealth)
 	mux.HandleFunc("/ping", handleHealth)
 	mux.HandleFunc("/admin/probe", handleAdminProbe)
+	mux.HandleFunc("/admin/warmup", handleAdminWarmup)
+	mux.HandleFunc("/admin/reload", handleAdminReload)
 	mux.HandleFunc("/", handleIndex)
 
 	listenAddr := fmt.Sprintf("%s:%d", cfg.Addr, cfg.Port)

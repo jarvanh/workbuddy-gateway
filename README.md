@@ -24,6 +24,7 @@
 - [refresh](#refresh)
 - [monitor](#monitor)
 - [probe](#probe)
+- [warmup（5 小时窗口主动触发）](#warmup5-小时窗口主动触发)
 - [reset](#reset)
 - [version / help](#version--help)
 - [多账号池](#多账号池)
@@ -70,6 +71,7 @@ workbuddy-gateway [command] [options]
   refresh   手动刷新所有账号访问令牌
   monitor   前台实时监控：账号表格 + 模型统计附表 + 最近日志
   probe     主动探测账号对指定模型的免费 / 收费属性（需 serve 运行中）
+  warmup    5 小时窗口主动触发：开关 / 时刻 / 价格上限 / 指定模型（需 serve 运行中）
   reset     清空除登录凭据外的全部本地数据，并重新拉取模型与倍率
   version   查看版本信息
   help      查看帮助
@@ -219,6 +221,8 @@ workbuddy-gateway serve -models-refresh 0
 | GET | `/v1/models`、`/models` | 模型列表，响应头 `X-Model-Source` 标注来源 |
 | GET | `/health`、`/ping` | 健康检查，返回 `version`、`model_count`、`model_source` |
 | POST | `/admin/probe` | 供 `probe` 命令调用，**仅接受回环来源** |
+| GET \| POST | `/admin/warmup` | 5 小时窗口触发状态查询 / 立即执行一轮，**仅接受回环来源** |
+| POST | `/admin/reload` | 让运行中进程重读 `config.json`，**仅接受回环来源** |
 | GET | `/` | 简单文本说明 |
 
 后台任务（`serve` 启动后自动运行）：
@@ -229,6 +233,8 @@ workbuddy-gateway serve -models-refresh 0
 | 额度扫描 | 5 分钟 | 每凭据 10 秒超时，超时保留旧值；`剩余=0` 标记付费耗尽 |
 | 模型目录刷新 | 60 分钟 | 实时接口 + npm 目录，合并去重后写缓存 |
 | 模型价格探测 | 30 分钟检查 / 每模型 12 小时一轮 | 单轮最多 5 个，仅探测需要确认的模型 |
+| 5 小时窗口主动触发 | 每天 `warmup.time`（默认 `04:00`） | 按价格上限筛选模型各打一次最小请求 |
+| 每日主动探测 | 跟随 warmup 时刻，或独立 `06:00` | warmup 关闭时按 `probe.schedule.time` 执行 |
 | 每日签到与 Buddy 旅行 | 每天 `UTC+8 09:00` | 国内站签到+Buddy旅行、国际站签到；`checkin` 段可分别关闭 |
 | 状态快照 | 3 秒 | 写 `workbuddy-status.json` 供 `monitor` 读取 |
 | 凭据热加载 | 5 秒 | 扫描凭据新增 / 更新 / 删除 |
@@ -512,6 +518,101 @@ workbuddy4.json        intl   hy3      paid     0.42    820     usage.credit=0.4
 | `error` | 网络 / 协议错误 |
 
 > 原理：`probe` 作为客户端调用运行中服务的 `/admin/probe`。账本保存在 `serve` 进程内存中，独立进程直接写状态文件会被服务快照覆盖，因此探测必须由运行中的服务执行。该接口仅接受回环来源；服务启用 `-api-key` 时同样需要鉴权。
+
+---
+
+## warmup（5 小时窗口主动触发）
+
+部分上游模型按「首次调用后的 5 小时」计算窗口额度。不主动打一次请求，窗口就不会开始计时，白天真正要用时反而只剩很短的可用时间。
+
+`warmup` 每天在指定时刻（默认 `04:00`，配置时区）对筛选出的模型各发一次最小请求，把窗口提前打开。
+
+**默认开启**，默认时刻 `04:00`，默认只触发价格不高于 `0.06` 的模型。
+
+```bash
+# 查看当前配置与最近触发结果
+workbuddy-gateway warmup status
+
+# 开关
+workbuddy-gateway warmup on
+workbuddy-gateway warmup off
+
+# 设置触发时刻（配置时区 HH:MM）
+workbuddy-gateway warmup time 04:30
+
+# 价格上限：0 = 只触发已确认免费的模型
+workbuddy-gateway warmup price 0.06
+workbuddy-gateway warmup price 0
+
+# 指定模型（优先级高于价格筛选）；clear 恢复价格筛选
+workbuddy-gateway warmup models hy4-preview-f,glm-5.3-flash
+workbuddy-gateway warmup models clear
+
+# 立即执行一轮（不等到点）
+workbuddy-gateway warmup run
+```
+
+| 子命令 | 默认 | 说明 |
+|---|---|---|
+| `status` | — | 查看配置、命中模型与最近触发结果 |
+| `on` / `off` | `on` | 开关 5 小时窗口主动触发 |
+| `time <HH:MM>` | `04:00` | 每日触发时刻（配置时区，即 `routing.tz`） |
+| `price <n>` | `0.06` | 价格上限；`0` = 只触发已确认免费的模型 |
+| `models <a,b>` | 空 | 指定模型列表，优先级高于价格筛选；`clear` 清除 |
+| `catch-up <hours>` | `4` | 补触发窗口（自计划时刻起算） |
+| `retry <minutes>` | `10` | 补触发重试间隔 |
+| `notify on\|off` | `off` | 每轮结束后是否推送结果（走 `notify` 通道） |
+| `probe-time <HH:MM>` | `06:00` | warmup 关闭时的每日主动探测时刻 |
+| `probe-follow on\|off` | `on` | 主动探测是否跟随 warmup 时刻 |
+| `run` | — | 立即执行一轮 |
+
+子命令会改写工作目录的 `config.json` 并通过 `/admin/reload` 让运行中的 `serve` 立即生效，无需重启。
+
+**价格筛选口径（绝不烧钱）**：只对「已确认免费」或「价格明确已知且不超过上限」的模型下手；价格未知、或「付费但无法定标」的模型一律跳过。显式 `models` 指定的模型按用户点名执行，不套价格上限。
+
+**结果记录与补触发**
+
+每轮结果落盘到 `wb-warmup.json`（当前周期逐模型状态 + 最近 14 天汇总）。以下三类「到点没成功」会在补触发窗口内按间隔自动重试：
+
+| 情形 | 处理 |
+|---|---|
+| 触发时刻服务还没启动 | 进程起来后发现当天周期未完成，立即补一轮（记录标记「补触发」） |
+| 模型正在冷却（`6004`） | 保持 `pending`，按 `retry` 间隔重试 |
+| 网络不畅 / 上游报错 | 同上 |
+
+只有**授权失效**判定为结构性失败不再重试。超过 `catchUpHours` 仍未成功的，标记失败并归档。
+
+**与主动探测结合**
+
+| warmup | 主动探测执行时刻 |
+|---|---|
+| 开启（默认） | 与 warmup 同刻执行 |
+| 关闭 | `probe.schedule.time`，默认 `06:00` |
+
+用 `warmup probe-follow off` 可让探测脱离 warmup 走独立时刻。
+
+`config.json` 对应配置：
+
+```json
+{
+  "warmup": {
+    "enabled": true,
+    "time": "04:00",
+    "maxPrice": 0.06,
+    "models": [],
+    "catchUpHours": 4,
+    "retryMinutes": 10,
+    "notify": false
+  },
+  "probe": {
+    "schedule": {
+      "enabled": true,
+      "followWarmup": true,
+      "time": "06:00"
+    }
+  }
+}
+```
 
 ---
 

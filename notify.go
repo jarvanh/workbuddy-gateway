@@ -27,6 +27,8 @@ const (
 	notifyEventCooldown      = "cooldown"
 	notifyEventModelCooldown = "model_cooldown"
 	notifyEventNoAccount     = "no_account"
+	// notifyEventWarmup 5 小时窗口主动触发的轮次结果（默认关闭，warmup.notify 开启）。
+	notifyEventWarmup = "warmup"
 )
 
 // notifyConfig 告警配置（config.json 的 notify 段）。

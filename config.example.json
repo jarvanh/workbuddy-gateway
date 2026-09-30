@@ -113,5 +113,21 @@
     ],
     "botTokenEnv": "TELEGRAM_BOT_TOKEN",
     "chatIdEnv": "TELEGRAM_CHAT_ID"
+  },
+  "warmup": {
+    "enabled": true,
+    "time": "04:00",
+    "maxPrice": 0.06,
+    "models": [],
+    "catchUpHours": 4,
+    "retryMinutes": 10,
+    "notify": false
+  },
+  "probe": {
+    "schedule": {
+      "enabled": true,
+      "followWarmup": true,
+      "time": "06:00"
+    }
   }
 }
