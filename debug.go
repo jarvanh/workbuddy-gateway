@@ -69,6 +69,8 @@ type runtimeFileConfig struct {
 			Enabled *bool `json:"enabled"`
 			// Travel：国内站签到后自动派 Buddy 旅行（默认开启）。
 			Travel *bool `json:"travel"`
+			// Growth：国内站成长任务自动化（接取→上报→领奖，默认开启）。
+			Growth *bool `json:"growth"`
 		} `json:"cn"`
 		Intl struct {
 			// Enabled：国际站每日自动签到（默认开启）。
@@ -175,13 +177,19 @@ func loadRuntimeConfig(path string) error {
 		upstreamEarlyFlushGrace = time.Duration(*n) * time.Second
 	}
 
-	// 签到与 Buddy 旅行开关：省略字段恢复默认开启，显式 false 关闭。
+	// 签到、Buddy 旅行与成长任务开关：省略字段恢复默认开启，显式 false 关闭。
+	// 四个开关必须一起重置 —— 漏掉任何一个，配置里省略该字段时都会沿上一次
+	// 加载的残留值，而不是回到默认开启。
 	cnCheckinEnabled, cnTravelEnabled, intlCheckinEnabled = true, true, true
+	cnGrowthEnabled = true
 	if fileCfg.Checkin.CN.Enabled != nil {
 		cnCheckinEnabled = *fileCfg.Checkin.CN.Enabled
 	}
 	if fileCfg.Checkin.CN.Travel != nil {
 		cnTravelEnabled = *fileCfg.Checkin.CN.Travel
+	}
+	if fileCfg.Checkin.CN.Growth != nil {
+		cnGrowthEnabled = *fileCfg.Checkin.CN.Growth
 	}
 	if fileCfg.Checkin.Intl.Enabled != nil {
 		intlCheckinEnabled = *fileCfg.Checkin.Intl.Enabled

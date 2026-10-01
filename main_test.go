@@ -573,7 +573,11 @@ func TestCheckinAccountCNAndIntl(t *testing.T) {
 	var checkinCalls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v2/billing/meter/daily-checkin" {
-			t.Errorf("unexpected path %s", r.URL.Path)
+			// 国际站已改为走 ACP 会话链路（不再打 daily-checkin），
+			// 这里放行其他路径，仅统计 daily-checkin 命中次数。
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":0,"msg":"OK","data":{"id":"conv-1","status":"completed"}}`))
+			return
 		}
 		checkinCalls++
 		if r.Header.Get("Authorization") != "Bearer test-access" {
@@ -601,10 +605,15 @@ func TestCheckinAccountCNAndIntl(t *testing.T) {
 		t.Fatalf("cn checkin result=%q calls=%d err=%v", result, checkinCalls, err)
 	}
 
+	// 国际站不再走 daily-checkin：上游根本不认该接口的 intl 调用，旧实现只会拿到
+	// 「已签到」文案被 isAlreadyCheckedIn 误判为幂等成功（实测 5 天 0 次真签到）。
+	// 现在 intl 改走 ACP 真实会话，由 acp_test.go 的 TestCheckinIntlRunsACPConversation 覆盖；
+	// 这里只需确认它不再打 daily-checkin。
 	intl := travelSeedAccount(t, "intl")
-	result, err = checkinAccount(context.Background(), intl)
-	if err != nil || result != "ok" || checkinCalls != 2 {
-		t.Fatalf("intl checkin should execute by default: result=%q calls=%d err=%v", result, checkinCalls, err)
+	before := checkinCalls
+	_, _ = checkinAccount(context.Background(), intl)
+	if checkinCalls != before {
+		t.Fatalf("国际站不应再调用 daily-checkin: before=%d after=%d", before, checkinCalls)
 	}
 }
 

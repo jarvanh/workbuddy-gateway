@@ -2495,38 +2495,64 @@ func checkinAccount(ctx context.Context, acc *Account) (string, error) {
 	path := acc.Path
 	prof := acc.Profile()
 	accountMu.Unlock()
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	log.Printf("[Checkin] 账号 %s 开始每日签到，站点=%s，接口=%s", path, prof.Label, prof.dailyCheckinURL())
-	headers := func(r *http.Request) {
-		commonHeaders(r, prof)
-		r.Header.Set("Authorization", "Bearer "+auth.Auth.AccessToken)
-		r.Header.Set("X-Client-Platform", "web")
-		if auth.Account.UID != "" {
-			r.Header.Set("X-User-Id", auth.Account.UID)
-		}
-		if auth.Account.EnterpriseID != "" {
-			r.Header.Set("X-Enterprise-Id", auth.Account.EnterpriseID)
-			r.Header.Set("X-Tenant-Id", auth.Account.EnterpriseID)
-		}
-		if auth.Auth.Domain != "" {
-			r.Header.Set("X-Domain", auth.Auth.Domain)
-		}
-	}
-	_, status, err := doJSONContext(ctx, cfg.HttpClient, http.MethodPost, prof.dailyCheckinURL(), headers, strings.NewReader("{}"))
+	// 实现与超时按站点分流：
+	//   国内站 —— daily-checkin 接口，一个请求就完事，保持短超时；
+	//   国际站 —— 该接口上游并不认（旧实现只会拿到「已签到」文案，被 isAlreadyCheckedIn
+	//             误判为幂等成功，实测 5 天 0 次真签到）。真正算数的是网页端跑完一次
+	//             agent 会话（ACP）：建会话 → 取沙箱 → SSE → JSON-RPC → 轮询 completed，
+	//             链路长得多，超时必须放宽。
+	var result string
 	var checkinErr error
-	result := "failed"
-	switch {
-	case err == nil:
-		log.Printf("[Checkin] 账号 %s 每日签到成功", path)
-		result = "ok"
-	case isAlreadyCheckedIn(status, err.Error()):
-		log.Printf("[Checkin] 账号 %s 今天已经签到，本次按幂等成功处理", path)
-		result = "already"
-	default:
-		log.Printf("[Checkin] 账号 %s 每日签到失败，HTTP=%d，原因=%v；不改变账号调度状态", path, status, err)
-		checkinErr = err
+
+	if isCN {
+		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+
+		log.Printf("[Checkin] 账号 %s 开始每日签到，站点=%s，接口=%s", path, prof.Label, prof.dailyCheckinURL())
+		headers := func(r *http.Request) {
+			commonHeaders(r, prof)
+			r.Header.Set("Authorization", "Bearer "+auth.Auth.AccessToken)
+			r.Header.Set("X-Client-Platform", "web")
+			if auth.Account.UID != "" {
+				r.Header.Set("X-User-Id", auth.Account.UID)
+			}
+			if auth.Account.EnterpriseID != "" {
+				r.Header.Set("X-Enterprise-Id", auth.Account.EnterpriseID)
+				r.Header.Set("X-Tenant-Id", auth.Account.EnterpriseID)
+			}
+			if auth.Auth.Domain != "" {
+				r.Header.Set("X-Domain", auth.Auth.Domain)
+			}
+		}
+		_, status, err := doJSONContext(ctx, cfg.HttpClient, http.MethodPost, prof.dailyCheckinURL(), headers, strings.NewReader("{}"))
+		result = "failed"
+		switch {
+		case err == nil:
+			log.Printf("[Checkin] 账号 %s 每日签到成功", path)
+			result = "ok"
+		case isAlreadyCheckedIn(status, err.Error()):
+			log.Printf("[Checkin] 账号 %s 今天已经签到，本次按幂等成功处理", path)
+			result = "already"
+		default:
+			log.Printf("[Checkin] 账号 %s 每日签到失败，HTTP=%d，原因=%v；不改变账号调度状态", path, status, err)
+			checkinErr = err
+		}
+	} else {
+		ctx, cancel := context.WithTimeout(ctx, acpTurnTimeout+30*time.Second)
+		defer cancel()
+
+		log.Printf("[Checkin] 账号 %s 开始国际站每日活跃（ACP 会话），模型=%s", path, acpDailyChatModel)
+		turn := runIntlDailyChat(ctx, &auth, prof)
+		switch {
+		case turn.OK:
+			log.Printf("[Checkin] 账号 %s 国际站每日活跃完成：%d 段输出 / %d 次更新，耗时 %dms",
+				path, turn.Chunks, turn.Updates, turn.ElapsedMS)
+			result = "ok"
+		default:
+			log.Printf("[Checkin] 账号 %s 国际站每日活跃失败：%s；不改变账号调度状态", path, turn.Error)
+			result = "failed"
+			checkinErr = errors.New(turn.Error)
+		}
 	}
 
 	// 国内站签到后派 Buddy 旅行：旅行是独立活动，签到成功或今日已签都尝试执行；
@@ -2538,6 +2564,18 @@ func checkinAccount(ctx context.Context, acc *Account) (string, error) {
 			log.Printf("[Travel] 账号 %s Buddy 旅行失败: %v", path, travelErr)
 		case travelResult == "ok":
 			log.Printf("[Travel] 账号 %s Buddy 旅行流程完成", path)
+		}
+	}
+
+	// 国内站成长任务：接取 → 事件上报点亮 → 进度落账 → 领奖。
+	// 独立于签到结果（今日已签也应继续推进），失败不影响签到返回值。
+	// 超时必须独立于签到那个 30s：任务多时整轮可达数分钟。
+	if isCN && cnGrowthEnabled {
+		gctx, gcancel := context.WithTimeout(context.Background(), growthTimeout)
+		gr := runGrowthTasks(gctx, &auth, prof, path)
+		gcancel()
+		if gr.EarnedCredit > 0 {
+			log.Printf("[Growth] 账号 %s 成长任务累计到账 +%d 积分", path, gr.EarnedCredit)
 		}
 	}
 	return result, checkinErr
@@ -4298,6 +4336,10 @@ func backendHeaders(req *http.Request, sa *StoredAuth, prof *upstreamProfile) {
 	}
 	if sa != nil && sa.Account.UID != "" {
 		req.Header.Set("X-User-Id", sa.Account.UID)
+		// 设备指纹三件套：由 uid 确定性派生，保证同一账号每次出站都来自同一台
+		// “固定物理设备”，避免随机机器码抖动触发上游风控（移植自 workbuddy-hub）。
+		req.Header.Set("X-Machine-ID", deriveDeviceID("machine", sa.Account.UID))
+		req.Header.Set("X-Session-ID", deriveDeviceID("session", sa.Account.UID))
 	} else {
 		req.Header.Set("X-No-User-Id", "1")
 	}

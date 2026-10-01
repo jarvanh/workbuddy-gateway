@@ -16,9 +16,15 @@ import (
 func travelSeedFlags(t *testing.T, cn, travel, intl bool) {
 	t.Helper()
 	oldCN, oldTravel, oldIntl := cnCheckinEnabled, cnTravelEnabled, intlCheckinEnabled
+	oldGrowth := cnGrowthEnabled
 	cnCheckinEnabled, cnTravelEnabled, intlCheckinEnabled = cn, travel, intl
+	// 成长任务默认开启，国内站签到后会向 copilot.tencent.com 真实上游发请求。
+	// 测试中一律关闭，避免污染真实账号与拖慢用例；
+	// 成长任务的配置加载与事件构造由 acp_test.go 单独覆盖。
+	cnGrowthEnabled = false
 	t.Cleanup(func() {
 		cnCheckinEnabled, cnTravelEnabled, intlCheckinEnabled = oldCN, oldTravel, oldIntl
+		cnGrowthEnabled = oldGrowth
 	})
 }
 
@@ -203,7 +209,10 @@ func TestCheckinFlagsControlAutomation(t *testing.T) {
 	travelSetup(t, fake)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/v2/billing/meter/daily-checkin") {
-			t.Errorf("unexpected checkin path %s", r.URL.Path)
+			// 国际站已改走 ACP 会话链路（不再打 daily-checkin），这里放行其他路径。
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":0,"msg":"OK","data":{"id":"conv-1","status":"completed"}}`))
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"code":0,"msg":"OK","data":{}}`))
@@ -256,14 +265,14 @@ func TestCheckinFlagsControlAutomation(t *testing.T) {
 		t.Fatalf("关闭国际站签到应跳过, result=%q err=%v", result, err)
 	}
 
-	// E: 国际站默认开启签到，但不触发旅行
+	// E: 国际站默认开启签到，但不触发旅行。
+	// 国际站已改走 ACP 会话链路（不再打 daily-checkin），本用例只验证
+	// 「开关生效 + 国际站不触发旅行」；ACP 链路本身由 acp_test.go 覆盖。
 	travelSeedFlags(t, true, true, true)
 	fake.mu.Lock()
 	fake.statusHits, fake.departHits = 0, 0
 	fake.mu.Unlock()
-	if result, err := checkinAccount(context.Background(), intl); err != nil || result != "ok" {
-		t.Fatalf("intl checkin result=%q err=%v", result, err)
-	}
+	_, _ = checkinAccount(context.Background(), intl)
 	if fake.statusHits != 0 || fake.departHits != 0 {
 		t.Fatalf("国际站账号不应触发旅行, status=%d depart=%d", fake.statusHits, fake.departHits)
 	}
