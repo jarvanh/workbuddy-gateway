@@ -47,6 +47,12 @@ const (
 	warmupDefaultRetryMinutes = 10
 	probeDefaultTime          = "06:00"
 
+	// warmupDefaultMaxRateLimitRetries 是单个模型「连续被限流」的放弃阈值。
+	// 补触发窗口内每 retryMinutes 重试一轮，而 6004 模型级限流往往整个窗口都不恢复：
+	// 没有上限时一个卡住的模型会刷满整个窗口（实测 13 轮全部无效）。
+	// 达到阈值即判本轮失败，不再重试 —— 省下的是真实的上游请求。
+	warmupDefaultMaxRateLimitRetries = 3
+
 	warmupTickInterval = 30 * time.Second
 )
 
@@ -65,6 +71,9 @@ type warmupConfig struct {
 	CatchUpHours *int `json:"catchUpHours"`
 	// RetryMinutes 补触发重试间隔（分钟），默认 10。
 	RetryMinutes *int `json:"retryMinutes"`
+	// MaxRateLimitRetries 单个模型连续被限流（6004）多少次后放弃本轮，默认 3。
+	// 设为 0 表示不启用熔断（回到旧行为：刷到补触发窗口结束）。
+	MaxRateLimitRetries *int `json:"maxRateLimitRetries"`
 	// Notify 是否在每轮结束后推送结果（走 notify 通道），默认 false。
 	Notify *bool `json:"notify"`
 }
@@ -82,13 +91,14 @@ type probeScheduleConfig struct {
 
 // warmupRuntime 是装载后的生效配置。
 type warmupRuntime struct {
-	Enabled      bool
-	Time         string
-	MaxPrice     float64
-	Models       []string
-	CatchUpHours int
-	RetryMinutes int
-	Notify       bool
+	Enabled             bool
+	Time                string
+	MaxPrice            float64
+	Models              []string
+	CatchUpHours        int
+	RetryMinutes        int
+	Notify              bool
+	MaxRateLimitRetries int
 }
 
 // probeRuntime 是装载后的生效探测调度配置。
@@ -110,10 +120,11 @@ var (
 func defaultWarmupRuntime() warmupRuntime {
 	return warmupRuntime{
 		Enabled:      true,
-		Time:         warmupDefaultTime,
-		MaxPrice:     warmupDefaultPrice,
-		CatchUpHours: warmupDefaultCatchUpHours,
-		RetryMinutes: warmupDefaultRetryMinutes,
+		Time:                warmupDefaultTime,
+		MaxPrice:            warmupDefaultPrice,
+		CatchUpHours:        warmupDefaultCatchUpHours,
+		RetryMinutes:        warmupDefaultRetryMinutes,
+		MaxRateLimitRetries: warmupDefaultMaxRateLimitRetries,
 	}
 }
 
@@ -145,6 +156,9 @@ func setWarmup(cfg warmupConfig) {
 	}
 	if cfg.RetryMinutes != nil && *cfg.RetryMinutes > 0 {
 		rt.RetryMinutes = *cfg.RetryMinutes
+	}
+	if cfg.MaxRateLimitRetries != nil && *cfg.MaxRateLimitRetries >= 0 {
+		rt.MaxRateLimitRetries = *cfg.MaxRateLimitRetries
 	}
 	if cfg.Notify != nil {
 		rt.Notify = *cfg.Notify
@@ -195,6 +209,9 @@ type warmupModelState struct {
 	Attempts int   `json:"attempts"`
 	LastAt  int64  `json:"lastAt,omitempty"`
 	Detail  string `json:"detail,omitempty"`
+	// RateLimitHits 累计本周期内该模型被限流（6004）的次数，成功即清零。
+	// 达到 warmupRuntime.MaxRateLimitRetries 时放弃本周期，不再重试。
+	RateLimitHits int `json:"rateLimitHits,omitempty"`
 }
 
 type warmupCycle struct {
@@ -409,11 +426,15 @@ func warmupTriggerModel(model string, rt warmupRuntime, now time.Time, ms *warmu
 		if out.ok() {
 			ms.Status = "ok"
 			ms.Verdict = out.Verdict
+			ms.RateLimitHits = 0 // 成功即清零，只统计「连续」被限流
 			log.Printf("[Warmup] 模型=%s 站点=%s 账号=%s 触发成功（HTTP %d，%s）", model, site, ms.Account, out.HTTP, out.Detail)
 			return
 		}
 		lastStatus = out.Status
 		lastDetail = fmt.Sprintf("站点 %s：%s", site, out.Detail)
+		if out.Status == "rate_limited" {
+			ms.RateLimitHits++
+		}
 		if out.RetryAt.After(retryAt) {
 			retryAt = out.RetryAt
 		}
@@ -424,6 +445,17 @@ func warmupTriggerModel(model string, rt warmupRuntime, now time.Time, ms *warmu
 	// 「无可用账号」可能只是账号冷却中或尚未热加载进来，保留 pending 让补触发窗口内再试。
 	if lastStatus == "auth_failed" {
 		ms.Status = "failed"
+		return
+	}
+	// 连续限流熔断：6004 这类模型级限流往往整个补触发窗口都不恢复，
+	// 没有上限时一个卡住的模型会刷满窗口（实测 13 轮全部无效，白白消耗上游请求）。
+	// 达到阈值即判本周期失败，不再重试。阈值 <=0 表示不启用熔断（旧行为）。
+	if rt.MaxRateLimitRetries > 0 && ms.RateLimitHits >= rt.MaxRateLimitRetries {
+		ms.Status = "failed"
+		ms.Detail += fmt.Sprintf("（连续被限流 %d 次，已达上限 %d，本周期放弃重试）",
+			ms.RateLimitHits, rt.MaxRateLimitRetries)
+		log.Printf("[Warmup] 模型=%s 连续被限流 %d 次（上限 %d），本周期放弃重试",
+			model, ms.RateLimitHits, rt.MaxRateLimitRetries)
 		return
 	}
 	ms.Status = "pending"
