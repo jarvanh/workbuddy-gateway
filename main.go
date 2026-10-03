@@ -36,6 +36,10 @@ import (
 
 // version 是网关版本号：默认取开发值，发布流水线会通过
 // -ldflags "-X main.version=<tag>" 注入 tag 版本（因此必须是 var 而非 const）。
+//
+// ⚠️ 上游 v1.13.13 把这里改成了 const(version = "1.13.13")，fork 不同步这一改动：
+// const 会让 release 流水线的 -ldflags 注入失效（Go 不允许对 const 做 linker 注入），
+// 发版产物会永远显示源码里的开发版本号。保留 var 形态。
 var version = "1.13.1"
 
 const (
@@ -313,6 +317,9 @@ type StoredTokens struct {
 	RefreshToken string `json:"refreshToken"`
 	ExpiresAt    int64  `json:"expiresAt"`
 	Domain       string `json:"domain"`
+	// 以下为本地续期元数据，官方客户端不读；旧凭据文件缺省为 0，不影响解析。
+	RefreshExpiresAt int64 `json:"refreshExpiresAt,omitempty"` // 刷新令牌到期时间（Unix 秒），0=未知
+	LastRefreshTime  int64 `json:"lastRefreshTime,omitempty"`  // 最近一次续期成功时间（Unix 秒），0=从未续期
 }
 
 type StoredAccount struct {
@@ -356,7 +363,7 @@ type quotaSummaryData struct {
 	Packages []quotaPackage `json:"Packages"`
 	// IsPaidUser 为上游「正式付费订阅」标记；Pro 试用用户该字段同样为 false。
 	IsPaidUser bool `json:"IsPaidUser"`
-	// ProTrialStatus 为上游 Pro 试用状态：1=试用中，0=无/已结束；国内站可能不返回。
+	// ProTrialStatus 不能单独证明试用仍有效；必须结合当前权益资源。
 	ProTrialStatus any `json:"ProTrialStatus"`
 	// SubscriptionPackageCode 为当前订阅包编码，非空表示存在订阅包。
 	SubscriptionPackageCode string `json:"SubscriptionPackageCode"`
@@ -367,25 +374,27 @@ type quotaSummaryData struct {
 // -----------------------------------------------------------------------------
 
 type Config struct {
-	Addr            string
-	Port            int
-	AuthFile        string
-	AuthDir         string
-	AuthExplicit    bool // 用户是否显式指定了 -auth（未指定时自动扫描目录下所有 workbuddy*.json）
-	LoginIntl       bool // login -intl：登录国际站 (www.workbuddy.ai，浏览器内完成登录)
-	APIKey          string
-	ProxyURL        string
-	Verbose         bool
-	DebugEnabled    bool   // 仅由工作目录 config.json 的 debug.enabled 控制
-	ReloadInterval  int    // 账号池热加载扫描间隔（秒），0 关闭
-	MonitorInterval int    // monitor 状态刷新间隔（秒）
-	LogFile         string // monitor 附加展示的日志文件路径
-	JournalService  string // monitor 附加展示的 systemd 服务名（journalctl -u）
-	LogLines        int    // monitor 展示的最近日志行数
-	ModelsRefresh   int    // 官方模型目录刷新间隔（分钟），0 关闭
-	ProbeModels     string // probe 专用：逗号分隔的模型列表
-	ProbeLimit      int    // probe 专用：未显式指定模型时的取用数量
-	HttpClient      *http.Client
+	Addr               string
+	Port               int
+	AuthFile           string
+	AuthDir            string
+	AuthExplicit       bool // 用户是否显式指定了 -auth（未指定时自动扫描目录下所有 workbuddy*.json）
+	LoginIntl          bool // login -intl：登录国际站 (www.workbuddy.ai，浏览器内完成登录)
+	APIKey             string
+	ProxyURL           string
+	Verbose            bool
+	DebugEnabled       bool   // 仅由工作目录 config.json 的 debug.enabled 控制
+	ReloadInterval     int    // 账号池热加载扫描间隔（秒），0 关闭
+	MonitorInterval    int    // monitor 状态刷新间隔（秒）
+	LogFile            string // monitor 附加展示的日志文件路径
+	JournalService     string // monitor 附加展示的 systemd 服务名（journalctl -u）
+	LogLines           int    // monitor 展示的最近日志行数
+	ModelsRefresh      int    // 官方模型目录刷新间隔（分钟），0 关闭
+	DisablePriceProbes bool   // 禁止后台价格探测，不影响客户端请求及显式 probe 命令
+	KeepaliveHours     []int  // 主动续期时刻（本地小时），空表示关闭；到点主动刷新全部账号
+	ProbeModels        string // probe 专用：逗号分隔的模型列表
+	ProbeLimit         int    // probe 专用：未显式指定模型时的取用数量
+	HttpClient         *http.Client
 }
 
 // Account 表示一个 CodeBuddy 账号凭据及其运行时状态。
@@ -403,13 +412,18 @@ type Account struct {
 	QuotaUsed      float64                       // 最近一次额度查询返回的已用额度
 	QuotaRemaining float64                       // 最近一次额度查询返回的剩余额度
 	IsPaidUser     bool                          // 是否为付费用户（上游 IsPaidUser 原值）
-	PlanLabel      string                        // 套餐展示：Pro试用 | pro | 免费
+	PlanLabel      string                        // 官方套餐名称或已知套餐短名称
+	PlanCheckedAt  int64                         // 最近成功校验权益的时间；旧快照为0
+	PlanStale      bool                          // 最近查询失败，展示时标记旧结果
 	QuotaKnown     bool                          // 是否已成功获取过额度
 	QuotaExhausted bool                          // 已确认额度为 0；额度扫描发现恢复后自动解除
 	ModelStates    map[string]*modelRuntimeState // 按模型隔离的成本、限流和额度阻断状态
 	inFlight       map[uint64]inFlightReserve    // 在途预留：reqID → 预留 credit（运行时，不入盘）
 	fingerprint    string                        // 凭据文件变更指纹（mtime+size，凭据热加载用）
 	lock           sync.Mutex                    // 单账号串行锁（防止同账号并发触发 11128）
+	// 续期失败计数（仅内存，重启清零）：单次失败可能是上游抖动，连续失败才判定登录态失效。
+	RefreshFailCount int
+	LastRefreshError string
 }
 
 const (
@@ -517,9 +531,13 @@ func main() {
 	fs.StringVar(&cfg.JournalService, "journal", "", "monitor 附加跟随的 systemd 服务名（Linux 下用 journalctl -u <服务> -f 跟随）")
 	fs.IntVar(&cfg.LogLines, "lines", 15, "monitor 每次刷新展示的最近日志行数")
 	fs.IntVar(&cfg.ModelsRefresh, "models-refresh", 60, "模型目录刷新间隔（分钟），0 关闭（实时接口 + npm 合并）")
+	fs.BoolVar(&cfg.DisablePriceProbes, "disable-price-probes", false, "禁止后台自动价格探测，不影响正常模型请求")
+	keepaliveHours := hourList{22}
+	fs.Var(&keepaliveHours, "keepalive-hours", "主动续期时刻（本地小时，逗号分隔，默认 22）；留空关闭")
 	fs.StringVar(&cfg.ProbeModels, "models", "", "probe 专用：逗号分隔的待探测模型（默认取目录前几个）")
 	fs.IntVar(&cfg.ProbeLimit, "limit", 5, "probe 专用：未指定 -models 时探测的模型数量上限")
 	_ = fs.Parse(args)
+	cfg.KeepaliveHours = []int(keepaliveHours)
 
 	// 检测 -auth 是否被显式指定：
 	// 若未指定 -auth 且未指定 -auth-dir，则自动扫描当前目录下所有 workbuddy*.json 组成账号池，
@@ -628,6 +646,13 @@ func printHelp() {
   -models-refresh <min>
                     模型目录刷新间隔（默认 60 分钟，0 关闭）
                     （目录来源：实时接口 + npm 静态包，合并去重）
+  -disable-price-probes
+                    关闭后台自动价格探测，避免主动生成模型请求；
+                    不影响客户端请求、目录刷新及显式 probe 命令
+  -keepalive-hours <h,h,...>
+                    主动续期时刻（本地小时，逗号分隔，默认 22）
+                    到点主动刷新全部账号登录凭据，不等访问令牌临近过期；
+                    留空关闭。只调刷新接口，不请求模型、不消耗额度
 
 probe 选项:
   -auth <path>      只探测指定凭据文件（文件名或路径均可）；默认探测全部账号
@@ -975,6 +1000,12 @@ func restoreAccountRuntimeStateLocked() {
 		acc.QuotaRemaining = state.QuotaRemaining
 		acc.IsPaidUser = state.IsPaidUser
 		acc.PlanLabel = state.PlanLabel
+		acc.PlanCheckedAt = state.PlanCheckedAt
+		acc.PlanStale = state.PlanStale || state.PlanCheckedAt == 0 ||
+			time.Now().Unix()-state.PlanCheckedAt >= 300
+		if acc.PlanCheckedAt == 0 {
+			acc.PlanLabel = planUnknown // 不沿用旧版本仅凭试用标记猜出的标签。
+		}
 		acc.QuotaKnown = state.QuotaKnown
 		acc.QuotaExhausted = state.QuotaExhausted
 		if len(state.ModelStates) == 0 {
@@ -1732,6 +1763,7 @@ func disableAccount(acc *Account, reason string) {
 	nickname := ""
 	uid := ""
 	edition := ""
+	var authSnapshot *StoredAuth
 	if acc.Auth != nil {
 		nickname = acc.Auth.Account.Nickname
 		uid = acc.Auth.Account.UID
@@ -1739,6 +1771,8 @@ func disableAccount(acc *Account, reason string) {
 		acc.Nickname = nickname
 		acc.UID = uid
 		acc.Edition = edition
+		copied := *acc.Auth
+		authSnapshot = &copied
 	}
 	accountMu.Unlock()
 
@@ -1757,11 +1791,17 @@ func disableAccount(acc *Account, reason string) {
 		}
 	}
 
-	// 删除失效的凭据文件，方便用户下次重新登录
+	// 删除凭据前先做一次只读校验：删除不可逆，只有确认凭据真的不可用才销毁。
+	if keep, note := credentialStillUsableForDelete(authSnapshot); keep {
+		log.Printf("[Auth] 账号 %s 已停止调度；%s；凭据文件保留在 %s（如需彻底移除请手动删除），重新登录会自动覆盖",
+			path, note, path)
+		writeStatusSnapshot()
+		return
+	}
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		log.Printf("[Auth] 账号 %s 凭据文件删除失败: %v", path, err)
 	}
-	log.Printf("[Auth] 账号 %s 授权失效，已禁止调度并删除凭据文件: %s", path, reason)
+	log.Printf("[Auth] 账号 %s 授权失效，已禁止调度并删除凭据文件（删除前只读校验确认不可用）: %s", path, reason)
 	writeStatusSnapshot()
 }
 
@@ -1819,15 +1859,32 @@ func loadDisabledMarkers() {
 		if err := json.Unmarshal(data, &m); err != nil {
 			continue
 		}
-		// 避免与已加载的有效账号重复
-		dup := false
-		for _, a := range accounts {
-			if a.Path == m.Path {
-				dup = true
-				break
+		// 凭据文件比标记更新，说明用户已重新登录或手动续期，旧标记已过期。
+		if fi, statErr := os.Stat(m.Path); statErr == nil {
+			if mi, mErr := os.Stat(mp); mErr == nil && fi.ModTime().After(mi.ModTime()) {
+				log.Printf("[Auth] 账号 %s 凭据文件比失效标记更新，视为已重新登录，清除失效标记", m.Path)
+				_ = os.Remove(mp)
+				continue
 			}
 		}
-		if dup {
+		// 凭据文件仍在时，标记负责把该账号重新置为失效（保留文件是为了可恢复）。
+		applied := false
+		for _, a := range accounts {
+			if a.Path != m.Path {
+				continue
+			}
+			a.Disabled = true
+			a.DisabledReason = m.Reason
+			if a.Nickname == "" {
+				a.Nickname = m.Nickname
+			}
+			if a.UID == "" {
+				a.UID = m.UID
+			}
+			applied = true
+			break
+		}
+		if applied {
 			continue
 		}
 		accounts = append(accounts, &Account{
@@ -2009,8 +2066,16 @@ func doRefreshToken(sa *StoredAuth) error {
 }
 
 // doRefreshTokenFor 刷新指定账号的令牌并保存回其凭据文件（多账号版）。
-// 若刷新因授权失效失败（401/403/refresh token 无效），自动禁用该账号并删除凭据文件。
 func doRefreshTokenFor(acc *Account) error {
+	return refreshAccountToken(acc, "按需续期")
+}
+
+// refreshAccountToken 刷新指定账号的登录凭据并原子写回。
+//
+// 失败分两档处理：命中上游「登录态失效」标志（如 12153 / invalid_grant）或连续失败
+// 达到 refreshDisableThreshold 次，才禁用账号；普通网络错误、5xx 以及未命中标志的
+// 401/403 只累计计数并保留原凭据，避免一次抖动就删掉用户凭据。
+func refreshAccountToken(acc *Account, reason string) error {
 	if acc == nil {
 		return fmt.Errorf("无法刷新：账号缺少 RefreshToken 或已失效")
 	}
@@ -2025,23 +2090,44 @@ func doRefreshTokenFor(acc *Account) error {
 		return fmt.Errorf("无法刷新：账号缺少 RefreshToken 或已失效")
 	}
 	refreshed := *acc.Auth
+	oldTokens := refreshed.Auth // 覆盖前校验要比对旧凭据，先留存副本。
 	path := acc.Path
 	oldExpiresAt := refreshed.Auth.ExpiresAt
 	accountMu.Unlock()
 
-	log.Printf("[Auth] 账号 %s 开始刷新 Token，站点=%s，刷新前过期时间=%s", path, profileForEdition(refreshed.Edition).Label, formatDisplayTime(time.Unix(oldExpiresAt, 0)))
+	log.Printf("[Auth] 账号 %s 开始刷新 Token，触发方式=%s，站点=%s，刷新前访问令牌过期时间=%s",
+		path, reason, profileForEdition(refreshed.Edition).Label, time.Unix(oldExpiresAt, 0).Format("2006-01-02 15:04:05"))
 	status, err := refreshTokenPayload(&refreshed)
 	if err != nil {
-		log.Printf("[Auth] 账号 %s Token 刷新失败，HTTP=%d，原因=%v，旧凭据未覆盖", path, status, err)
-		if isAuthFailure(status, err.Error()) {
-			// 与对话链路同理：403 但响应体无鉴权失败特征时疑似 WAF/CDN 拦截，
-			// 不禁用账号、不删凭据，等待下轮重试即可。
-			if status == http.StatusForbidden && !bodyIndicatesAuthFailure(err.Error()) {
-				log.Printf("[Auth] 账号 %s Token 刷新返回 403 但响应体无鉴权失败特征，疑似 WAF/CDN 拦截，不禁用账号", path)
-			} else {
-				disableAccount(acc, fmt.Sprintf("令牌刷新失败 (HTTP %d): %v", status, err))
-			}
+		// WAF/CDN 拦截守卫（fork 保留）：403 但响应体无鉴权失败特征时
+		// 既不是临时抖动也不是登录态失效，直接跳过失败计数，不禁用、不累积。
+		if status == http.StatusForbidden && !bodyIndicatesAuthFailure(err.Error()) {
+			log.Printf("[Auth] 账号 %s Token 刷新返回 403 但响应体无鉴权失败特征，疑似 WAF/CDN 拦截，不计入连续失败、不禁用账号", path)
+			return err
 		}
+		kind := classifyRefreshFailure(status, err.Error())
+		summary := refreshFailureSummary(kind, status, err)
+		count := recordRefreshFailure(acc, summary)
+		if count >= refreshDisableThreshold {
+			log.Printf("[Auth] 账号 %s 判定登录态失效，已停止调度并写入失效标记；连续失败=%d 判定依据=%s", path, count, summary)
+			disableAccount(acc, fmt.Sprintf("令牌刷新连续失败 %d 次: %s", count, summary))
+		} else if kind == refreshFailureSessionDead {
+			// 上游明确说登录态没了，但先不删凭据：保留原凭据继续重试，达到阈值才停止调度。
+			log.Printf("[Auth] 账号 %s 续期被上游判定登录态失效（连续 %d/%d 次）：%s；暂时保留凭据，达到阈值后才停止调度，建议尽快重新登录",
+				path, count, refreshDisableThreshold, summary)
+		} else {
+			log.Printf("[Auth] 账号 %s Token 刷新失败，旧凭据未覆盖；连续失败=%d/%d 判定=%s 业务影响=本次未续期，账号仍可用到访问令牌过期，稍后自动重试",
+				path, count, refreshDisableThreshold, summary)
+		}
+		return err
+	}
+	// 覆盖前校验：新凭据必须仍属于同一账号且确实可用，否则保留旧凭据不覆盖。
+	if err := validateRefreshedCredential(path, &refreshed, oldTokens); err != nil {
+		accountMu.Lock()
+		acc.LastRefreshError = "新凭据未通过覆盖前校验: " + err.Error()
+		accountMu.Unlock()
+		log.Printf("[Auth] 账号 %s 新凭据未通过覆盖前校验，已放弃本次覆盖并保留原凭据；原因=%v 业务影响=账号继续使用原凭据，不销毁、不降级",
+			path, err)
 		return err
 	}
 	if err := saveAuthTo(path, &refreshed); err != nil {
@@ -2057,11 +2143,29 @@ func doRefreshTokenFor(acc *Account) error {
 		acc.Auth = &refreshed
 		acc.Edition = profileForEdition(refreshed.Edition).Key
 		acc.fingerprint = fingerprint
+		acc.RefreshFailCount = 0
+		acc.LastRefreshError = ""
 	}
 	accountMu.Unlock()
-	log.Printf("[Auth] 账号 %s Token 刷新成功，过期时间由 %s 更新为 %s，凭据已安全写回", path, formatDisplayTime(time.Unix(oldExpiresAt, 0)), formatDisplayTime(time.Unix(refreshed.Auth.ExpiresAt, 0)))
+	newExpiresAt := refreshed.Auth.ExpiresAt
+	if oldExpiresAt > 0 && newExpiresAt <= oldExpiresAt {
+		// 刷新成功但访问令牌期限没有顺延：该账号可能已接近上游的登录态上限。
+		log.Printf("[Auth] 账号 %s 刷新成功但访问令牌期限未顺延（%s -> %s），该账号可能已接近登录态上限，建议留意是否需要重新登录",
+			path, time.Unix(oldExpiresAt, 0).Format("2006-01-02 15:04:05"), time.Unix(newExpiresAt, 0).Format("2006-01-02 15:04:05"))
+	}
+	log.Printf("[Auth] 账号 %s Token 刷新成功，访问令牌过期时间由 %s 更新为 %s，触发方式=%s，凭据已安全写回",
+		path, time.Unix(oldExpiresAt, 0).Format("2006-01-02 15:04:05"), time.Unix(newExpiresAt, 0).Format("2006-01-02 15:04:05"), reason)
 	writeStatusSnapshot()
 	return nil
+}
+
+// recordRefreshFailure 累计连续刷新失败次数并返回当前次数。
+func recordRefreshFailure(acc *Account, summary string) int {
+	accountMu.Lock()
+	defer accountMu.Unlock()
+	acc.RefreshFailCount++
+	acc.LastRefreshError = summary
+	return acc.RefreshFailCount
 }
 
 // refreshTokenPayload 调用上游刷新接口并更新内存中的令牌字段（不落盘）。
@@ -2087,6 +2191,7 @@ func refreshTokenPayload(sa *StoredAuth) (int, error) {
 		return status, fmt.Errorf("解析新 Token 失败: %w", err)
 	}
 
+	now := time.Now()
 	sa.Auth.AccessToken = tok.AccessToken
 	if tok.RefreshToken != "" {
 		sa.Auth.RefreshToken = tok.RefreshToken
@@ -2094,9 +2199,18 @@ func refreshTokenPayload(sa *StoredAuth) (int, error) {
 	if tok.Domain != "" {
 		sa.Auth.Domain = tok.Domain
 	}
+	// 接口未返回 expiresIn 时保留旧过期时间（preserveExpiry），避免刷新风暴。
 	if tok.ExpiresIn > 0 {
-		sa.Auth.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
+		sa.Auth.ExpiresAt = now.Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
 	}
+	// 刷新令牌到期时间：优先用接口返回的 refreshExpiresIn；接口没给时，
+	// 从当前刷新令牌未验签的令牌声明读取，避免在界面上显示成未知。
+	if tok.RefreshExpiresIn > 0 {
+		sa.Auth.RefreshExpiresAt = now.Add(time.Duration(tok.RefreshExpiresIn) * time.Second).Unix()
+	} else if exp, ok := jwtExpiry(sa.Auth.RefreshToken); ok {
+		sa.Auth.RefreshExpiresAt = exp.Unix()
+	}
+	sa.Auth.LastRefreshTime = now.Unix()
 	return status, nil
 }
 
@@ -2108,36 +2222,10 @@ func parseQuotaCapacity(value string) (float64, error) {
 	return strconv.ParseFloat(value, 64)
 }
 
-// planLabelFromSummary 把上游套餐字段归一化为展示值：Pro试用 | pro | 免费。
-// 规则：ProTrialStatus=1 → Pro试用；IsPaidUser=true → pro；其余（含字段缺失、
-// 类型异常等识别不出的情况）→ 免费。
+// summary 只有额度与历史标记，不能独立判定有效套餐。
+// 由完整权益查询成功后替换“待确认”，禁止据试用标记猜成Pro试用。
 func planLabelFromSummary(summary quotaSummaryData) string {
-	if isProTrialActive(summary.ProTrialStatus) {
-		return "Pro试用"
-	}
-	if summary.IsPaidUser {
-		return "pro"
-	}
-	return "免费"
-}
-
-// isProTrialActive 判断 ProTrialStatus 是否为「试用中」，兼容数字与字符串两种编码。
-func isProTrialActive(value any) bool {
-	switch v := value.(type) {
-	case float64:
-		return v == 1
-	case int:
-		return v == 1
-	case int64:
-		return v == 1
-	case json.Number:
-		n, err := v.Int64()
-		return err == nil && n == 1
-	case string:
-		return strings.TrimSpace(v) == "1"
-	default:
-		return false
-	}
+	return planUnknown
 }
 
 func parseQuotaSummary(data []byte) (total, used, remaining float64, paid bool, plan string, err error) {
@@ -2333,24 +2421,35 @@ func refreshAccountQuota(ctx context.Context, acc *Account) error {
 	prof := acc.Profile()
 	accountMu.Unlock()
 
-	log.Printf("[Quota] 账号 %s 开始查询额度，站点=%s，接口=%s", path, prof.Label, prof.quotaSummaryURL())
+	traceID := uuid.NewString()
+	log.Printf("[Quota] traceId=%s 账号 %s 开始查询额度，站点=%s，接口=%s", traceID, path, prof.Label, prof.quotaSummaryURL())
 	headers := func(r *http.Request) {
 		commonHeaders(r, prof)
 		r.Header.Set("Authorization", "Bearer "+auth.Auth.AccessToken)
 		r.Header.Set("X-Client-Platform", "web")
+		r.Header.Set("X-Trace-ID", traceID)
 		if auth.Account.EnterpriseID != "" {
 			r.Header.Set("X-Enterprise-Id", auth.Account.EnterpriseID)
 		}
 	}
 	data, status, err := doJSONContext(ctx, cfg.HttpClient, http.MethodPost, prof.quotaSummaryURL(), headers, strings.NewReader("{}"))
 	if err != nil {
-		log.Printf("[Quota] 账号 %s 查询额度失败，HTTP=%d，原因=%v，保留上一次额度数据", path, status, err)
+		markAccountPlanStale(acc)
+		log.Printf("[Quota] traceId=%s 账号 %s 查询额度失败，HTTP=%d，保留上一次额度数据，套餐标记待刷新", traceID, path, status)
 		return err
 	}
 	total, used, remaining, paid, plan, err := parseQuotaSummary(data)
 	if err != nil {
-		log.Printf("[Quota] 账号 %s 查询额度响应无法解析，原因=%v，保留上一次额度数据", path, err)
+		markAccountPlanStale(acc)
+		log.Printf("[Quota] traceId=%s 账号 %s 查询额度响应无法解析，保留上一次额度数据，套餐标记待刷新", traceID, path)
 		return err
+	}
+	var summary quotaSummaryData
+	_ = json.Unmarshal(data, &summary) // parseQuotaSummary 已校验。
+	now := time.Now()
+	resources, planErr := fetchPlanResources(ctx, prof, headers, traceID, path, now)
+	if planErr == nil {
+		plan, planErr = identifyPlan(prof.Key, summary, resources, now)
 	}
 	accountMu.Lock()
 	wasExhausted := acc.QuotaExhausted
@@ -2358,7 +2457,17 @@ func refreshAccountQuota(ctx context.Context, acc *Account) error {
 	acc.QuotaUsed = used
 	acc.QuotaRemaining = remaining
 	acc.IsPaidUser = paid
-	acc.PlanLabel = plan
+	if planErr == nil {
+		acc.PlanLabel = plan
+		acc.PlanCheckedAt = now.Unix()
+		acc.PlanStale = false
+	} else {
+		if acc.PlanCheckedAt == 0 {
+			acc.PlanLabel = planUnknown
+		}
+		acc.PlanStale = true
+	}
+	plan = planDisplayLabel(acc.PlanLabel, acc.PlanStale)
 	acc.QuotaKnown = true
 	acc.QuotaExhausted = remaining <= 0
 	if remaining > 0 {
@@ -2368,13 +2477,18 @@ func refreshAccountQuota(ctx context.Context, acc *Account) error {
 		}
 	}
 	accountMu.Unlock()
+	if planErr != nil {
+		log.Printf("[套餐判断] traceId=%s 账号=%s 结果=待确认 原因=%v 显示=%s 业务影响=额度仍更新，不把接口失败误报为免费或试用", traceID, path, planErr, plan)
+	} else {
+		log.Printf("[套餐判断] traceId=%s 账号=%s 有效期校验时间=%s 资源数=%d 显示=%s 结果=完整权益校验成功", traceID, path, now.Format(time.RFC3339), len(resources), plan)
+	}
 	switch {
 	case !wasExhausted && remaining <= 0:
-		log.Printf("[Quota] 账号 %s 额度查询成功，总额度=%s，已用=%s，剩余=%s，付费用户=%t，套餐=%s；账号已冻结调度，等待额度恢复", path, formatQuota(total), formatQuota(used), formatQuota(remaining), paid, plan)
+		log.Printf("[Quota] traceId=%s 账号 %s 额度查询成功，总额度=%s，已用=%s，剩余=%s，付费用户=%t，套餐=%s；账号已冻结调度，等待额度恢复", traceID, path, formatQuota(total), formatQuota(used), formatQuota(remaining), paid, plan)
 	case wasExhausted && remaining > 0:
-		log.Printf("[Quota] 账号 %s 额度已恢复，总额度=%s，已用=%s，剩余=%s，付费用户=%t，套餐=%s；账号已自动解除冻结并恢复调度", path, formatQuota(total), formatQuota(used), formatQuota(remaining), paid, plan)
+		log.Printf("[Quota] traceId=%s 账号 %s 额度已恢复，总额度=%s，已用=%s，剩余=%s，付费用户=%t，套餐=%s；账号已自动解除冻结并恢复调度", traceID, path, formatQuota(total), formatQuota(used), formatQuota(remaining), paid, plan)
 	default:
-		log.Printf("[Quota] 账号 %s 额度查询成功，总额度=%s，已用=%s，剩余=%s，付费用户=%t，套餐=%s", path, formatQuota(total), formatQuota(used), formatQuota(remaining), paid, plan)
+		log.Printf("[Quota] traceId=%s 账号 %s 额度查询成功，总额度=%s，已用=%s，剩余=%s，付费用户=%t，套餐=%s", traceID, path, formatQuota(total), formatQuota(used), formatQuota(remaining), paid, plan)
 	}
 	return nil
 }
@@ -2698,7 +2812,11 @@ func formatAccountStatus(acc *Account, idx int, now time.Time) string {
 	sb.WriteString(fmt.Sprintf("用户 UID:     %s\n", acc.Auth.Account.UID))
 	sb.WriteString(fmt.Sprintf("企业 ID:      %s\n", ifEmpty(acc.Auth.Account.EnterpriseID, "(个人账号)")))
 	sb.WriteString(fmt.Sprintf("认证域名:     %s\n", ifEmpty(acc.Auth.Auth.Domain, "www.codebuddy.cn")))
-	sb.WriteString(fmt.Sprintf("套餐:         %s\n", ifEmpty(acc.PlanLabel, "免费")))
+	sb.WriteString(formatRenewalStatus(acc))
+	sb.WriteString(fmt.Sprintf("套餐:         %s\n", planDisplayLabel(acc.PlanLabel, acc.PlanStale)))
+	if acc.PlanStale {
+		sb.WriteString("              * 权益查询失败，待刷新；名称可能是上次成功结果。\n")
+	}
 	if acc.QuotaKnown {
 		sb.WriteString(fmt.Sprintf("额度:         总额度 %s / 已用 %s / 剩余 %s\n", formatQuota(acc.QuotaTotal), formatQuota(acc.QuotaUsed), formatQuota(acc.QuotaRemaining)))
 	}
@@ -2775,25 +2893,31 @@ func runRefresh() {
 
 // accountSnapshot 是写入状态快照文件的单个账号状态。
 type accountSnapshot struct {
-	Path           string                        `json:"path"`
-	Edition        string                        `json:"edition,omitempty"` // 站点标识（cn/intl）
-	Nickname       string                        `json:"nickname"`
-	UID            string                        `json:"uid"`
-	State          string                        `json:"state"` // active | cooldown | paid_exhausted | expired | disabled
-	CooldownUntil  int64                         `json:"cooldownUntil,omitempty"`
-	CooldownMsg    string                        `json:"cooldownMsg,omitempty"`
-	DisabledReason string                        `json:"disabledReason,omitempty"`
-	TokenExpiresAt int64                         `json:"tokenExpiresAt,omitempty"`
-	QuotaTotal     float64                       `json:"quotaTotal,omitempty"`
-	QuotaUsed      float64                       `json:"quotaUsed,omitempty"`
-	QuotaRemaining float64                       `json:"quotaRemaining"`
-	IsPaidUser     bool                          `json:"isPaidUser"`
-	PlanLabel      string                        `json:"planLabel,omitempty"` // 套餐展示：Pro试用 | pro | 免费
-	QuotaKnown     bool                          `json:"quotaKnown,omitempty"`
-	QuotaExhausted bool                          `json:"quotaExhausted,omitempty"`
-	ModelStates    map[string]modelStateSnapshot `json:"modelStates,omitempty"`
-	FreeModels     int                           `json:"freeModels,omitempty"`
-	ModelCooldowns int                           `json:"modelCooldowns,omitempty"`
+	Path           string  `json:"path"`
+	Edition        string  `json:"edition,omitempty"` // 站点标识（cn/intl）
+	Nickname       string  `json:"nickname"`
+	UID            string  `json:"uid"`
+	State          string  `json:"state"` // active | cooldown | paid_exhausted | expired | disabled
+	CooldownUntil  int64   `json:"cooldownUntil,omitempty"`
+	CooldownMsg    string  `json:"cooldownMsg,omitempty"`
+	DisabledReason string  `json:"disabledReason,omitempty"`
+	TokenExpiresAt int64   `json:"tokenExpiresAt,omitempty"`
+	QuotaTotal     float64 `json:"quotaTotal,omitempty"`
+	QuotaUsed      float64 `json:"quotaUsed,omitempty"`
+	QuotaRemaining float64 `json:"quotaRemaining"`
+	IsPaidUser     bool    `json:"isPaidUser"`
+	PlanLabel      string  `json:"planLabel,omitempty"` // 官方套餐名称或已知短名称
+	PlanCheckedAt  int64   `json:"planCheckedAt,omitempty"`
+	PlanStale      bool    `json:"planStale,omitempty"`
+	// 登录续期状态：刷新令牌到期时间与最近成功续期时间，便于提前发现需要重新登录的账号。
+	RefreshExpiresAt int64                         `json:"refreshExpiresAt,omitempty"`
+	LastRefreshTime  int64                         `json:"lastRefreshTime,omitempty"`
+	RefreshFailCount int                           `json:"refreshFailCount,omitempty"`
+	QuotaKnown       bool                          `json:"quotaKnown,omitempty"`
+	QuotaExhausted   bool                          `json:"quotaExhausted,omitempty"`
+	ModelStates      map[string]modelStateSnapshot `json:"modelStates,omitempty"`
+	FreeModels       int                           `json:"freeModels,omitempty"`
+	ModelCooldowns   int                           `json:"modelCooldowns,omitempty"`
 }
 
 type modelStateSnapshot struct {
@@ -2825,6 +2949,19 @@ func writeStatusSnapshot() {
 		as.QuotaRemaining = acc.QuotaRemaining
 		as.IsPaidUser = acc.IsPaidUser
 		as.PlanLabel = acc.PlanLabel
+		as.PlanCheckedAt = acc.PlanCheckedAt
+		as.PlanStale = acc.PlanStale
+		as.RefreshFailCount = acc.RefreshFailCount
+		if acc.Auth != nil {
+			as.RefreshExpiresAt = acc.Auth.Auth.RefreshExpiresAt
+			as.LastRefreshTime = acc.Auth.Auth.LastRefreshTime
+			if as.RefreshExpiresAt == 0 {
+				// 旧凭据或手工导入的凭据没有该字段，从未验签的令牌声明补一个展示值。
+				if exp, ok := jwtExpiry(acc.Auth.Auth.RefreshToken); ok {
+					as.RefreshExpiresAt = exp.Unix()
+				}
+			}
+		}
 		as.QuotaKnown = acc.QuotaKnown
 		as.QuotaExhausted = acc.QuotaExhausted
 		if len(acc.ModelStates) > 0 {
@@ -2938,6 +3075,9 @@ func fitCell(s string, width int) string {
 
 func renderAccountTable(accs []accountSnapshot) string {
 	widths := []int{4, 20, 24, 8, 10, 19, 10, 10, 10, 10, 10, 10}
+	for _, a := range accs {
+		widths[9] = min(36, max(widths[9], displayWidth(planDisplayLabel(a.PlanLabel, a.PlanStale))))
+	}
 	headers := []string{"序号", "凭据文件", "账号", "站点", "状态", "Token 有效期", "总额度", "已用", "剩余", "套餐", "免费模型", "模型冷却"}
 	border := func() string {
 		var b strings.Builder
@@ -2971,7 +3111,7 @@ func renderAccountTable(accs []accountSnapshot) string {
 			total = formatQuota(a.QuotaTotal)
 			used = formatQuota(a.QuotaUsed)
 			remaining = formatQuota(a.QuotaRemaining)
-			plan = ifEmpty(a.PlanLabel, "免费")
+			plan = planDisplayLabel(a.PlanLabel, a.PlanStale)
 		}
 		if a.TokenExpiresAt > 0 {
 			expires = formatDisplayTime(time.Unix(a.TokenExpiresAt, 0))
@@ -2993,6 +3133,31 @@ func renderAccountTable(accs []accountSnapshot) string {
 		}) + "\n")
 	}
 	b.WriteString(border())
+	for _, a := range accs {
+		if a.PlanStale {
+			b.WriteString("\n* 套餐权益查询失败，待刷新；名称可能是上次成功结果。")
+			break
+		}
+	}
+	now := time.Now()
+	for _, a := range accs {
+		if a.RefreshExpiresAt <= 0 {
+			continue
+		}
+		exp := time.Unix(a.RefreshExpiresAt, 0)
+		switch {
+		case !exp.After(now):
+			b.WriteString(fmt.Sprintf("\n! %s 刷新令牌已过期，需要重新登录。", filepath.Base(a.Path)))
+		case exp.Sub(now) < 7*24*time.Hour:
+			b.WriteString(fmt.Sprintf("\n! %s 刷新令牌 %s 到期（剩余 %s），建议尽快重新登录。",
+				filepath.Base(a.Path), exp.Format("2006-01-02 15:04:05"), humanDuration(time.Until(exp))))
+		}
+	}
+	for _, a := range accs {
+		if a.RefreshFailCount > 0 {
+			b.WriteString(fmt.Sprintf("\n! %s 续期连续失败 %d 次，可能需要重新登录。", filepath.Base(a.Path), a.RefreshFailCount))
+		}
+	}
 	return b.String()
 }
 
@@ -3304,6 +3469,8 @@ func runServe() {
 
 	// 启动后台自动刷新协程
 	go backgroundTokenRefresher()
+	// 主动续期（保活）：到点刷新全部账号登录凭据，不等访问令牌临近过期
+	go keepaliveLoop()
 	go backgroundQuotaRefresher()
 	go backgroundDailyCheckin()
 	if cfg.ModelsRefresh > 0 {
@@ -3328,6 +3495,8 @@ func runServe() {
 	mux.HandleFunc("/chat/completions", handleChatCompletions)
 	mux.HandleFunc("/v1/responses", handleResponses)
 	mux.HandleFunc("/responses", handleResponses)
+	mux.HandleFunc("/v1/messages", handleMessages)
+	mux.HandleFunc("/v1/messages/count_tokens", handleCountTokens)
 	mux.HandleFunc("/v1/models", handleModels)
 	mux.HandleFunc("/models", handleModels)
 	mux.HandleFunc("/health", handleHealth)
@@ -3352,6 +3521,7 @@ func runServe() {
 	fmt.Printf("WorkBuddy 本地网关已启动\n")
 	fmt.Printf("   服务监听地址:  http://%s\n", listenAddr)
 	fmt.Printf("   Chat 接口地址: http://%s/v1/chat/completions\n", listenAddr)
+	fmt.Printf("   Claude Code:   http://%s/v1/messages (ANTHROPIC_BASE_URL 指向本网关)\n", listenAddr)
 	fmt.Printf("   Models 接口:   http://%s/v1/models\n", listenAddr)
 	fmt.Printf("   模型转发策略:  【完全透传】客户端请求的任意 model 原样中继至上游\n")
 	_, modelSource := mergedModelIDs()
@@ -3496,8 +3666,9 @@ func requestAuditMiddleware(next http.Handler) http.Handler {
 			traceID = uuid.NewString()
 		}
 		w.Header().Set("X-Trace-ID", traceID)
+		// 普通落盘审计也需要稳定的 TraceID / requestID；不能依赖可选 JSON 日志。
+		ensureDebugRequestContext(r, traceID, start)
 		if debugLoggingEnabled() {
-			ensureDebugRequestContext(r, traceID, start)
 			debugEvent(r, "info", "request_received", map[string]any{
 				"message": "请求已进入网关，准备执行中间件与路由处理",
 			})
@@ -3545,6 +3716,10 @@ func authMiddleware(next http.Handler) http.Handler {
 		if cfg.APIKey != "" && r.URL.Path != "/health" && r.URL.Path != "/ping" && r.URL.Path != "/" {
 			authHeader := r.Header.Get("Authorization")
 			token := strings.TrimPrefix(authHeader, "Bearer ")
+			// Anthropic 客户端（Claude Code 等）用 x-api-key 头携带密钥。
+			if token == "" {
+				token = r.Header.Get("x-api-key")
+			}
 			if token != cfg.APIKey {
 				debugEvent(r, "warn", "authentication_rejected", map[string]any{
 					"status_code":     http.StatusUnauthorized,
@@ -3552,7 +3727,7 @@ func authMiddleware(next http.Handler) http.Handler {
 					"business_impact": "请求未进入业务逻辑",
 				})
 				log.Printf("[请求被拦截] traceId=%s 拦截层=API鉴权 结果=拒绝 原因=未提供有效API密钥 返回状态码=401 业务影响=请求未进入业务方法", w.Header().Get("X-Trace-ID"))
-				writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "未提供有效 API 密钥")
+				writeUpstreamError(w, r, http.StatusUnauthorized, "invalid_api_key", "未提供有效 API 密钥")
 				return
 			}
 		}
@@ -3587,7 +3762,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 			"business_impact": "没有可用登录凭据，未调用上游模型",
 		})
 		recordModelFailure(modelName, "no_auth")
-		ef.fail(w, http.StatusUnauthorized, "no_auth", "未找到有效登录凭据，请先执行 login 命令扫码登录")
+		writeUpstreamError(w, r, http.StatusUnauthorized, "no_auth", "未找到有效登录凭据，请先执行 login 命令扫码登录")
 		return nil, nil, nil, false
 	}
 
@@ -3612,7 +3787,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 					"status_code": http.StatusForbidden, "reason": "没有符合模型账号名单的凭据", "business_impact": "未进入上游调用",
 				})
 				recordModelFailure(modelName, "账号名单拒绝")
-				ef.fail(w, http.StatusForbidden, "model_account_disabled", fmt.Sprintf("模型 %s 没有可用的凭据文件：已被账号黑白名单禁用", modelName))
+				writeUpstreamError(w, r, http.StatusForbidden, "model_account_disabled", fmt.Sprintf("模型 %s 没有可用的凭据文件：已被账号黑白名单禁用", modelName))
 				return nil, nil, nil, false
 			}
 			// 所有账号均不可用（冷却或失效）
@@ -3636,7 +3811,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 				"business_impact": "未调用上游模型",
 			})
 			recordModelFailure(modelName, "无可用账号")
-			ef.fail(w, http.StatusServiceUnavailable, "no_available_account", msg)
+			writeUpstreamError(w, r, http.StatusServiceUnavailable, "no_available_account", msg)
 			return nil, nil, nil, false
 		}
 		attempted[acc] = true
@@ -3702,7 +3877,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 			if clientGone {
 				// 客户端已断开：不再回退其他账号，直接结束
 				releasePendingInFlight(pendingRelease, reqID)
-				ef.fail(w, http.StatusBadGateway, "upstream_network_error", fmt.Sprintf("网络转发失败: %v", err))
+				writeUpstreamError(w, r, http.StatusBadGateway, "upstream_network_error", fmt.Sprintf("网络转发失败: %v", err))
 				return nil, nil, nil, false
 			}
 			lastNetErr = err.Error()
@@ -3730,7 +3905,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 					log.Printf("[#%d] %s", reqID, msg)
 					recordModelFailure(modelName, modelStatusFromError(resp.StatusCode, errStr))
 					releasePendingInFlight(pendingRelease, reqID)
-					ef.fail(w, http.StatusServiceUnavailable, "model_requires_quota", msg)
+					writeUpstreamError(w, r, http.StatusServiceUnavailable, "model_requires_quota", msg)
 					return nil, nil, nil, false
 				}
 				lastRateErr = errStr
@@ -3747,7 +3922,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 					msg := fmt.Sprintf("当前模型 %s 在余额耗尽账号 %s 的受控探测中触发模型级限流，本次不再探测其他耗尽账号", modelName, acc.Path)
 					recordModelFailure(modelName, modelStatusFromError(resp.StatusCode, errStr))
 					releasePendingInFlight(pendingRelease, reqID)
-					ef.fail(w, http.StatusServiceUnavailable, "model_rate_limited", msg)
+					writeUpstreamError(w, r, http.StatusServiceUnavailable, "model_rate_limited", msg)
 					return nil, nil, nil, false
 				}
 				lastRateErr = errStr
@@ -3791,7 +3966,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 
 			recordModelFailure(modelName, modelStatusFromError(resp.StatusCode, errStr))
 			releasePendingInFlight(pendingRelease, reqID)
-			ef.fail(w, resp.StatusCode, "upstream_error", fmt.Sprintf("upstream %d: %s", resp.StatusCode, errStr))
+			writeUpstreamError(w, r, resp.StatusCode, "upstream_error", fmt.Sprintf("upstream %d: %s", resp.StatusCode, errStr))
 			return nil, nil, nil, false
 		}
 
@@ -3841,7 +4016,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 		"reason":          "all_accounts_cooldown",
 		"business_impact": "未调用上游模型",
 	})
-	ef.fail(w, http.StatusTooManyRequests, "all_accounts_cooldown", "所有账号均处于冷却状态")
+	writeUpstreamError(w, r, http.StatusTooManyRequests, "all_accounts_cooldown", "所有账号均处于冷却状态")
 	return nil, nil, nil, false
 }
 
@@ -3925,7 +4100,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 会话结构归一化：保证首条消息为 system，修复部分非 harness 客户端
 	//（以 assistant / tool 续写或回传工具结果）触发的上游 11128 错误
-	ensureLeadingSystemMessage(reqObj)
+	prepareSystemPromptForUpstream(reqObj, r, reqID, w.Header().Get("X-Trace-ID"))
 	repairReport := repairToolMessageSequence(reqObj)
 	logToolSequenceRepair(r, w.Header().Get("X-Trace-ID"), reqID, modelName, repairReport)
 	// 11155 防护：与 Responses 入口共用出站推理历史回填，不伪造思维链正文。
@@ -4197,7 +4372,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = fmt.Fprintf(w, "WorkBuddy Local Gateway v%s is running.\n\nEndpoints:\n- POST /v1/chat/completions\n- POST /v1/responses\n- GET  /v1/models\n- GET  /health\n", version)
+	_, _ = fmt.Fprintf(w, "WorkBuddy Local Gateway v%s is running.\n\nEndpoints:\n- POST /v1/chat/completions\n- POST /v1/responses\n- POST /v1/messages (Anthropic)\n- POST /v1/messages/count_tokens\n- GET  /v1/models\n- GET  /health\n", version)
 }
 
 // -----------------------------------------------------------------------------
@@ -4260,21 +4435,23 @@ func sanitizeMessages(obj map[string]any) {
 //  2. 首条是 developer（OpenAI 新版 system 别名）：重命名为 system；
 //  3. 后续存在 system/developer：提升到首位（developer 归一化为 system），其余保持原序；
 //  4. 其余情况（user / assistant / tool 开头且无 system）：在最前注入一条保底 system。
-func ensureLeadingSystemMessage(obj map[string]any) {
+//
+// 返回值只表示本次是否注入了保底 system，用于不记录提示词正文的审计日志。
+func ensureLeadingSystemMessage(obj map[string]any) bool {
 	messages, ok := obj["messages"].([]any)
 	if !ok || len(messages) == 0 {
-		obj["messages"] = []any{map[string]any{"role": "system", "content": defaultSystemPrompt}}
-		return
+		obj["messages"] = []any{map[string]any{"role": "system", "content": configuredFallbackSystemPrompt()}}
+		return true
 	}
 
 	switch roleOfMessage(messages[0]) {
 	case "system":
-		return
+		return false
 	case "developer":
 		if msg, ok := messages[0].(map[string]any); ok {
 			msg["role"] = "system"
 		}
-		return
+		return false
 	}
 
 	// 后续存在 system/developer：提升到首位，其余保持原序
@@ -4289,15 +4466,16 @@ func ensureLeadingSystemMessage(obj map[string]any) {
 			reordered = append(reordered, messages[:i]...)
 			reordered = append(reordered, messages[i+1:]...)
 			obj["messages"] = reordered
-			return
+			return false
 		}
 	}
 
 	// 无任何 system：在最前注入保底 system（兼容国内站/国际站）
 	injected := make([]any, 0, len(messages)+1)
-	injected = append(injected, map[string]any{"role": "system", "content": defaultSystemPrompt})
+	injected = append(injected, map[string]any{"role": "system", "content": configuredFallbackSystemPrompt()})
 	injected = append(injected, messages...)
 	obj["messages"] = injected
+	return true
 }
 
 // roleOfMessage 读取消息的 role 字段并归一化为小写去空格；非法结构返回空串。

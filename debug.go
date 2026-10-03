@@ -25,6 +25,11 @@ import (
 const runtimeConfigFile = "config.json"
 
 type runtimeFileConfig struct {
+	// SystemPrompt 控制保底文本及实验性全局强制前缀。空值均保持旧行为。
+	SystemPrompt struct {
+		Fallback string `json:"fallback"`
+		Force    string `json:"force"`
+	} `json:"systemPrompt"`
 	Debug struct {
 		Enabled bool `json:"enabled"`
 	} `json:"debug"`
@@ -121,6 +126,7 @@ func loadRuntimeConfig(path string) error {
 		// 无配置文件：warmup / 探测调度回落内置默认值（warmup 默认开启）。
 		setWarmup(warmupConfig{})
 		setProbeSchedule(probeScheduleConfig{})
+		setSystemPromptConfig("", "")
 		return nil
 	}
 	if err != nil {
@@ -148,6 +154,7 @@ func loadRuntimeConfig(path string) error {
 	if err := setModelAccountFilter(fileCfg.Models.Accounts); err != nil {
 		return fmt.Errorf("解析模型账号名单 %s: %w", path, err)
 	}
+	setSystemPromptConfig(fileCfg.SystemPrompt.Fallback, fileCfg.SystemPrompt.Force)
 
 	// v6 站点路由：装载后缺失字段回落默认值（defaultPolicy=allow，未配置规则时兼容现状）。
 	setRouting(fileCfg.Routing)
