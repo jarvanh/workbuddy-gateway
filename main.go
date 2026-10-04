@@ -45,7 +45,6 @@ var version = "1.13.1"
 const (
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
-	logDir             = "logs"
 
 	// defaultSystemPrompt 是当客户端首条消息不是 system 时注入的保底系统提示，
 	// 用于满足腾讯上游「首条消息必须是 system prompt」的硬性要求 (code 11128)。
@@ -90,6 +89,109 @@ const (
 	// upstreamRetryBackoff 是两次重试之间的等待，给上游边缘节点留出恢复时间。
 	upstreamRetryBackoffDefault = 300 * time.Millisecond
 )
+
+// -----------------------------------------------------------------------------
+// 日志目录与保留策略（可用 config.json 的 log 段覆盖）
+// -----------------------------------------------------------------------------
+
+const (
+	// defaultLogDir 是日志目录默认值（相对工作目录）。
+	// 配成绝对路径即可写到持久化挂载上，避免 runner 重启清空 /tmp
+	// 后排障无从下手。
+	defaultLogDir = "logs"
+	// defaultLogKeepDays 是按日期滚动日志的保留天数；<=0 表示不自动清理。
+	defaultLogKeepDays = 7
+)
+
+var (
+	logDirMu    sync.RWMutex
+	logDir      = defaultLogDir
+	logKeepDays = defaultLogKeepDays
+)
+
+// currentLogDir 返回生效的日志目录。
+func currentLogDir() string {
+	logDirMu.RLock()
+	defer logDirMu.RUnlock()
+	return logDir
+}
+
+// currentLogKeepDays 返回生效的日志保留天数；<=0 表示不清理。
+func currentLogKeepDays() int {
+	logDirMu.RLock()
+	defer logDirMu.RUnlock()
+	return logKeepDays
+}
+
+// setLogConfig 装载 config.json 的 log 段；空目录回落到默认值。
+// keepDays < 0 表示未配置（用默认）。
+func setLogConfig(dir string, keepDays int) {
+	logDirMu.Lock()
+	defer logDirMu.Unlock()
+	if d := strings.TrimSpace(dir); d != "" {
+		logDir = d
+	} else {
+		logDir = defaultLogDir
+	}
+	if keepDays >= 0 {
+		logKeepDays = keepDays
+	} else {
+		logKeepDays = defaultLogKeepDays
+	}
+}
+
+// pruneOldLogs 删除超过保留天数的按日期滚动日志（gateway-YYYY-MM-DD.log 与
+// debug-YYYY-MM-DD.jsonl）。serve.log 由 systemd 追加写入、不按日期滚动，不清理。
+// 只在启动时执行一次：常驻进程每天扫一次目录是白花的系统调用，而日志按天切分，
+// 启动时清理足以保证磁盘不无限增长。
+func pruneOldLogs() {
+	keep := currentLogKeepDays()
+	if keep <= 0 {
+		return
+	}
+	dir := currentLogDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().AddDate(0, 0, -keep)
+	var removed int
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		day, ok := logFileDate(e.Name())
+		if !ok {
+			continue
+		}
+		if day.Before(cutoff) {
+			if err := os.Remove(filepath.Join(dir, e.Name())); err == nil {
+				removed++
+			}
+		}
+	}
+	if removed > 0 {
+		log.Printf("[Log] 已清理过期日志 %d 个文件（保留 %d 天，目录=%s）", removed, keep, dir)
+	}
+}
+
+// logFileDate 从滚动日志文件名中解析日期；无法识别返回 false。
+func logFileDate(name string) (time.Time, bool) {
+	const layout = "2006-01-02"
+	for _, prefix := range []string{"gateway-", "debug-"} {
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		rest := strings.TrimSuffix(strings.TrimSuffix(name[len(prefix):], ".log"), ".jsonl")
+		if len(rest) < len(layout) {
+			continue
+		}
+		if t, err := time.ParseInLocation(layout, rest[:len(layout)], displayLoc); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
 
 var errModelAccountPolicy = errors.New("model account policy rejected all accounts")
 

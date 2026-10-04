@@ -60,6 +60,15 @@ type runtimeFileConfig struct {
 	Routing routingConfig `json:"routing"`
 	// Notify 段可选：事件告警（冷却/模型冷却/无可用账号）。默认关闭，不影响现有行为。
 	Notify notifyConfig `json:"notify"`
+	// Log 段可选：日志目录与保留策略。
+	Log struct {
+		// Dir：日志目录（默认 "logs"，相对工作目录）。
+		// 配成绝对路径即可写到持久化挂载上，避免 /tmp 被清空后排障无从下手。
+		Dir string `json:"dir"`
+		// KeepDays：按日期滚动日志的保留天数，默认 7；<=0 表示不自动清理。
+		// 用指针区分「未配置」（默认 7）与「显式设为 0」（禁用清理）。
+		KeepDays *int `json:"keepDays"`
+	} `json:"log"`
 	// Warmup 段可选：5 小时窗口主动触发（默认开启，每日 04:00）。
 	Warmup warmupConfig `json:"warmup"`
 	// Probe 段可选：模型价格主动探测调度。
@@ -161,6 +170,14 @@ func loadRuntimeConfig(path string) error {
 
 	// 事件告警：默认关闭；配置见 config.example.json 的 notify 段。
 	setNotify(fileCfg.Notify)
+
+	// 日志目录与保留策略：必须在 initFileLogging 之前装载（main 里
+	// loadRuntimeConfig 先于 initFileLogging）。未配置时回落默认 "logs" + 保留 7 天。
+	logKeep := -1
+	if fileCfg.Log.KeepDays != nil {
+		logKeep = *fileCfg.Log.KeepDays
+	}
+	setLogConfig(fileCfg.Log.Dir, logKeep)
 
 	// 上游超时覆盖：仅当配置为正数时生效，否则保持内置默认值。
 	upstreamHeaderTimeout = upstreamHeaderTimeoutDefault
@@ -380,10 +397,11 @@ func initDebugLogging() (func(), error) {
 	if !cfg.DebugEnabled {
 		return func() {}, nil
 	}
-	if err := os.MkdirAll(logDir, 0755); err != nil {
-		return nil, fmt.Errorf("创建调试日志目录 %s: %w", logDir, err)
+	dir := currentLogDir()
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("创建调试日志目录 %s: %w", dir, err)
 	}
-	path := filepath.Join(logDir, "debug-"+time.Now().Format("2006-01-02")+".jsonl")
+	path := filepath.Join(dir, "debug-"+time.Now().Format("2006-01-02")+".jsonl")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("打开调试日志 %s: %w", path, err)
