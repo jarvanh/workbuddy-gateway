@@ -100,7 +100,9 @@ const (
 	// 后排障无从下手。
 	defaultLogDir = "logs"
 	// defaultLogKeepDays 是按日期滚动日志的保留天数；<=0 表示不自动清理。
-	defaultLogKeepDays = 7
+	// 90 天（原 7 天，2026-10-05 主人定）：日志按天切分、单份不大，
+	// 保留更长便于事后追溯冷却/无可用账号等历史事件。
+	defaultLogKeepDays = 90
 )
 
 var (
@@ -670,6 +672,12 @@ func main() {
 		}
 	}
 	defer closeDebug()
+
+	// 清理过期滚动日志（pruneOldLogs 此前从未被调用 → keepDays 形同虚设）。
+	// 必须放在 initFileLogging 之后：今天的 gateway-*.log 此刻刚被创建/打开，
+	// 提前清理对本轮无害但语义上应在日志通道就绪后执行；且依赖 loadRuntimeConfig
+	// 已装载的 log.dir / keepDays（顺序见 debug.go 注释）。
+	pruneOldLogs()
 
 	switch command {
 	case "serve", "run", "start":
