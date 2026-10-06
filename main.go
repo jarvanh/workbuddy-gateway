@@ -3866,13 +3866,17 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 	poolSize := len(accounts)
 	accountMu.Unlock()
 	if poolSize == 0 {
+		// 语义修正（2026-10-06）：账号池为空是**临时**状态（重启/重载后账号尚未
+		// ready、凭据同步还没拉回等），此前返回 401 会被上游判定为「认证失败」——
+		// 401 在 OpenClaw/CLIProxyAPI 侧属于不可重试错误，既不重试也不 fallback，
+		// 直接把失败抛给客户端。改为 503 后上层才会重试/切换模型，故障可自愈。
 		debugEvent(r, "warn", "request_rejected_no_account", map[string]any{
-			"status_code":     http.StatusUnauthorized,
-			"reason":          "no_auth",
-			"business_impact": "没有可用登录凭据，未调用上游模型",
+			"status_code":     http.StatusServiceUnavailable,
+			"reason":          "no_available_account",
+			"business_impact": "账号池为空（临时），未调用上游模型",
 		})
-		recordModelFailure(modelName, "no_auth")
-		writeUpstreamError(w, r, http.StatusUnauthorized, "no_auth", "未找到有效登录凭据，请先执行 login 命令扫码登录")
+		recordModelFailure(modelName, "无可用账号")
+		writeUpstreamError(w, r, http.StatusServiceUnavailable, "no_available_account", "账号池为空，暂时无法处理请求，请稍后重试")
 		return nil, nil, nil, false
 	}
 
