@@ -109,6 +109,10 @@ var (
 	logDirMu    sync.RWMutex
 	logDir      = defaultLogDir
 	logKeepDays = defaultLogKeepDays
+	// dataDir 是 config.json data 段指定的数据目录；空串 = 未配置（保持启动 cwd）。
+	// 配置后 serve 启动即 chdir 到该目录，凭据扫描/config/status/usage 等全部落到那里。
+	dataDirMu sync.RWMutex
+	dataDir   string
 )
 
 // currentLogDir 返回生效的日志目录。
@@ -123,6 +127,20 @@ func currentLogKeepDays() int {
 	logDirMu.RLock()
 	defer logDirMu.RUnlock()
 	return logKeepDays
+}
+
+// currentDataDir 返回配置的数据目录；空串 = 未配置（保持启动 cwd，行为同旧版）。
+func currentDataDir() string {
+	dataDirMu.RLock()
+	defer dataDirMu.RUnlock()
+	return dataDir
+}
+
+// setDataDir 装载 config.json 的 data 段；空值保持启动工作目录。
+func setDataDir(dir string) {
+	dataDirMu.Lock()
+	defer dataDirMu.Unlock()
+	dataDir = strings.TrimSpace(dir)
 }
 
 // setLogConfig 装载 config.json 的 log 段；空目录回落到默认值。
@@ -656,6 +674,15 @@ func main() {
 		if err := loadRuntimeConfig(runtimeConfigFile); err != nil {
 			fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)
 			os.Exit(1)
+		}
+		// data.dir：配置了就切过去 —— 之后凭据扫描（cwd 自动发现）、status 快照、
+		// config 热加载、用量流水、缓存/账本落盘全部落到该目录；
+		// 未配置时保持启动 cwd，行为与旧版完全一致（默认不迁移）。
+		if dd := currentDataDir(); dd != "" {
+			if err := os.Chdir(dd); err != nil {
+				fmt.Fprintf(os.Stderr, "启动失败: 切换数据目录 %s: %v\n", dd, err)
+				os.Exit(1)
+			}
 		}
 	}
 

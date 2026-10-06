@@ -69,6 +69,13 @@ type runtimeFileConfig struct {
 		// 用指针区分「未配置」（默认 7）与「显式设为 0」（禁用清理）。
 		KeepDays *int `json:"keepDays"`
 	} `json:"log"`
+	// Data 段可选：数据目录（凭据/config.json/status 快照/用量流水/缓存/账本）。
+	// 未配置时保持启动工作目录（cwd），行为与旧版完全一致；配置为绝对路径后
+	// 进程启动即切换到该目录，所有数据文件统一落那里 —— 用于把数据搬到持久化挂载。
+	// 注意：日志不跟随此段（仍由 log 段控制）；本段在 main 读 config.json 之前生效。
+	Data struct {
+		Dir string `json:"dir"`
+	} `json:"data"`
 	// Warmup 段可选：5 小时窗口主动触发（默认开启，每日 04:00）。
 	Warmup warmupConfig `json:"warmup"`
 	// Probe 段可选：模型价格主动探测调度。
@@ -178,6 +185,9 @@ func loadRuntimeConfig(path string) error {
 		logKeep = *fileCfg.Log.KeepDays
 	}
 	setLogConfig(fileCfg.Log.Dir, logKeep)
+	// 数据目录：在 main 里 chdir 之前装载（set 后 main 立即读取并切换），
+	// 未配置时空串 = 保持启动 cwd，行为与旧版完全一致。
+	setDataDir(fileCfg.Data.Dir)
 
 	// 上游超时覆盖：仅当配置为正数时生效，否则保持内置默认值。
 	upstreamHeaderTimeout = upstreamHeaderTimeoutDefault

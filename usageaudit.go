@@ -25,7 +25,10 @@ import (
 // -----------------------------------------------------------------------------
 
 // usageAuditDir 是使用量明细 JSONL 的落盘目录。
-const usageAuditDir = "/tmp/local_workbuddy/data"
+// 2026-10-06 起改为 cwd 相对：serve 启动时若 config.json 配了 data.dir 会先 chdir 过去，
+// 于是用量流水跟着数据目录走（可指向持久化挂载）；未配置时 cwd = 启动目录，行为同旧版。
+// 注意：用量只在 serve 请求处理时写入，chdir 发生在 main() 里先于一切请求。
+const usageAuditDir = "."
 
 // beijingZone 是北京时间固定时区（UTC+8），用于按自然日切分用量文件。
 var beijingZone = time.FixedZone("CST", 8*3600)
