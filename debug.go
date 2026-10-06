@@ -25,7 +25,7 @@ import (
 const runtimeConfigFile = "config.json"
 
 type runtimeFileConfig struct {
-	// SystemPrompt 控制保底文本及实验性全局强制前缀。空值均保持旧行为。
+	// SystemPrompt 控制保底文本及实验性全局强制文本（后置于 system 末尾）。空值均保持旧行为。
 	SystemPrompt struct {
 		Fallback string `json:"fallback"`
 		Force    string `json:"force"`
@@ -600,7 +600,8 @@ func debugEvent(r *http.Request, level, event string, fields map[string]any) {
 		record[key] = value
 	}
 
-	data, err := json.Marshal(record)
+	// 只生成日志用副本，不能改写调用方用于业务判断的字段或错误。
+	data, err := json.Marshal(redactDebugValue(record))
 	if err != nil {
 		return
 	}
@@ -701,7 +702,7 @@ func safeDebugError(err error) string {
 	if err == nil {
 		return ""
 	}
-	message := strings.ReplaceAll(strings.ReplaceAll(err.Error(), "\r", " "), "\n", " ")
+	message := strings.ReplaceAll(strings.ReplaceAll(redactSensitiveText(err.Error()), "\r", " "), "\n", " ")
 	if len(message) > 300 {
 		message = message[:300]
 	}

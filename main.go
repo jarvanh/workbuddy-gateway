@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -37,7 +38,7 @@ import (
 // version 是网关版本号：默认取开发值，发布流水线会通过
 // -ldflags "-X main.version=<tag>" 注入 tag 版本（因此必须是 var 而非 const）。
 //
-// ⚠️ 上游 v1.13.13 把这里改成了 const(version = "1.13.13")，fork 不同步这一改动：
+// ⚠️ 上游 v1.13.13 / v1.13.15 把这里改成了 const(version = "1.13.x")，fork 不同步这一改动：
 // const 会让 release 流水线的 -ldflags 注入失效（Go 不允许对 const 做 linker 注入），
 // 发版产物会永远显示源码里的开发版本号。保留 var 形态。
 var version = "1.13.1"
@@ -734,6 +735,9 @@ func main() {
 
 // initFileLogging 将运行日志同时写入控制台和按日期命名的项目日志文件。
 func initFileLogging(command string) func() {
+	registerSecrets(cfg.APIKey)
+	// 文件初始化失败时，控制台仍要隐藏秘密值。
+	log.SetOutput(&redactingLogWriter{writer: os.Stderr})
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		log.Printf("[Log] 无法创建日志目录 %s，将仅输出到控制台: %v", logDir, err)
 		return func() {}
@@ -744,7 +748,7 @@ func initFileLogging(command string) func() {
 		log.Printf("[Log] 无法打开日志文件 %s，将仅输出到控制台: %v", path, err)
 		return func() {}
 	}
-	log.SetOutput(io.MultiWriter(os.Stderr, f))
+	log.SetOutput(&redactingLogWriter{writer: io.MultiWriter(os.Stderr, f)})
 	log.Printf("[Log] 审计日志已启用，文件=%s，命令=%s，版本=%s", path, command, version)
 	return func() { _ = f.Close() }
 }
@@ -960,6 +964,7 @@ func loadAuth() (*StoredAuth, error) {
 	if sa.Auth.AccessToken == "" {
 		return nil, fmt.Errorf("凭据文件中缺少 AccessToken")
 	}
+	registerCredentialSecrets(&sa)
 
 	authLock.Lock()
 	currAuth = &sa
@@ -968,28 +973,34 @@ func loadAuth() (*StoredAuth, error) {
 }
 
 func saveAuth(sa *StoredAuth) error {
-	authLock.Lock()
-	currAuth = sa
-	authLock.Unlock()
-
+	registerCredentialSecrets(sa)
+	traceID := newTraceID()
+	log.Printf("[凭据保存] traceId=%s 文件=%s 阶段=开始 说明=先写入磁盘，成功后再更新当前内存凭据", traceID, cfg.AuthFile)
 	dir := filepath.Dir(cfg.AuthFile)
 	if dir != "" && dir != "." {
 		_ = os.MkdirAll(dir, 0755)
 	}
 	data, err := json.MarshalIndent(sa, "", "  ")
 	if err != nil {
+		log.Printf("[凭据保存] traceId=%s 阶段=编码 结果=失败 原因=%v 业务影响=当前内存凭据未切换", traceID, err)
 		return err
 	}
 	if err := os.WriteFile(cfg.AuthFile, data, 0600); err != nil {
+		log.Printf("[凭据保存] traceId=%s 阶段=写入磁盘 结果=失败 原因=%v 业务影响=当前内存凭据未切换", traceID, err)
 		return err
 	}
 	clearDisabledMarker(cfg.AuthFile)
+	authLock.Lock()
+	currAuth = sa
+	authLock.Unlock()
+	log.Printf("[凭据保存] traceId=%s 文件=%s 结果=成功 说明=磁盘写入完成，当前内存凭据已更新", traceID, cfg.AuthFile)
 	return nil
 }
 
 // saveAuthTo 将凭据写入指定路径（多账号模式使用）。
 // 写入成功后清除该路径的失效标记（表示账号已重新登录）。
 func saveAuthTo(path string, sa *StoredAuth) error {
+	registerCredentialSecrets(sa)
 	dir := filepath.Dir(path)
 	if dir != "" && dir != "." {
 		_ = os.MkdirAll(dir, 0755)
@@ -1018,6 +1029,7 @@ func loadAccountFile(path string) (*StoredAuth, error) {
 	if sa.Auth.AccessToken == "" {
 		return nil, fmt.Errorf("凭据文件缺少 AccessToken (%s)", path)
 	}
+	registerCredentialSecrets(&sa)
 	return &sa, nil
 }
 
@@ -2309,6 +2321,7 @@ func recordRefreshFailure(acc *Account, summary string) int {
 // 按凭据文件中的 edition 路由到对应站点（国内站/国际站）的刷新接口。
 // 返回上游 HTTP 状态码（成功或失败时均为实际状态；网络错误为 0）。
 func refreshTokenPayload(sa *StoredAuth) (int, error) {
+	registerCredentialSecrets(sa)
 	prof := profileForEdition(sa.Edition)
 	headers := func(r *http.Request) {
 		commonHeaders(r, prof)
@@ -2327,6 +2340,7 @@ func refreshTokenPayload(sa *StoredAuth) (int, error) {
 	if err := json.Unmarshal(data, &tok); err != nil || tok.AccessToken == "" {
 		return status, fmt.Errorf("解析新 Token 失败: %w", err)
 	}
+	registerSecrets(tok.AccessToken, tok.RefreshToken)
 
 	now := time.Now()
 	sa.Auth.AccessToken = tok.AccessToken
@@ -3053,7 +3067,7 @@ type accountSnapshot struct {
 	QuotaKnown       bool                          `json:"quotaKnown,omitempty"`
 	QuotaExhausted   bool                          `json:"quotaExhausted,omitempty"`
 	ModelStates      map[string]modelStateSnapshot `json:"modelStates,omitempty"`
-	FreeModels       int                           `json:"freeModels,omitempty"`
+	FreeModels       int                           `json:"freeModels,omitempty"` // 展示值：所属站点模型统计中 0.00x 的模型数，不参与调度
 	ModelCooldowns   int                           `json:"modelCooldowns,omitempty"`
 }
 
@@ -3104,9 +3118,6 @@ func writeStatusSnapshot() {
 		if len(acc.ModelStates) > 0 {
 			as.ModelStates = make(map[string]modelStateSnapshot, len(acc.ModelStates))
 			for model, state := range acc.ModelStates {
-				if state.CostClass == modelCostFree {
-					as.FreeModels++
-				}
 				if state.CooldownUntil.After(now) {
 					as.ModelCooldowns++
 				}
@@ -3160,6 +3171,20 @@ func writeStatusSnapshot() {
 		snap.Accounts = append(snap.Accounts, as)
 	}
 	snap.Models = buildModelStatSnapshots(now, accounts)
+	cnFree, intlFree := freeModelDisplayCounts(snap.Models)
+	for i := range snap.Accounts {
+		if profileForEdition(snap.Accounts[i].Edition).Key == "intl" {
+			snap.Accounts[i].FreeModels = intlFree
+		} else {
+			snap.Accounts[i].FreeModels = cnFree
+		}
+	}
+	if !lastFreeModelDisplay.initialized || lastFreeModelDisplay.cn != cnFree || lastFreeModelDisplay.intl != intlFree {
+		lastFreeModelDisplay.initialized = true
+		lastFreeModelDisplay.cn, lastFreeModelDisplay.intl = cnFree, intlFree
+		log.Printf("[免费模型展示] traceId=%s 来源=模型统计站点倍率 国内=%d 国际=%d 模型行数=%d 规则=只计0.00x 业务影响=仅更新账号表展示，不改实测账本、调度或计费判断",
+			newTraceID(), cnFree, intlFree, len(snap.Models))
+	}
 	accountMu.Unlock()
 
 	data, err := json.MarshalIndent(snap, "", "  ")
@@ -3669,7 +3694,7 @@ func runServe() {
 		fmt.Printf("   凭据热加载:    已关闭 (-reload-interval 0)\n")
 	}
 	if cfg.APIKey != "" {
-		fmt.Printf("   API 鉴权:      已启用 (Bearer %s)\n", cfg.APIKey)
+		printAPIAuthBanner(os.Stdout)
 	} else {
 		fmt.Printf("   API 鉴权:      未启用 (任何客户端均可直连)\n")
 	}
@@ -3751,6 +3776,10 @@ func runServe() {
 	defer cancel()
 	_ = server.Shutdown(ctx)
 	fmt.Println("网关已安全停止。")
+}
+
+func printAPIAuthBanner(w io.Writer) {
+	fmt.Fprintln(w, "   API 鉴权:      已启用 (密钥已隐藏)")
 }
 
 func backgroundTokenRefresher() {
@@ -3857,7 +3886,7 @@ func authMiddleware(next http.Handler) http.Handler {
 			if token == "" {
 				token = r.Header.Get("x-api-key")
 			}
-			if token != cfg.APIKey {
+			if subtle.ConstantTimeCompare([]byte(token), []byte(cfg.APIKey)) != 1 {
 				debugEvent(r, "warn", "authentication_rejected", map[string]any{
 					"status_code":     http.StatusUnauthorized,
 					"reason":          "invalid_api_key",
