@@ -142,8 +142,11 @@ func recordModelTTFT(model string, d time.Duration) {
 	}
 	modelStatsMu.Lock()
 	stat := modelStatLocked(model)
-	stat.bucketLocked(time.Now()).TTFTSum += d
-	stat.bucketLocked(time.Now()).TTFTSamples++
+	// 单次取桶：两次独立 time.Now() 会让 Sum 与 Samples 在小时边界落入不同桶，
+	// 且第二次 bucketLocked 的淘汰/追加可能使第一次返回的指针错位。
+	b := stat.bucketLocked(time.Now())
+	b.TTFTSum += d
+	b.TTFTSamples++
 	modelStatsMu.Unlock()
 }
 

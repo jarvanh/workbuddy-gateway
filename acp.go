@@ -26,6 +26,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -169,7 +170,7 @@ func acpCreateConversation(ctx context.Context, auth *StoredAuth, prof *upstream
 		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(raw), 120))
 	}
 	var env struct {
-		Code int `json:"code"`
+		Code int    `json:"code"`
 		Msg  string `json:"msg"`
 		Data struct {
 			ID string `json:"id"`
@@ -186,7 +187,7 @@ func acpCreateConversation(ctx context.Context, auth *StoredAuth, prof *upstream
 
 // acpGetConversation 读会话；suffix 为空拿会话本身，"/session" 拿沙箱信息。
 func acpGetConversation(ctx context.Context, auth *StoredAuth, prof *upstreamProfile, conversation, suffix string) (json.RawMessage, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, prof.Origin+webConversationsPath+urlPathEscape(conversation)+suffix, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, prof.Origin+webConversationsPath+url.PathEscape(conversation)+suffix, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -466,9 +467,4 @@ func orUnknown(s string) string {
 		return "未知"
 	}
 	return s
-}
-
-// urlPathEscape 对会话 id 做路径转义，避免特殊字符破坏 URL。
-func urlPathEscape(s string) string {
-	return strings.ReplaceAll(strings.ReplaceAll(s, " ", "%20"), "/", "%2F")
 }

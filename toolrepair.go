@@ -139,7 +139,7 @@ func repairToolMessageSequence(obj map[string]any) toolSequenceRepairReport {
 }
 
 // toolMessageTopology 生成有界的消息拓扑签名：仅角色与工具调用 ID，不含任何正文内容。
-// 最多记录前 40 条，用于在真实请求上核对工具序列结构而不泄露提示词或工具结果。
+// 最多记录前 200 条，用于在真实请求上核对工具序列结构而不泄露提示词或工具结果。
 func toolMessageTopology(messages []any) string {
 	const maxEntries = 200
 	parts := make([]string, 0, maxEntries)
