@@ -10,6 +10,13 @@
     "fallback": "",
     "force": ""
   },
+  "log": {
+    "dir": "logs",
+    "keepDays": 7
+  },
+  "data": {
+    "dir": ""
+  },
   "debug": {
     "enabled": false
   },
@@ -30,84 +37,14 @@
     "accountOrder": "expiringFirst",
     "minBalanceGuard": 10,
     "maxPrice": 0.06,
-    "priceAnchor": {
-      "model": "glm-5.3-flash",
-      "site": "cn",
-      "multiplier": 0.06
-    },
-    "rules": [
-      {
-        "models": [
-          "hy4-preview-f"
-        ],
-        "sites": [
-          {
-            "site": "intl"
-          },
-          {
-            "site": "cn"
-          }
-        ]
-      },
-      {
-        "models": [
-          "hy4-preview"
-        ],
-        "sites": [
-          {
-            "site": "intl"
-          },
-          {
-            "site": "cn",
-            "window": {
-              "start": "23:00",
-              "end": "08:00"
-            },
-            "outside": "reject",
-            "fallbackBudget": {
-              "credits": 1
-            },
-            "active": {
-              "from": "2026-09-11",
-              "until": "2026-10-11"
-            },
-            "onExpire": "reject"
-          }
-        ]
-      },
-      {
-        "models": [
-          "glm-5.3-flash"
-        ],
-        "sites": [
-          {
-            "site": "intl"
-          },
-          {
-            "site": "cn"
-          }
-        ]
-      },
-      {
-        "models": [
-          "some-expensive-model"
-        ],
-        "maxPrice": 0.5,
-        "sites": [
-          {
-            "site": "intl"
-          },
-          {
-            "site": "cn"
-          }
-        ]
-      }
-    ]
+    "priceAnchor": null,
+    "rules": []
   },
   "checkin": {
     "cn": {
       "enabled": true,
-      "travel": true
+      "travel": true,
+      "growth": true
     },
     "intl": {
       "enabled": true
@@ -116,14 +53,17 @@
   "notify": {
     "enabled": false,
     "type": "telegram",
+    "webhook": "",
+    "botToken": "",
+    "botTokenEnv": "TELEGRAM_BOT_TOKEN",
+    "chatId": "",
+    "chatIdEnv": "TELEGRAM_CHAT_ID",
     "minIntervalSeconds": 60,
     "events": [
       "cooldown",
       "model_cooldown",
       "no_account"
-    ],
-    "botTokenEnv": "TELEGRAM_BOT_TOKEN",
-    "chatIdEnv": "TELEGRAM_CHAT_ID"
+    ]
   },
   "warmup": {
     "enabled": true,
@@ -132,6 +72,7 @@
     "models": [],
     "catchUpHours": 4,
     "retryMinutes": 10,
+    "maxRateLimitRetries": 3,
     "notify": false
   },
   "probe": {
