@@ -29,6 +29,9 @@ const (
 	notifyEventNoAccount     = "no_account"
 	// notifyEventWarmup 5 小时窗口主动触发的轮次结果（默认关闭，warmup.notify 开启）。
 	notifyEventWarmup = "warmup"
+	// notifyEventProbe 模型价格探测的结果汇总（默认关闭，probe.schedule.notify 开启）。
+	// 探测是周期性任务（收敛前 2 分钟一轮），故按「每天一条」汇总推送，不逐轮打扰。
+	notifyEventProbe = "probe"
 )
 
 // notifyConfig 告警配置（config.json 的 notify 段）。

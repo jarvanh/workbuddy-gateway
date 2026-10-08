@@ -87,6 +87,9 @@ type probeScheduleConfig struct {
 	FollowWarmup *bool `json:"followWarmup"`
 	// Time warmup 关闭（或显式关闭跟随）时的每日探测时刻，默认 06:00。
 	Time string `json:"time"`
+	// Notify 每日探测结论汇总是否推送（默认 false）。
+	// 探测收敛前是 2 分钟一轮，逐轮推送纯属噪音，故按「每天一条」汇总发送。
+	Notify *bool `json:"notify"`
 }
 
 // warmupRuntime 是装载后的生效配置。
@@ -106,6 +109,7 @@ type probeRuntime struct {
 	Enabled      bool
 	FollowWarmup bool
 	Time         string
+	Notify       bool
 }
 
 var (
@@ -129,7 +133,7 @@ func defaultWarmupRuntime() warmupRuntime {
 }
 
 func defaultProbeRuntime() probeRuntime {
-	return probeRuntime{Enabled: true, FollowWarmup: true, Time: probeDefaultTime}
+	return probeRuntime{Enabled: true, FollowWarmup: true, Time: probeDefaultTime, Notify: false}
 }
 
 // setWarmup 装载 warmup 段，缺失字段回落默认值。
@@ -184,6 +188,9 @@ func setProbeSchedule(cfg probeScheduleConfig) {
 	}
 	if t := strings.TrimSpace(cfg.Time); t != "" {
 		rt.Time = t
+	}
+	if cfg.Notify != nil {
+		rt.Notify = *cfg.Notify
 	}
 	warmupMu.Lock()
 	probeCurrent = rt
@@ -610,6 +617,92 @@ func sendWarmupNotify(rt warmupRuntime, ok, failed, skipped int) {
 }
 
 // -----------------------------------------------------------------------------
+// 模型探测每日汇总通知
+// -----------------------------------------------------------------------------
+
+// probeSummaryDelay 当日首次探测后多久汇总推送。
+// 探测收敛前是 2 分钟一轮，等一会儿再汇总能覆盖更多模型，避免只报头几个。
+const probeSummaryDelay = 30 * time.Minute
+
+var (
+	probeDailyMu     sync.Mutex
+	probeDailyDate   string
+	probeDailyFree   int
+	probeDailyPaid   int
+	probeDailyOther  int
+	probeDailyModels []string
+	probeDailySent   bool
+	probeDailyFirst  time.Time
+)
+
+// recordProbeDailyResult 累计当日探测结论，供每日汇总通知使用。
+func recordProbeDailyResult(site, model, verdict string, now time.Time) {
+	probeDailyMu.Lock()
+	defer probeDailyMu.Unlock()
+	date := cycleDateOf(now)
+	if probeDailyDate != date {
+		// 跨天重置：只统计当天结论，且每天允许再发一条。
+		probeDailyDate = date
+		probeDailyFree, probeDailyPaid, probeDailyOther = 0, 0, 0
+		probeDailyModels = nil
+		probeDailySent = false
+		probeDailyFirst = now
+	}
+	label := site + "/" + model
+	switch verdict {
+	case "free":
+		probeDailyFree++
+		label += " 免费"
+	case "paid":
+		probeDailyPaid++
+		label += " 收费"
+	default:
+		probeDailyOther++
+		label += " 未判定"
+	}
+	if len(probeDailyModels) < 20 {
+		probeDailyModels = append(probeDailyModels, label)
+	}
+}
+
+// maybeSendProbeDailyNotify 当日探测累计够久后推送一条汇总（每天最多一条）。
+// 未开开关、当天已发过、或距首次探测不足 probeSummaryDelay 时直接返回。
+func maybeSendProbeDailyNotify(now time.Time) {
+	pr := probeScheduleSnapshot()
+	if !pr.Enabled || !pr.Notify {
+		return
+	}
+	probeDailyMu.Lock()
+	if probeDailySent || probeDailyFirst.IsZero() || probeDailyDate != cycleDateOf(now) {
+		probeDailyMu.Unlock()
+		return
+	}
+	if now.Sub(probeDailyFirst) < probeSummaryDelay {
+		probeDailyMu.Unlock()
+		return
+	}
+	free, paid, other := probeDailyFree, probeDailyPaid, probeDailyOther
+	models := append([]string(nil), probeDailyModels...)
+	probeDailySent = true
+	probeDailyMu.Unlock()
+
+	title := "🔍 workbuddy 模型探测结果"
+	date := cycleDateOf(now)
+	body := fmt.Sprintf("探测日期: %s\n免费: %d\n收费: %d\n未判定: %d", date, free, paid, other)
+	if len(models) > 0 {
+		body += "\n明细:\n  " + strings.Join(models, "\n  ")
+	}
+	sendNotify(notifyEvent{
+		Kind:  notifyEventProbe,
+		Key:   "probe|" + date,
+		Level: "info",
+		Title: title,
+		Body:  body,
+		HTML:  tgTitle(title) + tgKV("探测日期", date) + tgKV("免费", fmt.Sprint(free)) + tgKV("收费", fmt.Sprint(paid)) + tgKV("未判定", fmt.Sprint(other)),
+	})
+}
+
+// -----------------------------------------------------------------------------
 // 调度循环
 // -----------------------------------------------------------------------------
 
@@ -821,6 +914,7 @@ type warmupStatusResponse struct {
 	ProbeFollowWarmup bool   `json:"probeFollowWarmup"`
 	ProbeTime         string `json:"probeTime"`
 	ProbeEffectiveAt  string `json:"probeEffectiveAt"`
+	ProbeNotify       bool   `json:"probeNotify"`
 
 	Cycle *warmupCycle         `json:"cycle,omitempty"`
 	History []warmupHistoryEntry `json:"history,omitempty"`
@@ -843,6 +937,7 @@ func warmupStatusNow() warmupStatusResponse {
 		ProbeEnabled: pr.Enabled,
 		ProbeFollowWarmup: pr.FollowWarmup,
 		ProbeTime:    pr.Time,
+		ProbeNotify:  pr.Notify,
 	}
 	if rt.Enabled {
 		resp.ProbeEffectiveAt = scheduledTimeOn(now, rt.Time, 4, 0).Format("2006-01-02 15:04:05 MST")
@@ -927,6 +1022,8 @@ func printWarmupHelp() {
   notify on|off       每轮结束后是否推送结果（默认 off）
   probe-time <HH:MM>  设置 warmup 关闭时的每日主动探测时刻（默认 06:00）
   probe-follow on|off 主动探测是否跟随 warmup 时刻（默认 on）
+  probe-notify on|off 每日探测结论汇总是否推送（默认 off，每天最多一条）
+  probe-notify on|off 每日探测结论汇总是否推送（默认 off，每天最多一条）
   run                 立即执行一轮（需 serve 正在运行）
 
 示例:
@@ -1103,6 +1200,22 @@ func runWarmup() {
 		mutate = func(m map[string]any) error {
 			p := probeSection(m)
 			p["followWarmup"] = val
+			m["probe"] = map[string]any{"schedule": p}
+			return nil
+		}
+	case "probe-notify":
+		if len(args) < 2 {
+			fmt.Println("用法: workbuddy-gateway warmup probe-notify on|off")
+			os.Exit(1)
+		}
+		val, ok := parseOnOff(args[1])
+		if !ok {
+			fmt.Printf("取值无效: %s（应为 on 或 off）\n", args[1])
+			os.Exit(1)
+		}
+		mutate = func(m map[string]any) error {
+			p := probeSection(m)
+			p["notify"] = val
 			m["probe"] = map[string]any{"schedule": p}
 			return nil
 		}
@@ -1304,6 +1417,7 @@ func printRemoteWarmupStatus(st warmupStatusResponse) {
 	} else {
 		fmt.Printf("              独立时刻 %s\n", st.ProbeTime)
 	}
+	fmt.Printf("  探测结果通知: %s\n", onOff(st.ProbeNotify))
 	if len(st.Selected) > 0 {
 		fmt.Printf("  命中模型:    %d 个：%s\n", len(st.Selected), strings.Join(st.Selected, ", "))
 	}

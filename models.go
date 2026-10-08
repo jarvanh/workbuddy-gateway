@@ -914,6 +914,9 @@ func modelPriceProbeLoop() {
 		case <-modelProbeTrigger:
 		}
 		modelPriceProbeOnce()
+		// 探测收敛前是 2 分钟一轮，逐轮推送纯属噪音；这里只做「当日首次探测
+		// 满 probeSummaryDelay 后发一条汇总」的判断，未开开关时立即返回。
+		maybeSendProbeDailyNotify(time.Now())
 		next := modelPriceProbeTick
 		if modelPendingProbeCount() > 0 {
 			next = modelPriceProbeCatchUp
@@ -1001,6 +1004,8 @@ func modelPriceProbeOnce() {
 			modelsMu.Unlock()
 			log.Printf("[ModelPrice] 站点=%s 账号=%s 模型=%s -> verdict=%s credit=%s tokens=%d (%s)",
 				site, acc.Path, id, p.Verdict, formatQuota(credit), tokens, detail)
+			// 累计当日探测结论，供「每日探测汇总」通知使用（开关关闭时仅累计不推送）。
+			recordProbeDailyResult(site, id, verdict, now)
 			done++
 		}
 	}
