@@ -222,7 +222,31 @@ var (
 	warmupTrigger     = make(chan struct{}, 1) // 立即执行一轮（HTTP run / 配置变更）
 	warmupWake        = make(chan struct{}, 1)
 	probeScheduleDate string // 进程内记录已触发过的探测日期，防止同日重复
+
+	// warmupWakeReason 记录下一轮 runWarmupOnce 的触发来源：
+	// scheduled（每日定时）/ cooldown（模型冷却恢复）/ manual（HTTP run）。
+	// 三者的通知标题与去重键必须分开，否则主人分不清是哪一路触发的。
+	warmupReasonMu   sync.Mutex
+	warmupWakeReason string
 )
+
+func setWarmupWakeReason(r string) {
+	warmupReasonMu.Lock()
+	warmupWakeReason = r
+	warmupReasonMu.Unlock()
+}
+
+// takeWarmupWakeReason 取出并清空触发来源；未设置时视为定时触发。
+func takeWarmupWakeReason() string {
+	warmupReasonMu.Lock()
+	defer warmupReasonMu.Unlock()
+	r := warmupWakeReason
+	warmupWakeReason = ""
+	if r == "" {
+		return "scheduled"
+	}
+	return r
+}
 
 func defaultWarmupRuntime() warmupRuntime {
 	return warmupRuntime{
@@ -614,6 +638,7 @@ func warmupTriggerModel(model string, rt warmupRuntime, now time.Time, ms *warmu
 // runWarmupOnce 执行一轮：只处理 pending 模型，已 ok/failed/skipped 的不重复打。
 // 返回本轮结束后的统计。
 func runWarmupOnce(rt warmupRuntime, now time.Time) (ok, failed, skipped, pending int, catchUp bool) {
+	reason := takeWarmupWakeReason()
 	models := warmupSelectModels(rt, now)
 	if len(models) == 0 {
 		log.Printf("[Warmup] 本轮没有符合条件的模型（上限=%s，显式模型=%d）", formatQuota(rt.MaxPrice), len(rt.Models))
@@ -661,6 +686,11 @@ func runWarmupOnce(rt warmupRuntime, now time.Time) (ok, failed, skipped, pendin
 	warmupStateMu.Unlock()
 
 	if len(pendingModels) == 0 {
+		// 冷却恢复触发时即使没有待触发模型（例如当天已全部成功），
+		// 也要发一条通知：主人需要知道「冷却恢复触发发生了」，否则这一路是静默的。
+		if rt.Notify && reason == "cooldown" {
+			sendWarmupNotify(rt, 0, 0, 0, reason)
+		}
 		return countCycle(cy)
 	}
 	log.Printf("[Warmup] 开始第 %d 轮触发：待触发=%d，总计=%d，计划时刻=%s，上限=%s",
@@ -700,7 +730,7 @@ func runWarmupOnce(rt warmupRuntime, now time.Time) (ok, failed, skipped, pendin
 	log.Printf("[Warmup] 第 %d 轮结束：成功=%d，失败=%d，跳过=%d，待补触发=%d",
 		cy.Attempts, ok, failed, skipped, pending)
 	if rt.Notify && pending == 0 {
-		sendWarmupNotify(rt, ok, failed, skipped)
+		sendWarmupNotify(rt, ok, failed, skipped, reason)
 	}
 	return ok, failed, skipped, pending, catchUp
 }
@@ -737,19 +767,32 @@ func modelDisplayName(key string) string {
 	return key
 }
 
-// sendWarmupNotify 一轮全部结束后推送结果（复用 notify 通道）。
-func sendWarmupNotify(rt warmupRuntime, ok, failed, skipped int) {
+// sendWarmupNotify 一轮结束后推送结果（复用 notify 通道）。
+// reason 区分触发来源（scheduled 定时 / cooldown 冷却恢复 / manual 手动），
+// 三者的标题与去重键必须不同，否则主人分不清是哪一路触发的。
+func sendWarmupNotify(rt warmupRuntime, ok, failed, skipped int, reason string) {
 	now := time.Now()
-	title := "✅ workbuddy 5 小时窗口已触发"
-	if failed > 0 {
-		title = "⚠️ workbuddy 5 小时窗口触发（部分失败）"
+	var title, keyPrefix string
+	switch reason {
+	case "cooldown":
+		title = "🔄 workbuddy 冷却恢复触发"
+		if failed > 0 {
+			title = "⚠️ workbuddy 冷却恢复触发（部分失败）"
+		}
+		keyPrefix = "warmup-cooldown|"
+	default: // scheduled 及其他
+		title = "✅ workbuddy 5 小时窗口已触发"
+		if failed > 0 {
+			title = "⚠️ workbuddy 5 小时窗口触发（部分失败）"
+		}
+		keyPrefix = "warmup|"
 	}
 	body := fmt.Sprintf("触发时刻: %s\n价格上限: %s\n成功: %d\n失败: %d\n跳过: %d",
 		formatDisplayTime(now), formatQuota(rt.MaxPrice), ok, failed, skipped)
 	sendNotify(notifyEvent{
-		Kind:  notifyEventWarmup,
-		// 同一天多次触发（定时 + 冷却恢复补触发）共用同一去重键，避免刷屏。
-		Key:   "warmup|" + cycleDateOf(now),
+		Kind: notifyEventWarmup,
+		// 定时与冷却恢复分开去重：冷却恢复一天可能多次，不能共用同一把锁。
+		Key:   keyPrefix + cycleDateOf(now),
 		Level: "info",
 		Title: title,
 		Body:  body,
@@ -986,6 +1029,7 @@ func warmupCooldownWatchLoop() {
 		log.Printf("[Warmup] 检测到冷却恢复（%d 项：%s），立即触发一轮（最小间隔 %v）",
 			len(recovered), strings.Join(shown, ", "), minGap)
 		lastTrigger = now
+		setWarmupWakeReason("cooldown")
 		requestWarmupRun()
 	}
 }
@@ -1111,7 +1155,7 @@ func archiveCycle(rt warmupRuntime, cy *warmupCycle, now time.Time) {
 	log.Printf("[Warmup] %s 周期补触发窗口结束：成功=%d，失败=%d，跳过=%d，已归档",
 		cy.Date, ok, failed, skipped+pending)
 	if rt.Notify {
-		sendWarmupNotify(rt, ok, failed+pending, skipped)
+		sendWarmupNotify(rt, ok, failed+pending, skipped, "scheduled")
 	}
 }
 
