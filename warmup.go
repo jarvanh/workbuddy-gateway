@@ -775,9 +775,9 @@ func sendWarmupNotify(rt warmupRuntime, ok, failed, skipped int, reason string) 
 	var title, keyPrefix string
 	switch reason {
 	case "cooldown":
-		title = "🔄 workbuddy 冷却恢复触发"
+		title = "🔄 workbuddy 冷却恢复窗口触发"
 		if failed > 0 {
-			title = "⚠️ workbuddy 冷却恢复触发（部分失败）"
+			title = "⚠️ workbuddy 冷却恢复窗口触发（部分失败）"
 		}
 		keyPrefix = "warmup-cooldown|"
 	default: // scheduled 及其他
