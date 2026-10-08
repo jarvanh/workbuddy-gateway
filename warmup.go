@@ -52,6 +52,10 @@ const (
 	// 没有上限时一个卡住的模型会刷满整个窗口（实测 13 轮全部无效）。
 	// 达到阈值即判本轮失败，不再重试 —— 省下的是真实的上游请求。
 	warmupDefaultMaxRateLimitRetries = 3
+	// warmupDefaultCooldownTriggerMinMinutes 冷却恢复后补触发的最小间隔（分钟）。
+	warmupDefaultCooldownTriggerMinMinutes = 10
+	// warmupCooldownWatchTick 冷却恢复监听的扫描间隔。
+	warmupCooldownWatchTick = 30 * time.Second
 
 	warmupTickInterval = 30 * time.Second
 )
@@ -74,6 +78,14 @@ type warmupConfig struct {
 	// MaxRateLimitRetries 单个模型连续被限流（6004）多少次后放弃本轮，默认 3。
 	// 设为 0 表示不启用熔断（回到旧行为：刷到补触发窗口结束）。
 	MaxRateLimitRetries *int `json:"maxRateLimitRetries"`
+	// Windows 允许触发的时间段列表，形如 ["06:00-21:00"]，可配置多段。
+	// 非空时优先于 Time：每个时段的开始时刻触发一轮；时段内模型冷却恢复也会补触发；
+	// 时段外不触发，避免半夜白白消耗额度。End <= Start 视为跨天。
+	Windows []string `json:"windows"`
+	// CooldownTrigger 模型冷却恢复后立即触发一轮，默认 true。
+	CooldownTrigger *bool `json:"cooldownTrigger"`
+	// CooldownTriggerMinMinutes 冷却恢复触发的最小间隔（分钟），默认 10，防抖动刷屏。
+	CooldownTriggerMinMinutes *int `json:"cooldownTriggerMinMinutes"`
 	// Notify 是否在每轮结束后推送结果（走 notify 通道），默认 false。
 	Notify *bool `json:"notify"`
 }
@@ -92,6 +104,91 @@ type probeScheduleConfig struct {
 	Notify *bool `json:"notify"`
 }
 
+// timeWindow 一个允许触发的时间段（HH:MM-HH:MM，配置时区）。
+// End 早于或等于 Start 视为跨天（例如 22:00-06:00）。
+type timeWindow struct {
+	Start string `json:"start"`
+	End   string `json:"end"`
+}
+
+// parseTimeWindow 解析 "HH:MM-HH:MM"。
+func parseTimeWindow(s string) (timeWindow, bool) {
+	parts := strings.Split(s, "-")
+	if len(parts) != 2 {
+		return timeWindow{}, false
+	}
+	a := strings.TrimSpace(parts[0])
+	b := strings.TrimSpace(parts[1])
+	if _, ok := parseClock(a); !ok {
+		return timeWindow{}, false
+	}
+	if _, ok := parseClock(b); !ok {
+		return timeWindow{}, false
+	}
+	return timeWindow{Start: a, End: b}, true
+}
+
+// startOn 返回该窗口在 day 所属自然日的开始时刻。
+func (w timeWindow) startOn(day time.Time) time.Time {
+	return w.clockOn(day, w.Start, 0, 0)
+}
+
+// endOn 返回该窗口的结束时刻；End <= Start 时顺延到次日（跨天窗口）。
+func (w timeWindow) endOn(day time.Time) time.Time {
+	e := w.clockOn(day, w.End, 0, 0)
+	if !e.After(w.startOn(day)) {
+		e = e.AddDate(0, 0, 1)
+	}
+	return e
+}
+
+func (w timeWindow) clockOn(day time.Time, clock string, defHour, defMin int) time.Time {
+	loc := warmupLocation()
+	local := day.In(loc)
+	m, _ := parseClockOr(clock, defHour, defMin)
+	return time.Date(local.Year(), local.Month(), local.Day(), m/60, m%60, 0, 0, loc)
+}
+
+// contains 判断 now 是否落在该窗口内（含跨天情况）。
+func (w timeWindow) contains(now time.Time) bool {
+	for _, d := range []time.Time{now, now.AddDate(0, 0, -1)} {
+		s := w.startOn(d)
+		e := w.endOn(d)
+		if !now.Before(s) && now.Before(e) {
+			return true
+		}
+	}
+	return false
+}
+
+// currentWindowIndex 返回 now 所处窗口的下标；不在任何窗口内返回 -1。
+func currentWindowIndex(now time.Time, windows []timeWindow) int {
+	for i, w := range windows {
+		if w.contains(now) {
+			return i
+		}
+	}
+	return -1
+}
+
+// nextWindowStartAfter 返回严格晚于 now 的最近一个窗口开始时刻及其下标。
+func nextWindowStartAfter(now time.Time, windows []timeWindow) (time.Time, int) {
+	var best time.Time
+	idx := -1
+	for i, w := range windows {
+		for _, d := range []time.Time{now, now.AddDate(0, 0, 1)} {
+			c := w.startOn(d)
+			if c.After(now) && (best.IsZero() || c.Before(best)) {
+				best = c
+				idx = i
+			}
+		}
+	}
+	return best, idx
+}
+
+func (w timeWindow) String() string { return w.Start + "-" + w.End }
+
 // warmupRuntime 是装载后的生效配置。
 type warmupRuntime struct {
 	Enabled             bool
@@ -102,6 +199,12 @@ type warmupRuntime struct {
 	RetryMinutes        int
 	Notify              bool
 	MaxRateLimitRetries int
+	// Windows 允许触发的时间段；非空时优先于 Time。
+	Windows []timeWindow
+	// CooldownTrigger 模型冷却恢复后立即补触发一轮，默认 true。
+	CooldownTrigger bool
+	// CooldownTriggerMinMinutes 冷却恢复触发的最小间隔（分钟），默认 10。
+	CooldownTriggerMinMinutes int
 }
 
 // probeRuntime 是装载后的生效探测调度配置。
@@ -123,12 +226,14 @@ var (
 
 func defaultWarmupRuntime() warmupRuntime {
 	return warmupRuntime{
-		Enabled:      true,
-		Time:                warmupDefaultTime,
-		MaxPrice:            warmupDefaultPrice,
-		CatchUpHours:        warmupDefaultCatchUpHours,
-		RetryMinutes:        warmupDefaultRetryMinutes,
-		MaxRateLimitRetries: warmupDefaultMaxRateLimitRetries,
+		Enabled:                    true,
+		Time:                       warmupDefaultTime,
+		MaxPrice:                   warmupDefaultPrice,
+		CatchUpHours:               warmupDefaultCatchUpHours,
+		RetryMinutes:               warmupDefaultRetryMinutes,
+		MaxRateLimitRetries:        warmupDefaultMaxRateLimitRetries,
+		CooldownTrigger:            true,
+		CooldownTriggerMinMinutes:  warmupDefaultCooldownTriggerMinMinutes,
 	}
 }
 
@@ -167,9 +272,53 @@ func setWarmup(cfg warmupConfig) {
 	if cfg.Notify != nil {
 		rt.Notify = *cfg.Notify
 	}
+	if len(cfg.Windows) > 0 {
+		ws := make([]timeWindow, 0, len(cfg.Windows))
+		for _, s := range cfg.Windows {
+			if w, ok := parseTimeWindow(s); ok {
+				ws = append(ws, w)
+			}
+		}
+		rt.Windows = ws
+	}
+	if cfg.CooldownTrigger != nil {
+		rt.CooldownTrigger = *cfg.CooldownTrigger
+	}
+	if cfg.CooldownTriggerMinMinutes != nil && *cfg.CooldownTriggerMinMinutes >= 0 {
+		rt.CooldownTriggerMinMinutes = *cfg.CooldownTriggerMinMinutes
+	}
 	warmupMu.Lock()
 	warmupCurrent = rt
 	warmupMu.Unlock()
+}
+
+// cycleKeyOf 返回当前所属周期键。
+// 配置了时间段时为「日期#时段下标」，使同一天的多个时段各自成为一个周期，
+// 互不覆盖；未配置时间段时回落到自然日（兼容旧行为）。
+func cycleKeyOf(t time.Time, rt warmupRuntime) string {
+	date := cycleDateOf(t)
+	if len(rt.Windows) == 0 {
+		return date
+	}
+	if i := currentWindowIndex(t, rt.Windows); i >= 0 {
+		return fmt.Sprintf("%s#%d", date, i)
+	}
+	return date
+}
+
+// lastWindowStartOnOrBefore 返回不晚于 now 的最近一个窗口开始时刻；
+// 没有任何窗口已开始时返回零值。
+func lastWindowStartOnOrBefore(now time.Time, windows []timeWindow) time.Time {
+	var best time.Time
+	for _, w := range windows {
+		for _, d := range []time.Time{now, now.AddDate(0, 0, -1)} {
+			c := w.startOn(d)
+			if !c.After(now) && (best.IsZero() || c.After(best)) {
+				best = c
+			}
+		}
+	}
+	return best
 }
 
 func warmupSnapshot() warmupRuntime {
@@ -484,8 +633,15 @@ func runWarmupOnce(rt warmupRuntime, now time.Time) (ok, failed, skipped, pendin
 
 	warmupStateMu.Lock()
 	st := loadWarmupState()
-	date := cycleDateOf(now)
+	// 周期键必须跟随调度器：时段模式下是「日期#时段下标」，
+	// 否则同一天第二个时段会复用第一个时段的周期，导致后续时段不再触发。
+	date := cycleKeyOf(now, rt)
 	scheduledAt := scheduledTimeOn(now, rt.Time, 4, 0)
+	if len(rt.Windows) > 0 {
+		if s := lastWindowStartOnOrBefore(now, rt.Windows); !s.IsZero() {
+			scheduledAt = s
+		}
+	}
 	cy := st.Current
 	if cy == nil || cy.Date != date {
 		// 新的一天：开启新周期。若 now 已过计划时刻（服务启动晚于触发点），
@@ -608,7 +764,8 @@ func sendWarmupNotify(rt warmupRuntime, ok, failed, skipped int) {
 		formatDisplayTime(now), formatQuota(rt.MaxPrice), ok, failed, skipped)
 	sendNotify(notifyEvent{
 		Kind:  notifyEventWarmup,
-		Key:   "warmup|" + cycleDateOf(now),
+		// 时段模式下按「日期#时段」去重，保证每个时段各自一条，不被同一天合并掉。
+		Key:   "warmup|" + cycleKeyOf(now, rt),
 		Level: "info",
 		Title: title,
 		Body:  body,
@@ -722,30 +879,69 @@ func warmupLoop() {
 		}
 		now := time.Now()
 		loc := warmupLocation()
-		date := cycleDateOf(now)
+		date := cycleKeyOf(now, rt)
+
+		// 配置了时间段：时段外不触发，等到下一个时段开始（避免半夜白白消耗额度）。
+		if len(rt.Windows) > 0 {
+			if currentWindowIndex(now, rt.Windows) < 0 {
+				next, _ := nextWindowStartAfter(now, rt.Windows)
+				if next.IsZero() {
+					waitWarmupSignal(time.Hour)
+					continue
+				}
+				waitWarmupSignal(time.Until(next) + time.Second)
+				continue
+			}
+		}
+
 		scheduled := scheduledTimeOn(now, rt.Time, 4, 0)
+		if len(rt.Windows) > 0 {
+			if s := lastWindowStartOnOrBefore(now, rt.Windows); !s.IsZero() {
+				scheduled = s
+			}
+		}
 
 		warmupStateMu.Lock()
 		st := loadWarmupState()
 		cy := st.Current
 		warmupStateMu.Unlock()
 
-		// 当天周期还没建立，且还没到点：等到点。
+		// 当天（当前时段）周期还没建立，且还没到点：等到点。
 		if (cy == nil || cy.Date != date) && now.Before(scheduled) {
 			waitWarmupSignal(time.Until(scheduled) + time.Second)
 			continue
 		}
 		if cy != nil && cy.Date == date && cy.CompletedAt > 0 {
-			// 当天已完成：等明天。
+			// 本周期已完成：等下一个触发点（时段模式下是下一个时段开始）。
+			if len(rt.Windows) > 0 {
+				if next, _ := nextWindowStartAfter(time.Now(), rt.Windows); !next.IsZero() {
+					waitWarmupSignal(time.Until(next) + time.Second)
+					continue
+				}
+			}
 			waitWarmupSignal(time.Until(nextScheduledAfter(now, rt.Time, 4, 0)) + time.Second)
 			continue
 		}
 
 		deadline := scheduled.Add(time.Duration(rt.CatchUpHours) * time.Hour)
+		// 时段模式下补触发不得越过本时段结束（否则会打进下一个时段甚至深夜）。
+		if len(rt.Windows) > 0 {
+			if i := currentWindowIndex(now, rt.Windows); i >= 0 {
+				if end := rt.Windows[i].endOn(now); end.Before(deadline) {
+					deadline = end
+				}
+			}
+		}
 		if now.After(deadline) {
 			// 超出补触发窗口：归档为未完成（窗口已过，再触发没有意义）。
 			if cy != nil && cy.Date == date && cy.CompletedAt == 0 {
 				archiveCycle(rt, cy, now)
+			}
+			if len(rt.Windows) > 0 {
+				if next, _ := nextWindowStartAfter(time.Now(), rt.Windows); !next.IsZero() {
+					waitWarmupSignal(time.Until(next) + time.Second)
+					continue
+				}
 			}
 			waitWarmupSignal(time.Until(nextScheduledAfter(now, rt.Time, 4, 0)) + time.Second)
 			continue
@@ -767,7 +963,90 @@ func warmupLoop() {
 			continue
 		}
 		_ = loc
+		// 本周期完成：时段模式下等下一个时段开始，否则等次日同一时刻。
+		if len(rt.Windows) > 0 {
+			if next, _ := nextWindowStartAfter(time.Now(), rt.Windows); !next.IsZero() {
+				waitWarmupSignal(time.Until(next) + time.Second)
+				continue
+			}
+		}
 		waitWarmupSignal(time.Until(nextScheduledAfter(time.Now(), rt.Time, 4, 0)) + time.Second)
+	}
+}
+
+// activeCooldownKeys 返回当前仍处于冷却中的「账号|模型」及其截止时间。
+// 账号级冷却的 model 部分为空。
+func activeCooldownKeys(now time.Time) map[string]time.Time {
+	out := make(map[string]time.Time)
+	accountMu.Lock()
+	defer accountMu.Unlock()
+	for _, acc := range accounts {
+		if acc.Disabled {
+			continue
+		}
+		name := filepath.Base(acc.Path)
+		if acc.CooldownUntil.After(now) {
+			out[name+"|"] = acc.CooldownUntil
+		}
+		for model, st := range acc.ModelStates {
+			if st == nil || !st.CooldownUntil.After(now) {
+				continue
+			}
+			out[name+"|"+model] = st.CooldownUntil
+		}
+	}
+	return out
+}
+
+// warmupCooldownWatchLoop 监听模型冷却：一旦发现某个「账号|模型」从冷却中恢复，
+// 且当前处于允许触发的时段内，立即补触发一轮（按最小间隔节流，防抖动刷屏）。
+//
+// 为什么需要它：warmup 只按固定时刻触发，模型被 6004 屏蔽后要等到下个周期才重试；
+// 冷却往往几小时内就恢复，等到次日白白浪费窗口。
+func warmupCooldownWatchLoop() {
+	var prev map[string]time.Time
+	var lastTrigger time.Time
+	for {
+		time.Sleep(warmupCooldownWatchTick)
+		rt := warmupSnapshot()
+		if !rt.Enabled || !rt.CooldownTrigger {
+			prev = nil
+			continue
+		}
+		now := time.Now()
+		if len(rt.Windows) > 0 && currentWindowIndex(now, rt.Windows) < 0 {
+			// 时段外不跟踪：否则跨时段会被误判成「冷却恢复」。
+			prev = nil
+			continue
+		}
+		cur := activeCooldownKeys(now)
+		if prev == nil {
+			prev = cur
+			continue
+		}
+		recovered := make([]string, 0, len(prev))
+		for k := range prev {
+			if _, still := cur[k]; !still {
+				recovered = append(recovered, k)
+			}
+		}
+		prev = cur
+		if len(recovered) == 0 {
+			continue
+		}
+		minGap := time.Duration(rt.CooldownTriggerMinMinutes) * time.Minute
+		if minGap > 0 && now.Sub(lastTrigger) < minGap {
+			continue
+		}
+		sort.Strings(recovered)
+		shown := recovered
+		if len(shown) > 8 {
+			shown = shown[:8]
+		}
+		log.Printf("[Warmup] 检测到冷却恢复（%d 项：%s），立即触发一轮（最小间隔 %v）",
+			len(recovered), strings.Join(shown, ", "), minGap)
+		lastTrigger = now
+		requestWarmupRun()
 	}
 }
 
@@ -916,9 +1195,28 @@ type warmupStatusResponse struct {
 	ProbeEffectiveAt  string `json:"probeEffectiveAt"`
 	ProbeNotify       bool   `json:"probeNotify"`
 
+	// Windows 允许触发的时段（HH:MM-HH:MM）；非空时优先于 Time。
+	Windows []string `json:"windows,omitempty"`
+	// CooldownTrigger 模型冷却恢复后立即触发一轮。
+	CooldownTrigger bool `json:"cooldownTrigger"`
+	// CooldownTriggerMinMinutes 冷却恢复触发的最小间隔（分钟）。
+	CooldownTriggerMinMinutes int `json:"cooldownTriggerMinMinutes"`
+
 	Cycle *warmupCycle         `json:"cycle,omitempty"`
 	History []warmupHistoryEntry `json:"history,omitempty"`
 	Selected []string           `json:"selected,omitempty"`
+}
+
+// windowsToStrings 把时段结构转回配置里的字符串形式，供状态展示。
+func windowsToStrings(ws []timeWindow) []string {
+	if len(ws) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(ws))
+	for _, w := range ws {
+		out = append(out, w.String())
+	}
+	return out
 }
 
 func warmupStatusNow() warmupStatusResponse {
@@ -938,8 +1236,15 @@ func warmupStatusNow() warmupStatusResponse {
 		ProbeFollowWarmup: pr.FollowWarmup,
 		ProbeTime:    pr.Time,
 		ProbeNotify:  pr.Notify,
+		Windows:                   windowsToStrings(rt.Windows),
+		CooldownTrigger:           rt.CooldownTrigger,
+		CooldownTriggerMinMinutes: rt.CooldownTriggerMinMinutes,
 	}
-	if rt.Enabled {
+	if len(rt.Windows) > 0 {
+		if s := lastWindowStartOnOrBefore(now, rt.Windows); !s.IsZero() {
+			resp.ProbeEffectiveAt = s.Format("2006-01-02 15:04:05 MST")
+		}
+	} else if rt.Enabled {
 		resp.ProbeEffectiveAt = scheduledTimeOn(now, rt.Time, 4, 0).Format("2006-01-02 15:04:05 MST")
 		resp.Selected = warmupSelectModels(rt, now)
 	} else {
@@ -1023,7 +1328,10 @@ func printWarmupHelp() {
   probe-time <HH:MM>  设置 warmup 关闭时的每日主动探测时刻（默认 06:00）
   probe-follow on|off 主动探测是否跟随 warmup 时刻（默认 on）
   probe-notify on|off 每日探测结论汇总是否推送（默认 off，每天最多一条）
-  probe-notify on|off 每日探测结论汇总是否推送（默认 off，每天最多一条）
+  windows <a-b,c-d>   设置允许触发的时段（如 06:00-21:00），多段用逗号分隔；
+                      优先于 time；clear 清除并回落到 time
+  cooldown-trigger on|off 模型冷却恢复后立即触发一轮（默认 on）
+  cooldown-min <min>  冷却恢复触发的最小间隔分钟数（默认 10，防抖动）
   run                 立即执行一轮（需 serve 正在运行）
 
 示例:
@@ -1219,6 +1527,68 @@ func runWarmup() {
 			m["probe"] = map[string]any{"schedule": p}
 			return nil
 		}
+	case "windows":
+		if len(args) < 2 {
+			fmt.Println("用法: workbuddy-gateway warmup windows <HH:MM-HH:MM[,HH:MM-HH:MM]> | clear")
+			os.Exit(1)
+		}
+		raw := strings.TrimSpace(args[1])
+		if strings.EqualFold(raw, "clear") {
+			mutate = func(m map[string]any) error {
+				w := warmupSection(m)
+				delete(w, "windows")
+				m["warmup"] = w
+				return nil
+			}
+			break
+		}
+		parts := strings.Split(raw, ",")
+		list := make([]string, 0, len(parts))
+		for _, p := range parts {
+			if _, ok := parseTimeWindow(p); !ok {
+				fmt.Printf("时段格式无效: %s（应为 HH:MM-HH:MM，例如 06:00-21:00）\n", strings.TrimSpace(p))
+				os.Exit(1)
+			}
+			list = append(list, strings.TrimSpace(p))
+		}
+		mutate = func(m map[string]any) error {
+			w := warmupSection(m)
+			w["windows"] = list
+			m["warmup"] = w
+			return nil
+		}
+	case "cooldown-trigger":
+		if len(args) < 2 {
+			fmt.Println("用法: workbuddy-gateway warmup cooldown-trigger on|off")
+			os.Exit(1)
+		}
+		val, ok := parseOnOff(args[1])
+		if !ok {
+			fmt.Printf("取值无效: %s（应为 on 或 off）\n", args[1])
+			os.Exit(1)
+		}
+		mutate = func(m map[string]any) error {
+			w := warmupSection(m)
+			w["cooldownTrigger"] = val
+			m["warmup"] = w
+			return nil
+		}
+	case "cooldown-min":
+		if len(args) < 2 {
+			fmt.Println("用法: workbuddy-gateway warmup cooldown-min <minutes>")
+			os.Exit(1)
+		}
+		v, err := strconv.Atoi(strings.TrimSpace(args[1]))
+		if err != nil || v < 0 {
+			fmt.Printf("取值无效: %s（应为非负整数分钟数）\n", args[1])
+			os.Exit(1)
+		}
+		mutate = func(m map[string]any) error {
+			w := warmupSection(m)
+			w["cooldownTriggerMinMinutes"] = v
+			m["warmup"] = w
+			return nil
+		}
 	default:
 		fmt.Printf("未知子命令: %s\n\n", args[0])
 		printWarmupHelp()
@@ -1399,6 +1769,10 @@ func printRemoteWarmupStatus(st warmupStatusResponse) {
 	fmt.Println("5 小时窗口主动触发")
 	fmt.Printf("  状态:        %s\n", state)
 	fmt.Printf("  触发时刻:    %s（%s）\n", st.Time, st.TZ)
+	if len(st.Windows) > 0 {
+		fmt.Printf("  允许时段:    %s（优先于触发时刻）\n", strings.Join(st.Windows, ", "))
+	}
+	fmt.Printf("  冷却恢复触发: %s（最小间隔 %d 分钟）\n", onOff(st.CooldownTrigger), st.CooldownTriggerMinMinutes)
 	if st.MaxPrice == 0 {
 		fmt.Printf("  价格上限:    0（只触发已确认免费的模型）\n")
 	} else {

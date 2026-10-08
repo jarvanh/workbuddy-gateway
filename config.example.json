@@ -73,7 +73,12 @@
     "catchUpHours": 4,
     "retryMinutes": 10,
     "maxRateLimitRetries": 3,
-    "notify": false
+    "notify": false,
+    "windows": [
+      "06:00-21:00"
+    ],
+    "cooldownTrigger": true,
+    "cooldownTriggerMinMinutes": 10
   },
   "probe": {
     "schedule": {

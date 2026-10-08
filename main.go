@@ -3629,6 +3629,8 @@ func runServe() {
 	// 5 小时窗口主动触发 + 每日主动探测调度。
 	go warmupLoop()
 	go probeScheduleLoop()
+	// 模型冷却恢复后立即补触发一轮（需 warmup 开启且在允许时段内）。
+	go warmupCooldownWatchLoop()
 
 	// 启动状态快照协程（monitor 命令实时读取展示）
 	go statusSnapshotLoop()
