@@ -236,6 +236,23 @@ func setWarmupWakeReason(r string) {
 	warmupReasonMu.Unlock()
 }
 
+// warmupCooldownWakeArmed 是否有冷却恢复唤醒等待处理。
+// warmupLoop 用它决定是否穿透「当天已完成 / 超出补触发窗口」等门闸：
+// 这些门闸对定时唤醒有效，但绝不能吞掉冷却恢复信号 —— 否则该路通知永远静默
+// （v1.27.0/v1.27.1 实测：一天内六次冷却恢复全部无通知）。
+func warmupCooldownWakeArmed() bool {
+	return peekWarmupWakeReason() == "cooldown"
+}
+
+// peekWarmupWakeReason 读取当前触发来源但不清除。
+// warmupLoop 用它判断要不要穿透门闸，真正的清除仍在 runWarmupOnce 里做，
+// 所以这里绝不能消费掉，否则 runWarmupOnce 会退化成 scheduled。
+func peekWarmupWakeReason() string {
+	warmupReasonMu.Lock()
+	defer warmupReasonMu.Unlock()
+	return warmupWakeReason
+}
+
 // takeWarmupWakeReason 取出并清空触发来源；未设置时视为定时触发。
 func takeWarmupWakeReason() string {
 	warmupReasonMu.Lock()
@@ -915,6 +932,20 @@ func warmupLoop() {
 		st := loadWarmupState()
 		cy := st.Current
 		warmupStateMu.Unlock()
+
+		// 冷却恢复信号必须优先穿透下面所有门闸，立即执行一轮。
+		// 原因：waitWarmupSignal 被信号唤醒后循环会重走这些门闸，而
+		// 「当天已完成」「超出补触发窗口」等分支会直接 continue，信号就此被吞 ——
+		// runWarmupOnce 取不到 reason=="cooldown"，v1.27.0 专为该场景加的
+		// 通知分支永远进不去（实测 10-09 六次冷却恢复全部静默）。
+		if warmupCooldownWakeArmed() {
+			_, _, _, pending, _ := runWarmupOnce(rt, now)
+			if pending > 0 {
+				// 有未完成的：按重试间隔再来一轮，别空转烧请求。
+				waitWarmupSignal(time.Duration(rt.RetryMinutes) * time.Minute)
+			}
+			continue
+		}
 
 		// 当天（当前时段）周期还没建立，且还没到点：等到点。
 		if (cy == nil || cy.Date != date) && now.Before(scheduled) {

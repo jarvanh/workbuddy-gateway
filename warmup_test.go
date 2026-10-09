@@ -411,3 +411,140 @@ func TestProbeFallsBackToOwnTimeWhenWarmupOff(t *testing.T) {
 		t.Fatalf("warmup 关闭时探测应回落 06:00，实际=%s", st.ProbeEffectiveAt)
 	}
 }
+
+// -----------------------------------------------------------------------------
+// 回归：冷却恢复触发的通知不能静默
+// -----------------------------------------------------------------------------
+//
+// 背景（2026-10-09 线上事故）：warmupLoop 被冷却恢复信号唤醒后会重走门闸，
+// 「当天已完成（CompletedAt > 0）」分支直接 continue，信号被吞 ——
+// runWarmupOnce 永远取不到 reason=="cooldown"，v1.27.0 专为该场景加的通知
+// 分支永远进不去。实测一天内六次冷却恢复全部无通知。
+//
+// 以下用例锁定三条链路：唤醒标记可读、已完成后仍发通知、普通唤醒不误发。
+
+// TestWarmupCooldownWakeArmedReason 冷却恢复唤醒标记应可被 peek 读到且不消费。
+func TestWarmupCooldownWakeArmedReason(t *testing.T) {
+	resetWarmupStateT(t)
+	// 清干净，避免上一个用例残留影响
+	takeWarmupWakeReason()
+
+	if warmupCooldownWakeArmed() {
+		t.Fatal("初始状态不应有冷却恢复唤醒")
+	}
+	setWarmupWakeReason("cooldown")
+	if !warmupCooldownWakeArmed() {
+		t.Fatal("设置 cooldown 后应判定为已唤醒")
+	}
+	// peek 只读取不清除：真正的消费必须由 runWarmupOnce 完成，
+	// 否则 reason 会退化成 scheduled，通知标题就错了。
+	if peekWarmupWakeReason() != "cooldown" {
+		t.Fatalf("peek 不应消费唤醒来源，实际=%q", peekWarmupWakeReason())
+	}
+}
+
+// TestWarmupCooldownNotifiesAfterCycleCompleted 当天定时轮已跑完时，
+// 冷却恢复触发仍必须发出通知（v1.27.1 及以前此处静默）。
+func TestWarmupCooldownNotifiesAfterCycleCompleted(t *testing.T) {
+	resetWarmupStateT(t)
+	chdirTemp(t)
+
+	ch := make(chan map[string]any, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var m map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&m)
+		ch <- m
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	resetNotifyState()
+	setNotify(notifyConfig{Enabled: true, Type: "webhook", Webhook: srv.URL, MinIntervalSeconds: 0})
+	defer setNotify(notifyConfig{})
+
+	on := true
+	// 显式模型：跳过价格筛选，也避免依赖真实站点可用性
+	setWarmup(warmupConfig{Enabled: &on, Notify: &on, Models: []string{"m-free"}})
+
+	now := time.Now()
+	// 构造「当天定时轮已全部成功并完成」的周期 —— 正是门闸会拦截的场景
+	warmupStateMu.Lock()
+	saveWarmupStateLocked(&warmupState{
+		Current: &warmupCycle{
+			Date:        cycleDateOf(now),
+			ScheduledAt: now.Add(-2 * time.Hour).Unix(),
+			StartedAt:   now.Add(-2 * time.Hour).Unix(),
+			CompletedAt: now.Add(-100 * time.Minute).Unix(),
+			Models:      map[string]*warmupModelState{"m-free": {Status: "ok"}},
+		},
+	})
+	warmupStateMu.Unlock()
+
+	// 复刻 warmupCooldownWatchLoop 的动作
+	setWarmupWakeReason("cooldown")
+	requestWarmupRun()
+	runWarmupOnce(warmupSnapshot(), now)
+
+	select {
+	case m := <-ch:
+		if m["kind"] != notifyEventWarmup {
+			t.Fatalf("事件类型应为 warmup，实际=%v", m["kind"])
+		}
+		title, _ := m["title"].(string)
+		if !strings.Contains(title, "冷却恢复") {
+			t.Fatalf("通知标题应标明冷却恢复触发，实际=%q", title)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("冷却恢复触发未发通知 —— 「当天已完成」门闸吞信号的问题回归了")
+	}
+}
+
+// TestWarmupNoCooldownWakeKeepsSilent 没有冷却恢复唤醒时不应凭空发通知，
+// 防止修复过头变成「每轮都发」。
+func TestWarmupNoCooldownWakeKeepsSilent(t *testing.T) {
+	resetWarmupStateT(t)
+	chdirTemp(t)
+
+	ch := make(chan map[string]any, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var m map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&m)
+		ch <- m
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	resetNotifyState()
+	setNotify(notifyConfig{Enabled: true, Type: "webhook", Webhook: srv.URL, MinIntervalSeconds: 0})
+	defer setNotify(notifyConfig{})
+
+	on := true
+	setWarmup(warmupConfig{Enabled: &on, Notify: &on, Models: []string{"m-free"}})
+
+	now := time.Now()
+	warmupStateMu.Lock()
+	saveWarmupStateLocked(&warmupState{
+		Current: &warmupCycle{
+			Date:        cycleDateOf(now),
+			ScheduledAt: now.Add(-2 * time.Hour).Unix(),
+			StartedAt:   now.Add(-2 * time.Hour).Unix(),
+			CompletedAt: now.Add(-100 * time.Minute).Unix(),
+			Models:      map[string]*warmupModelState{"m-free": {Status: "ok"}},
+		},
+	})
+	warmupStateMu.Unlock()
+
+	// 未设置唤醒来源：视为 scheduled，且本轮无 pending 模型 → 不应发通知
+	takeWarmupWakeReason()
+	if warmupCooldownWakeArmed() {
+		t.Fatal("未设置唤醒来源时不应判定为冷却恢复唤醒")
+	}
+	runWarmupOnce(warmupSnapshot(), now)
+
+	select {
+	case m := <-ch:
+		t.Fatalf("无冷却恢复唤醒时不应发通知，实际收到: %v", m)
+	case <-time.After(300 * time.Millisecond):
+		// 预期：静默
+	}
+}
