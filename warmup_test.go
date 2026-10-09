@@ -69,7 +69,7 @@ func TestWarmupConfigOverride(t *testing.T) {
 	notify := true
 	setWarmup(warmupConfig{
 		Enabled: &enabled, Time: "05:30", MaxPrice: &price,
-		Models: []string{"hy4-preview-f", " glm-5.3-flash "},
+		Models:       []string{"hy4-preview-f", " glm-5.3-flash "},
 		CatchUpHours: &hours, RetryMinutes: &minutes, Notify: &notify,
 	})
 	rt := warmupSnapshot()
@@ -162,8 +162,8 @@ func TestWarmupRunOnceRecordsSuccess(t *testing.T) {
 	accountMu.Lock()
 	oldAccounts, oldRR := accounts, rrIndex
 	accounts, rrIndex = []*Account{{
-		Path: "cn.json",
-		Auth: &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()}},
+		Path:       "cn.json",
+		Auth:       &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()}},
 		QuotaKnown: true, QuotaRemaining: 100,
 	}}, 0
 	accountMu.Unlock()
@@ -214,8 +214,8 @@ func TestWarmupKeepsPendingOnRateLimit(t *testing.T) {
 	accountMu.Lock()
 	oldAccounts, oldRR := accounts, rrIndex
 	accounts, rrIndex = []*Account{{
-		Path: "cn.json",
-		Auth: &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()}},
+		Path:       "cn.json",
+		Auth:       &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()}},
 		QuotaKnown: true, QuotaRemaining: 100,
 	}}, 0
 	accountMu.Unlock()
@@ -262,8 +262,8 @@ func TestWarmupAuthFailureIsTerminal(t *testing.T) {
 	accountMu.Lock()
 	oldAccounts, oldRR := accounts, rrIndex
 	accounts, rrIndex = []*Account{{
-		Path: "cn.json",
-		Auth: &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()}},
+		Path:       "cn.json",
+		Auth:       &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()}},
 		QuotaKnown: true, QuotaRemaining: 100,
 	}}, 0
 	accountMu.Unlock()
@@ -413,38 +413,121 @@ func TestProbeFallsBackToOwnTimeWhenWarmupOff(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
-// 回归：冷却恢复触发的通知不能静默
+// 回归：冷却恢复触发的通知不能静默（2026-10-09 线上事故）
 // -----------------------------------------------------------------------------
 //
-// 背景（2026-10-09 线上事故）：warmupLoop 被冷却恢复信号唤醒后会重走门闸，
-// 「当天已完成（CompletedAt > 0）」分支直接 continue，信号被吞 ——
-// runWarmupOnce 永远取不到 reason=="cooldown"，v1.27.0 专为该场景加的通知
-// 分支永远进不去。实测一天内六次冷却恢复全部无通知。
+// 事故：warmupLoop 被冷却恢复信号唤醒后重走门闸，「当天已完成（CompletedAt > 0）」
+// 分支直接 continue，信号被吞 —— runWarmupOnce 取不到 reason=="cooldown"，
+// v1.27.0 专为该场景加的通知分支永远进不去，一天内六次冷却恢复全部无通知。
 //
-// 以下用例锁定三条链路：唤醒标记可读、已完成后仍发通知、普通唤醒不误发。
+// 门闸决策已抽成纯函数 decideWarmupLoop，以下用例**直接在门闸层**断言。
+// 上一版测试直接调 runWarmupOnce，绕过了门闸 —— 模拟 bug 回归时仍然全过，
+// 是假合格证；这一版只要冷却恢复再被任何门闸拦下就会失败。
 
-// TestWarmupCooldownWakeArmedReason 冷却恢复唤醒标记应可被 peek 读到且不消费。
-func TestWarmupCooldownWakeArmedReason(t *testing.T) {
+// TestWarmupPeekWakeReasonKeepsReason peek 只读取不消费，消费必须由
+// runWarmupOnce 完成（在调度层消费早了，通知标题会退化成 scheduled）。
+func TestWarmupPeekWakeReasonKeepsReason(t *testing.T) {
 	resetWarmupStateT(t)
-	// 清干净，避免上一个用例残留影响
-	takeWarmupWakeReason()
+	takeWarmupWakeReason() // 清干净，避免用例间污染
 
-	if warmupCooldownWakeArmed() {
-		t.Fatal("初始状态不应有冷却恢复唤醒")
-	}
 	setWarmupWakeReason("cooldown")
-	if !warmupCooldownWakeArmed() {
-		t.Fatal("设置 cooldown 后应判定为已唤醒")
+	if got := peekWarmupWakeReason(); got != "cooldown" {
+		t.Fatalf("peek 应读到 cooldown，实际=%q", got)
 	}
-	// peek 只读取不清除：真正的消费必须由 runWarmupOnce 完成，
-	// 否则 reason 会退化成 scheduled，通知标题就错了。
-	if peekWarmupWakeReason() != "cooldown" {
-		t.Fatalf("peek 不应消费唤醒来源，实际=%q", peekWarmupWakeReason())
+	if got := peekWarmupWakeReason(); got != "cooldown" {
+		t.Fatalf("peek 不应消费唤醒来源，第二次读到=%q", got)
+	}
+	if got := takeWarmupWakeReason(); got != "cooldown" {
+		t.Fatalf("take 才应取出 cooldown，实际=%q", got)
+	}
+	if got := takeWarmupWakeReason(); got != "scheduled" {
+		t.Fatalf("取空后应回落 scheduled，实际=%q", got)
 	}
 }
 
-// TestWarmupCooldownNotifiesAfterCycleCompleted 当天定时轮已跑完时，
-// 冷却恢复触发仍必须发出通知（v1.27.1 及以前此处静默）。
+// TestDecideWarmupLoopCooldownPiercesCompletedGate 冷却恢复唤醒必须穿透
+// 「当天已完成」门闸 —— 这正是 2026-10-09 六次通知静默的直接原因。
+func TestDecideWarmupLoopCooldownPiercesCompletedGate(t *testing.T) {
+	resetWarmupStateT(t)
+	rt := defaultWarmupRuntime()
+	loc := warmupLocation()
+	// 12:00：当天定时轮早已完成，且已过补触发窗口（04:00 + 4h）
+	now := time.Date(2026, 10, 10, 12, 0, 0, 0, loc)
+	cy := &warmupCycle{
+		Date:        cycleDateOf(now),
+		ScheduledAt: now.Add(-8 * time.Hour).Unix(),
+		StartedAt:   now.Add(-8 * time.Hour).Unix(),
+		CompletedAt: now.Add(-7 * time.Hour).Unix(),
+		Models:      map[string]*warmupModelState{"m-free": {Status: "ok"}},
+	}
+
+	// 修复前此处返回 wait（等明天），reason 永不被消费 → 通知静默
+	if act := decideWarmupLoop(now, rt, cy, "cooldown"); !act.run {
+		t.Fatal("冷却恢复唤醒必须穿透「当天已完成」门闸立即执行一轮；" +
+			"否则 runWarmupOnce 取不到 reason==cooldown，通知永远静默")
+	}
+
+	// 对照：同样周期状态，定时唤醒仍应等待，不能误执行
+	act := decideWarmupLoop(now, rt, cy, "scheduled")
+	if act.run {
+		t.Fatal("定时唤醒在当天已完成时应继续等待，不应重复执行")
+	}
+	if act.wait <= 0 {
+		t.Fatalf("定时唤醒应返回正的等待时长，实际=%v", act.wait)
+	}
+}
+
+// TestDecideWarmupLoopCooldownPiercesArchiveGate 冷却恢复唤醒也必须穿透
+// 「超出补触发窗口」门闸，不能被归档分支拦下。
+func TestDecideWarmupLoopCooldownPiercesArchiveGate(t *testing.T) {
+	resetWarmupStateT(t)
+	rt := defaultWarmupRuntime()
+	loc := warmupLocation()
+	now := time.Date(2026, 10, 10, 12, 0, 0, 0, loc)
+	cy := &warmupCycle{
+		Date:        cycleDateOf(now),
+		ScheduledAt: now.Add(-8 * time.Hour).Unix(),
+		StartedAt:   now.Add(-8 * time.Hour).Unix(),
+		CompletedAt: 0, // 未完成
+		Models:      map[string]*warmupModelState{"m-free": {Status: "pending"}},
+	}
+
+	act := decideWarmupLoop(now, rt, cy, "cooldown")
+	if !act.run {
+		t.Fatal("冷却恢复唤醒必须穿透「超出补触发窗口」门闸")
+	}
+	if act.archive {
+		t.Fatal("冷却恢复唤醒不应触发归档")
+	}
+
+	// 对照：定时唤醒在该场景下应归档而非执行
+	actScheduled := decideWarmupLoop(now, rt, cy, "scheduled")
+	if actScheduled.run {
+		t.Fatal("定时唤醒超出补触发窗口时不应执行")
+	}
+	if !actScheduled.archive {
+		t.Fatal("定时唤醒超出补触发窗口且未完成时，应归档当前周期")
+	}
+}
+
+// TestDecideWarmupLoopWaitsBeforeScheduled 定时唤醒且当天周期尚未建立时，
+// 应等到计划时刻，不能提前执行。
+func TestDecideWarmupLoopWaitsBeforeScheduled(t *testing.T) {
+	resetWarmupStateT(t)
+	rt := defaultWarmupRuntime()
+	loc := warmupLocation()
+	now := time.Date(2026, 10, 10, 1, 0, 0, 0, loc) // 01:00，早于 04:00
+	act := decideWarmupLoop(now, rt, nil, "scheduled")
+	if act.run {
+		t.Fatal("未到计划时刻不应执行")
+	}
+	if act.wait <= 0 {
+		t.Fatalf("应返回正的等待时长，实际=%v", act.wait)
+	}
+}
+
+// TestWarmupCooldownNotifiesAfterCycleCompleted 端到端：周期已完成时，
+// 冷却恢复触发仍必须发出带「冷却恢复」字样的通知。
 func TestWarmupCooldownNotifiesAfterCycleCompleted(t *testing.T) {
 	resetWarmupStateT(t)
 	chdirTemp(t)
@@ -463,11 +546,9 @@ func TestWarmupCooldownNotifiesAfterCycleCompleted(t *testing.T) {
 	defer setNotify(notifyConfig{})
 
 	on := true
-	// 显式模型：跳过价格筛选，也避免依赖真实站点可用性
 	setWarmup(warmupConfig{Enabled: &on, Notify: &on, Models: []string{"m-free"}})
 
 	now := time.Now()
-	// 构造「当天定时轮已全部成功并完成」的周期 —— 正是门闸会拦截的场景
 	warmupStateMu.Lock()
 	saveWarmupStateLocked(&warmupState{
 		Current: &warmupCycle{
@@ -495,7 +576,7 @@ func TestWarmupCooldownNotifiesAfterCycleCompleted(t *testing.T) {
 			t.Fatalf("通知标题应标明冷却恢复触发，实际=%q", title)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("冷却恢复触发未发通知 —— 「当天已完成」门闸吞信号的问题回归了")
+		t.Fatal("冷却恢复触发未发通知 —— 门闸吞信号的问题回归了")
 	}
 }
 
@@ -536,9 +617,6 @@ func TestWarmupNoCooldownWakeKeepsSilent(t *testing.T) {
 
 	// 未设置唤醒来源：视为 scheduled，且本轮无 pending 模型 → 不应发通知
 	takeWarmupWakeReason()
-	if warmupCooldownWakeArmed() {
-		t.Fatal("未设置唤醒来源时不应判定为冷却恢复唤醒")
-	}
 	runWarmupOnce(warmupSnapshot(), now)
 
 	select {

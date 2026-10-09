@@ -236,14 +236,6 @@ func setWarmupWakeReason(r string) {
 	warmupReasonMu.Unlock()
 }
 
-// warmupCooldownWakeArmed 是否有冷却恢复唤醒等待处理。
-// warmupLoop 用它决定是否穿透「当天已完成 / 超出补触发窗口」等门闸：
-// 这些门闸对定时唤醒有效，但绝不能吞掉冷却恢复信号 —— 否则该路通知永远静默
-// （v1.27.0/v1.27.1 实测：一天内六次冷却恢复全部无通知）。
-func warmupCooldownWakeArmed() bool {
-	return peekWarmupWakeReason() == "cooldown"
-}
-
 // peekWarmupWakeReason 读取当前触发来源但不清除。
 // warmupLoop 用它判断要不要穿透门闸，真正的清除仍在 runWarmupOnce 里做，
 // 所以这里绝不能消费掉，否则 runWarmupOnce 会退化成 scheduled。
@@ -914,6 +906,57 @@ func maybeSendProbeDailyNotify(now time.Time) {
 //  2. 触发时模型正在冷却（6004）—— 保留 pending，按重试间隔再来；
 //  3. 网络不畅 / 上游错误 —— 同上。
 // 超过补触发窗口（ScheduledAt + CatchUpHours）仍未成功的，标记为失败并归档。
+// warmupLoopAction 描述 warmupLoop 一次迭代要做的事。
+// 抽成值而非内联分支，是为了让「门闸是否吞掉冷却恢复信号」可被单测覆盖：
+// v1.27.1 及以前门闸直接 continue，导致该路通知静默（2026-10-09 六次全无通知）。
+type warmupLoopAction struct {
+	run       bool          // 立即执行一轮
+	archive   bool          // 归档当前周期（超出补触发窗口且未完成）
+	wait      time.Duration // 本轮不执行时的等待时长
+	skipProbe bool          // 执行一轮后是否跳过主动探测（冷却恢复补触发不跟随探测）
+}
+
+// decideWarmupLoop 根据唤醒来源与周期状态决定本轮动作。
+// 入参显式、不直接读周期状态，便于回归测试精确构造各道门闸场景。
+//
+// 关键约束：reason=="cooldown" 时必须放行执行，绝不能落到「当天已完成」
+// 或「超出补触发窗口」的等待分支 —— 一旦等待，reason 就没机会被
+// runWarmupOnce 取走，冷却恢复通知将彻底静默。
+func decideWarmupLoop(now time.Time, rt warmupRuntime, cy *warmupCycle, reason string) warmupLoopAction {
+	// 冷却恢复唤醒：穿透所有定时语义门闸，立即执行一轮。
+	if reason == "cooldown" {
+		return warmupLoopAction{run: true, skipProbe: true}
+	}
+
+	date := cycleDateOf(now)
+	scheduled := scheduledTimeOn(now, rt.Time, 4, 0)
+	sameDay := cy != nil && cy.Date == date
+
+	// 当天周期还没建立，且还没到点：等到点。
+	if !sameDay && now.Before(scheduled) {
+		return warmupLoopAction{wait: scheduled.Sub(now) + time.Second}
+	}
+	// 当天已完成：等明天。
+	if sameDay && cy.CompletedAt > 0 {
+		return warmupLoopAction{wait: nextScheduledAfter(now, rt.Time, 4, 0).Sub(now) + time.Second}
+	}
+	deadline := scheduled.Add(time.Duration(rt.CatchUpHours) * time.Hour)
+	if now.After(deadline) {
+		// 超出补触发窗口：归档为未完成（窗口已过，再触发没有意义）。
+		return warmupLoopAction{
+			archive: sameDay && cy.CompletedAt == 0,
+			wait:    nextScheduledAfter(now, rt.Time, 4, 0).Sub(now) + time.Second,
+		}
+	}
+	// 需要执行（到点 / 补触发）。pending 项按重试间隔节流。
+	if sameDay && cy.LastAttemptAt > 0 {
+		if wait := time.Duration(rt.RetryMinutes)*time.Minute - time.Since(time.Unix(cy.LastAttemptAt, 0)); wait > 0 {
+			return warmupLoopAction{wait: wait}
+		}
+	}
+	return warmupLoopAction{run: true}
+}
+
 func warmupLoop() {
 	for {
 		rt := warmupSnapshot()
@@ -922,68 +965,31 @@ func warmupLoop() {
 			continue
 		}
 		now := time.Now()
-		loc := warmupLocation()
-		date := cycleDateOf(now)
-		// 定时触发只认 time（默认 04:00），与 windows 无关。
-		// windows 只用于约束「模型冷却恢复后的补触发」，见 warmupCooldownWatchLoop。
-		scheduled := scheduledTimeOn(now, rt.Time, 4, 0)
-
 		warmupStateMu.Lock()
 		st := loadWarmupState()
 		cy := st.Current
 		warmupStateMu.Unlock()
 
-		// 冷却恢复信号必须优先穿透下面所有门闸，立即执行一轮。
-		// 原因：waitWarmupSignal 被信号唤醒后循环会重走这些门闸，而
-		// 「当天已完成」「超出补触发窗口」等分支会直接 continue，信号就此被吞 ——
-		// runWarmupOnce 取不到 reason=="cooldown"，v1.27.0 专为该场景加的
-		// 通知分支永远进不去（实测 10-09 六次冷却恢复全部静默）。
-		if warmupCooldownWakeArmed() {
-			_, _, _, pending, _ := runWarmupOnce(rt, now)
-			if pending > 0 {
-				// 有未完成的：按重试间隔再来一轮，别空转烧请求。
-				waitWarmupSignal(time.Duration(rt.RetryMinutes) * time.Minute)
-			}
-			continue
+		// 唤醒来源只 peek 不消费：真正的清除由 runWarmupOnce 完成，
+		// 这里消费掉会让通知标题退化成 scheduled。
+		act := decideWarmupLoop(now, rt, cy, peekWarmupWakeReason())
+		if act.archive && cy != nil {
+			archiveCycle(rt, cy, now)
 		}
-
-		// 当天（当前时段）周期还没建立，且还没到点：等到点。
-		if (cy == nil || cy.Date != date) && now.Before(scheduled) {
-			waitWarmupSignal(time.Until(scheduled) + time.Second)
+		if !act.run {
+			waitWarmupSignal(act.wait)
 			continue
-		}
-		if cy != nil && cy.Date == date && cy.CompletedAt > 0 {
-			// 当天已完成：等明天。
-			waitWarmupSignal(time.Until(nextScheduledAfter(now, rt.Time, 4, 0)) + time.Second)
-			continue
-		}
-
-		deadline := scheduled.Add(time.Duration(rt.CatchUpHours) * time.Hour)
-		if now.After(deadline) {
-			// 超出补触发窗口：归档为未完成（窗口已过，再触发没有意义）。
-			if cy != nil && cy.Date == date && cy.CompletedAt == 0 {
-				archiveCycle(rt, cy, now)
-			}
-			waitWarmupSignal(time.Until(nextScheduledAfter(now, rt.Time, 4, 0)) + time.Second)
-			continue
-		}
-
-		// 需要执行（到点 / 补触发）。pending 项按重试间隔节流。
-		if cy != nil && cy.Date == date && cy.LastAttemptAt > 0 && cy.CompletedAt == 0 {
-			if wait := time.Duration(rt.RetryMinutes)*time.Minute - time.Since(time.Unix(cy.LastAttemptAt, 0)); wait > 0 {
-				waitWarmupSignal(wait)
-				continue
-			}
 		}
 
 		_, _, _, pending, _ := runWarmupOnce(rt, now)
-		// 主动探测与本功能同刻执行（主人要求：开启 warmup 时探测跟随同一时刻）。
-		requestModelsProbe()
+		if !act.skipProbe {
+			// 主动探测与本功能同刻执行（主人要求：开启 warmup 时探测跟随同一时刻）。
+			requestModelsProbe()
+		}
 		if pending > 0 {
 			waitWarmupSignal(time.Duration(rt.RetryMinutes) * time.Minute)
 			continue
 		}
-		_ = loc
 		waitWarmupSignal(time.Until(nextScheduledAfter(time.Now(), rt.Time, 4, 0)) + time.Second)
 	}
 }
