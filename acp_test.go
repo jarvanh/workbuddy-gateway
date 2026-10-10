@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -45,6 +46,13 @@ type fakeACP struct {
 	failSSE bool
 }
 
+// conversationHits 返回建会话次数：用于断言「去重生效时确实没打上游」。
+func (f *fakeACP) conversationHits() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.created
+}
+
 // setupFakeACP 启动假上游并把国际站 Origin 指向它，测试结束自动还原。
 func setupFakeACP(t *testing.T, fake *fakeACP) {
 	t.Helper()
@@ -57,12 +65,19 @@ func setupFakeACP(t *testing.T, fake *fakeACP) {
 	server := httptest.NewServer(fake)
 	acpSSEEndpoint = server.URL + acpSSEPath
 
+	// 国际站活跃的「当日去重」名单默认落在 cwd，会让多个用例共用同一份状态：
+	// 前一个用例标记成功后，后一个用例直接被去重跳过，断言必然失败。
+	// 每个用例指向自己的临时文件，互相隔离。
+	oldStateFile, oldDedupe := intlCheckinStateFile, intlCheckinDedupe
+	intlCheckinStateFile = filepath.Join(t.TempDir(), "wb-intl-checkin.json")
+
 	oldOrigin, oldClient := profileINTL.Origin, cfg.HttpClient
 	profileINTL.Origin = server.URL
 	cfg.HttpClient = server.Client()
 	t.Cleanup(func() {
 		profileINTL.Origin = oldOrigin
 		cfg.HttpClient = oldClient
+		intlCheckinStateFile, intlCheckinDedupe = oldStateFile, oldDedupe
 		server.Close()
 	})
 }
@@ -192,6 +207,48 @@ func TestCheckinIntlFailsWhenFailed(t *testing.T) {
 	result, err := checkinAccount(context.Background(), travelSeedAccount(t, "intl"))
 	if result != "failed" || err == nil {
 		t.Fatalf("会话状态 failed 应判定失败: result=%q err=%v", result, err)
+	}
+}
+
+// 当日已成功活跃过，重复调用应被去重跳过，且不再请求上游。
+// 背景：国际站活跃按次扣额度，网关每次重启都会重跑一轮；上游只回「今日已签」
+// 的幂等文案、不会叫停，去重只能本地记账。这条用例锁住「不重复烧额度」的行为。
+func TestCheckinIntlDedupesSameDay(t *testing.T) {
+	fake := &fakeACP{status: "completed"}
+	setupFakeACP(t, fake)
+	travelSeedFlags(t, true, true, true)
+
+	acc := travelSeedAccount(t, "intl")
+	if result, err := checkinAccount(context.Background(), acc); result != "ok" || err != nil {
+		t.Fatalf("首次活跃应成功: result=%q err=%v", result, err)
+	}
+	hitsAfterFirst := fake.conversationHits()
+
+	// 第二次调用：模拟网关重启后重跑当日签到。
+	result, err := checkinAccount(context.Background(), acc)
+	if result != "already" || err != nil {
+		t.Fatalf("当日重复活跃应被去重跳过: result=%q err=%v", result, err)
+	}
+	if got := fake.conversationHits(); got != hitsAfterFirst {
+		t.Fatalf("去重后不应再请求上游: 建会话次数=%d, want %d", got, hitsAfterFirst)
+	}
+}
+
+// 关掉去重开关后应恢复「每次都跑」的旧行为。
+func TestCheckinIntlDedupeCanBeDisabled(t *testing.T) {
+	fake := &fakeACP{status: "completed"}
+	setupFakeACP(t, fake)
+	travelSeedFlags(t, true, true, true)
+	intlCheckinDedupe = false
+
+	acc := travelSeedAccount(t, "intl")
+	for i := 0; i < 2; i++ {
+		if result, err := checkinAccount(context.Background(), acc); result != "ok" || err != nil {
+			t.Fatalf("第 %d 次活跃应成功（去重已关闭）: result=%q err=%v", i+1, result, err)
+		}
+	}
+	if got := fake.conversationHits(); got < 2 {
+		t.Fatalf("关闭去重后每次都应跑会话: 建会话次数=%d, want >=2", got)
 	}
 }
 

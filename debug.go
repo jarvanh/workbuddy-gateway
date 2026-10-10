@@ -97,6 +97,10 @@ type runtimeFileConfig struct {
 		Intl struct {
 			// Enabled：国际站每日自动签到（默认开启）。
 			Enabled *bool `json:"enabled"`
+			// Dedupe：当日已成功活跃则跳过重复执行（默认开启）。
+			// 国际站活跃按次扣额度，网关每次重启都会重跑一轮，升级频繁时一天能刷掉
+			// 六七轮；上游只回「今日已签」的幂等文案，不会叫停，去重只能本地记账。
+			Dedupe *bool `json:"dedupe"`
 		} `json:"intl"`
 	} `json:"checkin"`
 }
@@ -220,6 +224,7 @@ func loadRuntimeConfig(path string) error {
 	// 加载的残留值，而不是回到默认开启。
 	cnCheckinEnabled, cnTravelEnabled, intlCheckinEnabled = true, true, true
 	cnGrowthEnabled = true
+	intlCheckinDedupe = true
 	if fileCfg.Checkin.CN.Enabled != nil {
 		cnCheckinEnabled = *fileCfg.Checkin.CN.Enabled
 	}
@@ -231,6 +236,9 @@ func loadRuntimeConfig(path string) error {
 	}
 	if fileCfg.Checkin.Intl.Enabled != nil {
 		intlCheckinEnabled = *fileCfg.Checkin.Intl.Enabled
+	}
+	if fileCfg.Checkin.Intl.Dedupe != nil {
+		intlCheckinDedupe = *fileCfg.Checkin.Intl.Dedupe
 	}
 	return nil
 }

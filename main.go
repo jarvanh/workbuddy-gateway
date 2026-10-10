@@ -2748,7 +2748,91 @@ var (
 	cnCheckinEnabled   = true // 国内站每日自动签到
 	cnTravelEnabled    = true // 国内站签到后自动派 Buddy 旅行
 	intlCheckinEnabled = true // 国际站每日自动签到
+	// intlCheckinDedupe 国际站活跃「当日已跑过就跳过」。
+	// 国际站活跃按次扣额度（实测约 0.58/账号/次），而网关每次启动都会重跑一轮；
+	// 上游只回「今日已签」的幂等文案、不会叫停，所以只能本地记账去重。
+	intlCheckinDedupe = true
 )
+
+// -----------------------------------------------------------------------------
+// 国际站活跃去重：当日成功名单落盘
+// -----------------------------------------------------------------------------
+
+const (
+	intlCheckinStateSchema = 1
+)
+
+// intlCheckinStateFile 当日活跃名单落盘路径（相对数据目录）。
+// 声明为变量以便测试指向临时目录，避免用例之间互相污染。
+var intlCheckinStateFile = "wb-intl-checkin.json"
+
+// intlCheckinState 记录各国际站账号最近一次成功活跃的日期（配置时区）。
+type intlCheckinState struct {
+	Schema    int   `json:"schema"`
+	UpdatedAt int64 `json:"updatedAt"`
+	// Days 以「账号 -> YYYY-MM-DD」记录最近一次成功活跃的日期。
+	Days map[string]string `json:"days"`
+}
+
+var intlCheckinStateMu sync.Mutex
+
+// intlCheckinDayKey 返回当日在配置时区下的日期键。
+func intlCheckinDayKey() string {
+	return time.Now().In(displayLoc).Format("2006-01-02")
+}
+
+func loadIntlCheckinState() *intlCheckinState {
+	data, err := os.ReadFile(intlCheckinStateFile)
+	st := &intlCheckinState{Schema: intlCheckinStateSchema, Days: map[string]string{}}
+	if err == nil {
+		var loaded intlCheckinState
+		if json.Unmarshal(data, &loaded) == nil && loaded.Schema == intlCheckinStateSchema {
+			st = &loaded
+		}
+	}
+	if st.Days == nil {
+		st.Days = map[string]string{}
+	}
+	return st
+}
+
+// saveIntlCheckinStateLocked 原子落盘（调用方持有 intlCheckinStateMu）。
+func saveIntlCheckinStateLocked(st *intlCheckinState) {
+	st.Schema = intlCheckinStateSchema
+	st.UpdatedAt = time.Now().Unix()
+	data, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return
+	}
+	tmp := intlCheckinStateFile + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, intlCheckinStateFile)
+}
+
+// intlCheckinAlreadyDone 判断该账号当日活跃是否已成功跑过。
+func intlCheckinAlreadyDone(path string) bool {
+	if !intlCheckinDedupe {
+		return false
+	}
+	intlCheckinStateMu.Lock()
+	defer intlCheckinStateMu.Unlock()
+	st := loadIntlCheckinState()
+	return st.Days[path] == intlCheckinDayKey()
+}
+
+// markIntlCheckinDone 标记该账号当日活跃已成功。
+func markIntlCheckinDone(path string) {
+	intlCheckinStateMu.Lock()
+	defer intlCheckinStateMu.Unlock()
+	st := loadIntlCheckinState()
+	if st.Days[path] == intlCheckinDayKey() {
+		return
+	}
+	st.Days[path] = intlCheckinDayKey()
+	saveIntlCheckinStateLocked(st)
+}
 
 // isAlreadyCheckedIn 判断签到响应是否为「今日已签」类幂等结果。
 func isAlreadyCheckedIn(status int, message string) bool {
@@ -2826,6 +2910,13 @@ func checkinAccount(ctx context.Context, acc *Account) (string, error) {
 			checkinErr = err
 		}
 	} else {
+		// 当日已成功跑过就跳过：国际站活跃按次扣额度，网关每次启动都会重跑一轮，
+		// 而上游只回「今日已签」的幂等文案、不会叫停，重复跑纯属白烧额度。
+		if intlCheckinAlreadyDone(path) {
+			log.Printf("[Checkin] 账号 %s 国际站今日已活跃，跳过重复执行（去重，不消耗额度）", path)
+			return "already", nil
+		}
+
 		ctx, cancel := context.WithTimeout(ctx, acpTurnTimeout+30*time.Second)
 		defer cancel()
 
@@ -2835,6 +2926,7 @@ func checkinAccount(ctx context.Context, acc *Account) (string, error) {
 		case turn.OK:
 			log.Printf("[Checkin] 账号 %s 国际站每日活跃完成：%d 段输出 / %d 次更新，耗时 %dms",
 				path, turn.Chunks, turn.Updates, turn.ElapsedMS)
+			markIntlCheckinDone(path)
 			result = "ok"
 		default:
 			log.Printf("[Checkin] 账号 %s 国际站每日活跃失败：%s；不改变账号调度状态", path, turn.Error)

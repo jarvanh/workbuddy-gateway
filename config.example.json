@@ -47,7 +47,8 @@
       "growth": true
     },
     "intl": {
-      "enabled": true
+      "enabled": true,
+      "dedupe": true
     }
   },
   "notify": {
