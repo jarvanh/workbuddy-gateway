@@ -853,6 +853,76 @@ func sendWarmupNotify(rt warmupRuntime, ok, failed, skipped int, reason string, 
 // 探测收敛前是 2 分钟一轮，等一会儿再汇总能覆盖更多模型，避免只报头几个。
 const probeSummaryDelay = 30 * time.Minute
 
+// probeDailyFile 每日探测汇总计数落盘文件。
+//
+// 背景（2026-10-10 事故）：计数原本仅存内存，服务重启即清零 ——
+// 当天已探到的结论丢失，且「当日首次探测时刻」被重置为重启后首个探测，
+// 导致「每日探测汇总」通知的数字明显偏低（当日 01:13 已探到 1 个 free，
+// 02:11 重启后 03:11 的通知只报了重启后探到的 1 个）。落盘后按自然日恢复。
+const probeDailyFile = "wb-probe-daily.json"
+
+// probeDailyPersist 是落盘结构：跨重启恢复当日汇总计数。
+type probeDailyPersist struct {
+	Date   string   `json:"date"` // 计划日期（配置时区自然日），不匹配则忽略
+	Free   int      `json:"free"`
+	Paid   int      `json:"paid"`
+	Other  int      `json:"other"`
+	Models []string `json:"models,omitempty"`
+	Sent   bool     `json:"sent"`
+	First  int64    `json:"first,omitempty"` // 当日首次探测 Unix 秒
+}
+
+// loadProbeDaily 启动时恢复当日汇总计数（仅当落盘日期与当前计划日期一致）。
+func loadProbeDaily() {
+	data, err := os.ReadFile(probeDailyFile)
+	if err != nil {
+		return
+	}
+	var p probeDailyPersist
+	if err := json.Unmarshal(data, &p); err != nil {
+		log.Printf("[ModelPrice] 每日汇总计数文件无效，忽略: %v", err)
+		return
+	}
+	if p.Date != cycleDateOf(time.Now()) {
+		return // 跨天：不恢复，等首个探测自然重置
+	}
+	probeDailyMu.Lock()
+	probeDailyDate = p.Date
+	probeDailyFree, probeDailyPaid, probeDailyOther = p.Free, p.Paid, p.Other
+	probeDailyModels = p.Models
+	probeDailySent = p.Sent
+	if p.First > 0 {
+		probeDailyFirst = time.Unix(p.First, 0)
+	}
+	probeDailyMu.Unlock()
+	log.Printf("[ModelPrice] 已恢复当日探测汇总计数：日期=%s 免费=%d 收费=%d 未判定=%d 已发送=%v",
+		p.Date, p.Free, p.Paid, p.Other, p.Sent)
+}
+
+// persistProbeDailyLocked 落盘当日汇总计数。调用方必须已持有 probeDailyMu。
+func persistProbeDailyLocked() {
+	var first int64
+	if !probeDailyFirst.IsZero() {
+		first = probeDailyFirst.Unix()
+	}
+	data, err := json.MarshalIndent(probeDailyPersist{
+		Date: probeDailyDate, Free: probeDailyFree, Paid: probeDailyPaid,
+		Other: probeDailyOther, Models: probeDailyModels, Sent: probeDailySent,
+		First: first,
+	}, "", "  ")
+	if err != nil {
+		return
+	}
+	tmp := probeDailyFile + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		log.Printf("[ModelPrice] 每日汇总计数写入失败: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, probeDailyFile); err != nil {
+		log.Printf("[ModelPrice] 每日汇总计数写入失败: %v", err)
+	}
+}
+
 var (
 	probeDailyMu     sync.Mutex
 	probeDailyDate   string
@@ -892,6 +962,8 @@ func recordProbeDailyResult(site, model, verdict string, now time.Time) {
 	if len(probeDailyModels) < 20 {
 		probeDailyModels = append(probeDailyModels, label)
 	}
+	// 计数变化即落盘，保证重启后不丢当日已累计的结论。
+	persistProbeDailyLocked()
 }
 
 // maybeSendProbeDailyNotify 当日探测累计够久后推送一条汇总（每天最多一条）。

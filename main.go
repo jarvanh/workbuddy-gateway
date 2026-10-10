@@ -3599,6 +3599,7 @@ func runServe() {
 		}
 	}()
 	loadModelsCache()
+	loadProbeDaily()   // 恢复当日探测汇总计数：重启不得让「每日探测汇总」数字偏低（2026-10-10 修复）
 	loadRoutingSpend() // v6：恢复站点模型预算消耗（重启不再清零）
 	loadPriceLedger()  // 恢复站点价格账本：重启不得让价格记忆清零（2026-09-29 事故修复）
 	if err := loadAccounts(); err != nil {

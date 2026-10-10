@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -678,4 +679,83 @@ func TestWarmupWakeCarriesRecovered(t *testing.T) {
 	if got := takeWarmupRecovered(); len(got) != 0 {
 		t.Fatalf("兼容入口不应携带恢复项，实际=%v", got)
 	}
+}
+
+// TestProbeDailyPersistsAcrossRestart 当日探测汇总计数必须跨「进程重启」保持：
+// 这正是 2026-10-10 的 bug —— 内存计数在重启后清零，导致当日 02:11 重启后
+// 03:11 的汇总通知只报了重启后探到的 1 个 free（重启前 01:13 已探到 1 个）。
+func TestProbeDailyPersistsAcrossRestart(t *testing.T) {
+	resetWarmupStateT(t)
+	loc := warmupLocation()
+	// 固定一个「今天」的时刻，保证落盘日期与恢复时的 plan date 一致。
+	now := time.Now().In(loc)
+	date := cycleDateOf(now)
+
+	// 首个探测：free。清空落盘，模拟重启前累计。
+	probeDailyMu.Lock()
+	probeDailyDate, probeDailyFree, probeDailyPaid, probeDailyOther = "", 0, 0, 0
+	probeDailyModels, probeDailySent, probeDailyFirst = nil, false, time.Time{}
+	probeDailyMu.Unlock()
+	_ = removeIfExists(probeDailyFile)
+
+	firstAt := now.Add(-5 * time.Minute)
+	recordProbeDailyResult("intl", "deepseek-v4.1-flash", "free", firstAt)
+
+	// 模拟进程重启：内存态清零后从落盘恢复。
+	probeDailyMu.Lock()
+	probeDailyDate, probeDailyFree, probeDailyPaid, probeDailyOther = "", 0, 0, 0
+	probeDailyModels, probeDailySent, probeDailyFirst = nil, false, time.Time{}
+	probeDailyMu.Unlock()
+	loadProbeDaily()
+
+	probeDailyMu.Lock()
+	gotDate, gotFree, gotFirst := probeDailyDate, probeDailyFree, probeDailyFirst
+	probeDailyMu.Unlock()
+	if gotDate != date {
+		t.Fatalf("恢复日期应为 %s，实际=%s", date, gotDate)
+	}
+	if gotFree != 1 {
+		t.Fatalf("重启前已探到的 1 个 free 必须恢复，实际 free=%d", gotFree)
+	}
+	// 「当日首次探测时刻」必须恢复为重启前的首次，而非重启后首个探测。
+	if gotFirst.Unix() != firstAt.Unix() {
+		t.Fatalf("当日首次探测时刻应恢复为 %d，实际=%d",
+			firstAt.Unix(), gotFirst.Unix())
+	}
+
+	// 重启后再探到一个 paid：计数应累加到 1 free + 1 paid。
+	recordProbeDailyResult("intl", "auto", "paid", now)
+	probeDailyMu.Lock()
+	free, paid := probeDailyFree, probeDailyPaid
+	probeDailyMu.Unlock()
+	if free != 1 || paid != 1 {
+		t.Fatalf("重启后累计应为 free=1 paid=1，实际 free=%d paid=%d", free, paid)
+	}
+
+	// 跨天落盘不得恢复：把落盘日期改成昨天再加载，应保持清空。
+	probeDailyMu.Lock()
+	probeDailyDate, probeDailyFree, probeDailyPaid, probeDailyOther = "", 0, 0, 0
+	probeDailyModels, probeDailySent, probeDailyFirst = nil, false, time.Time{}
+	probeDailyMu.Unlock()
+	stale := probeDailyPersist{Date: "2000-01-01", Free: 9, Paid: 9, Other: 9, First: firstAt.Unix()}
+	data, _ := json.Marshal(stale)
+	if err := os.WriteFile(probeDailyFile, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	loadProbeDaily()
+	probeDailyMu.Lock()
+	gotFree2 := probeDailyFree
+	probeDailyMu.Unlock()
+	if gotFree2 != 0 {
+		t.Fatalf("跨天落盘不得恢复，实际 free=%d", gotFree2)
+	}
+}
+
+// removeIfExists 删除文件，不存在也不报错。
+func removeIfExists(path string) error {
+	err := os.Remove(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
