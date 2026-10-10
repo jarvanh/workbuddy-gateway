@@ -879,6 +879,77 @@ func probeVerdictTotals() (free, paid int) {
 	return free, paid
 }
 
+// probeKnownEntry 一条已确认结论的展示结构（站点/模型 + 结论 + 时间）。
+type probeKnownEntry struct {
+	Label   string // site/model
+	Verdict string // free | paid
+	When    string // MM-DD HH:MM，配置时区
+	Credit  float64
+	Tokens  int64
+}
+
+// probeKnownEntries 列出目录内已确认的价格结论明细（free 在前，其次 paid）。
+//
+// 背景（2026-10-10）：汇总通知只给了「当前已知 免费 3 / 收费 2」两个数字，
+// 主人追问「把当前已知也列出来」—— 计数无法回答「到底是哪几个」，明细才行。
+func probeKnownEntries() []probeKnownEntry {
+	modelsMu.RLock()
+	defer modelsMu.RUnlock()
+	out := make([]probeKnownEntry, 0, len(modelProbes))
+	for key, p := range modelProbes {
+		if p.Verdict != "free" && p.Verdict != "paid" {
+			continue
+		}
+		site, model := key, ""
+		if i := strings.Index(key, "|"); i >= 0 {
+			site, model = key[:i], key[i+1:]
+		}
+		e := probeKnownEntry{
+			Label:   site + "/" + model,
+			Verdict: p.Verdict,
+			Credit:  p.Credit,
+			Tokens:  p.Tokens,
+		}
+		if p.LastProbeAt > 0 {
+			e.When = time.Unix(p.LastProbeAt, 0).In(warmupLocation()).Format("01-02 15:04")
+		}
+		out = append(out, e)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Verdict != out[j].Verdict {
+			return out[i].Verdict == "free" // free 排前面
+		}
+		return out[i].Label < out[j].Label
+	})
+	return out
+}
+
+// probeEntryLines 把「site/model 结论」纯文本行转成 tgEntry 条目行。
+// 每日累计的明细原本是单一字符串（如 "intl/hy3 免费"），拆出结论做元数据，
+// 主体仍以 <code> 包裹，与「当前已知明细」排版一致。
+func probeEntryLines(lines []string) []string {
+	out := make([]string, 0, len(lines))
+	for _, l := range lines {
+		if i := strings.LastIndex(l, " "); i > 0 {
+			out = append(out, tgEntry(l[:i], l[i+1:]))
+			continue
+		}
+		out = append(out, tgEntry(l))
+	}
+	return out
+}
+
+// verdictCN 结论的中展示名。
+func verdictCN(v string) string {
+	switch v {
+	case "free":
+		return "免费"
+	case "paid":
+		return "收费"
+	}
+	return "未判定"
+}
+
 // probeDailyPersist 是落盘结构：跨重启恢复当日汇总计数。
 type probeDailyPersist struct {
 	Date   string   `json:"date"` // 计划日期（配置时区自然日），不匹配则忽略
@@ -1012,12 +1083,23 @@ func maybeSendProbeDailyNotify(now time.Time) {
 	totFree, totPaid := probeVerdictTotals()
 	newLine := fmt.Sprintf("免费 %d / 收费 %d / 未判定 %d", free, paid, other)
 	knownLine := fmt.Sprintf("免费 %d / 收费 %d", totFree, totPaid)
+	known := probeKnownEntries()
 
 	body := fmt.Sprintf("探测日期: %s\n当日新增: %s\n当前已知(累计): %s", date, newLine, knownLine)
 	if len(models) > 0 {
-		body += "\n明细:\n  " + strings.Join(models, "\n  ")
+		body += "\n当日新增:\n  " + strings.Join(models, "\n  ")
 	}
-	body += "\n口径: 「当日新增」为今天新探测出的价格结论；" +
+	if len(known) > 0 {
+		body += "\n当前已知:\n"
+		for _, e := range known {
+			body += "  " + e.Label + " " + verdictCN(e.Verdict)
+			if e.When != "" {
+				body += " (" + e.When + ")"
+			}
+			body += "\n"
+		}
+	}
+	body += "口径: 「当日新增」为今天新探测出的价格结论；" +
 		"「当前已知」为目录内已确认的判断总数，两者不是同一个数"
 
 	var b strings.Builder
@@ -1025,13 +1107,25 @@ func maybeSendProbeDailyNotify(now time.Time) {
 	b.WriteString(tgKV("探测日期", date))
 	b.WriteString(tgKV("当日新增", newLine))
 	b.WriteString(tgKV("当前已知", knownLine))
-	tgSection(&b, "明细")
+	tgSection(&b, "当日新增明细")
 	if len(models) == 0 {
 		b.WriteString("（无）\n")
 	} else {
-		for _, m := range models {
-			b.WriteString(tgEntry(m) + "\n")
+		b.WriteString(treeLines(probeEntryLines(models)) + "\n")
+	}
+	tgSection(&b, "当前已知明细")
+	if len(known) == 0 {
+		b.WriteString("（无）\n")
+	} else {
+		entries := make([]string, 0, len(known))
+		for _, e := range known {
+			meta := verdictCN(e.Verdict)
+			if e.When != "" {
+				meta += " · " + e.When
+			}
+			entries = append(entries, tgEntry(e.Label, meta))
 		}
+		b.WriteString(treeLines(entries) + "\n")
 	}
 	b.WriteString(tgKV("口径", "当日新增=今天新探出的结论；当前已知=目录内已确认总数"))
 
