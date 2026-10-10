@@ -24,9 +24,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -231,9 +231,34 @@ var (
 )
 
 func setWarmupWakeReason(r string) {
+	setWarmupWake(r, nil)
+}
+
+// warmupRecoveredKeys 传递「本次冷却恢复的具体项」（账号|模型 列表）。
+// 与 warmupWakeReason 同生命周期：watch loop 设置、runWarmupOnce 取走清空。
+// 仅 cooldown 路径非空，通知用它写明「本次触发的是哪个模型」。
+var (
+	warmupRecoveredMu   sync.Mutex
+	warmupRecoveredKeys []string
+)
+
+// setWarmupWake 设置唤醒来源与恢复项；recovered 仅 cooldown 路径使用。
+func setWarmupWake(reason string, recovered []string) {
 	warmupReasonMu.Lock()
-	warmupWakeReason = r
+	warmupWakeReason = reason
 	warmupReasonMu.Unlock()
+	warmupRecoveredMu.Lock()
+	warmupRecoveredKeys = recovered
+	warmupRecoveredMu.Unlock()
+}
+
+// takeWarmupRecovered 取出并清空恢复项；仅 reason=="cooldown" 时非空。
+func takeWarmupRecovered() []string {
+	warmupRecoveredMu.Lock()
+	defer warmupRecoveredMu.Unlock()
+	r := warmupRecoveredKeys
+	warmupRecoveredKeys = nil
+	return r
 }
 
 // peekWarmupWakeReason 读取当前触发来源但不清除。
@@ -259,14 +284,14 @@ func takeWarmupWakeReason() string {
 
 func defaultWarmupRuntime() warmupRuntime {
 	return warmupRuntime{
-		Enabled:                    true,
-		Time:                       warmupDefaultTime,
-		MaxPrice:                   warmupDefaultPrice,
-		CatchUpHours:               warmupDefaultCatchUpHours,
-		RetryMinutes:               warmupDefaultRetryMinutes,
-		MaxRateLimitRetries:        warmupDefaultMaxRateLimitRetries,
-		CooldownTrigger:            true,
-		CooldownTriggerMinMinutes:  warmupDefaultCooldownTriggerMinMinutes,
+		Enabled:                   true,
+		Time:                      warmupDefaultTime,
+		MaxPrice:                  warmupDefaultPrice,
+		CatchUpHours:              warmupDefaultCatchUpHours,
+		RetryMinutes:              warmupDefaultRetryMinutes,
+		MaxRateLimitRetries:       warmupDefaultMaxRateLimitRetries,
+		CooldownTrigger:           true,
+		CooldownTriggerMinMinutes: warmupDefaultCooldownTriggerMinMinutes,
 	}
 }
 
@@ -379,14 +404,14 @@ func probeScheduleSnapshot() probeRuntime {
 // -----------------------------------------------------------------------------
 
 type warmupModelState struct {
-	Status  string `json:"status"` // pending | ok | failed | skipped
-	Site    string `json:"site,omitempty"`
-	Account string `json:"account,omitempty"`
-	Verdict string `json:"verdict,omitempty"` // free | paid
-	HTTP    int    `json:"http,omitempty"`
-	Attempts int   `json:"attempts"`
-	LastAt  int64  `json:"lastAt,omitempty"`
-	Detail  string `json:"detail,omitempty"`
+	Status   string `json:"status"` // pending | ok | failed | skipped
+	Site     string `json:"site,omitempty"`
+	Account  string `json:"account,omitempty"`
+	Verdict  string `json:"verdict,omitempty"` // free | paid
+	HTTP     int    `json:"http,omitempty"`
+	Attempts int    `json:"attempts"`
+	LastAt   int64  `json:"lastAt,omitempty"`
+	Detail   string `json:"detail,omitempty"`
 	// RateLimitHits 累计本周期内该模型被限流（6004）的次数，成功即清零。
 	// 达到 warmupRuntime.MaxRateLimitRetries 时放弃本周期，不再重试。
 	RateLimitHits int `json:"rateLimitHits,omitempty"`
@@ -414,10 +439,10 @@ type warmupHistoryEntry struct {
 }
 
 type warmupState struct {
-	Schema   int                   `json:"schema"`
-	UpdatedAt int64               `json:"updatedAt"`
-	Current  *warmupCycle         `json:"current,omitempty"`
-	History  []warmupHistoryEntry `json:"history,omitempty"`
+	Schema    int                  `json:"schema"`
+	UpdatedAt int64                `json:"updatedAt"`
+	Current   *warmupCycle         `json:"current,omitempty"`
+	History   []warmupHistoryEntry `json:"history,omitempty"`
 }
 
 var warmupStateMu sync.Mutex
@@ -648,6 +673,7 @@ func warmupTriggerModel(model string, rt warmupRuntime, now time.Time, ms *warmu
 // 返回本轮结束后的统计。
 func runWarmupOnce(rt warmupRuntime, now time.Time) (ok, failed, skipped, pending int, catchUp bool) {
 	reason := takeWarmupWakeReason()
+	recoveredKeys := takeWarmupRecovered()
 	models := warmupSelectModels(rt, now)
 	if len(models) == 0 {
 		log.Printf("[Warmup] 本轮没有符合条件的模型（上限=%s，显式模型=%d）", formatQuota(rt.MaxPrice), len(rt.Models))
@@ -695,10 +721,12 @@ func runWarmupOnce(rt warmupRuntime, now time.Time) (ok, failed, skipped, pendin
 	warmupStateMu.Unlock()
 
 	if len(pendingModels) == 0 {
-		// 冷却恢复触发时即使没有待触发模型（例如当天已全部成功），
-		// 也要发一条通知：主人需要知道「冷却恢复触发发生了」，否则这一路是静默的。
+		// 冷却恢复触发但无待触发模型（例如当天已全部成功）：仍发通知避免静默，
+		// 但计数必须用当天周期真实结果 —— 绝不硬编码 0/0/0，否则主人分不清
+		// 「本轮没触发任何模型」还是「当天真的全部为零」；正文同时写明恢复项。
 		if rt.Notify && reason == "cooldown" {
-			sendWarmupNotify(rt, 0, 0, 0, reason)
+			cok, cfail, cskip, _, _ := countCycle(cy)
+			sendWarmupNotify(rt, cok, cfail, cskip, reason, recoveredKeys)
 		}
 		return countCycle(cy)
 	}
@@ -739,7 +767,7 @@ func runWarmupOnce(rt warmupRuntime, now time.Time) (ok, failed, skipped, pendin
 	log.Printf("[Warmup] 第 %d 轮结束：成功=%d，失败=%d，跳过=%d，待补触发=%d",
 		cy.Attempts, ok, failed, skipped, pending)
 	if rt.Notify && pending == 0 {
-		sendWarmupNotify(rt, ok, failed, skipped, reason)
+		sendWarmupNotify(rt, ok, failed, skipped, reason, recoveredKeys)
 	}
 	return ok, failed, skipped, pending, catchUp
 }
@@ -779,7 +807,7 @@ func modelDisplayName(key string) string {
 // sendWarmupNotify 一轮结束后推送结果（复用 notify 通道）。
 // reason 区分触发来源（scheduled 定时 / cooldown 冷却恢复 / manual 手动），
 // 三者的标题与去重键必须不同，否则主人分不清是哪一路触发的。
-func sendWarmupNotify(rt warmupRuntime, ok, failed, skipped int, reason string) {
+func sendWarmupNotify(rt warmupRuntime, ok, failed, skipped int, reason string, recovered []string) {
 	now := time.Now()
 	var title, keyPrefix string
 	switch reason {
@@ -798,6 +826,14 @@ func sendWarmupNotify(rt warmupRuntime, ok, failed, skipped int, reason string) 
 	}
 	body := fmt.Sprintf("触发时刻: %s\n价格上限: %s\n成功: %d\n失败: %d\n跳过: %d",
 		formatDisplayTime(now), formatQuota(rt.MaxPrice), ok, failed, skipped)
+	html := tgTitle(title) + tgKV("触发时刻", formatDisplayTime(now)) + tgKV("价格上限", formatQuota(rt.MaxPrice))
+	if len(recovered) > 0 {
+		// 写明本次触发由哪些「账号|模型」的冷却恢复引起，便于对账。
+		names := strings.Join(recovered, ", ")
+		body += "\n恢复项: " + names
+		html += tgKV("恢复项", names)
+	}
+	html += tgKV("成功", fmt.Sprint(ok)) + tgKV("失败", fmt.Sprint(failed)) + tgKV("跳过", fmt.Sprint(skipped))
 	sendNotify(notifyEvent{
 		Kind: notifyEventWarmup,
 		// 定时与冷却恢复分开去重：冷却恢复一天可能多次，不能共用同一把锁。
@@ -805,7 +841,7 @@ func sendWarmupNotify(rt warmupRuntime, ok, failed, skipped int, reason string) 
 		Level: "info",
 		Title: title,
 		Body:  body,
-		HTML:  tgTitle(title) + tgKV("触发时刻", formatDisplayTime(now)) + tgKV("价格上限", formatQuota(rt.MaxPrice)) + tgKV("成功", fmt.Sprint(ok)) + tgKV("失败", fmt.Sprint(failed)) + tgKV("跳过", fmt.Sprint(skipped)),
+		HTML:  html,
 	})
 }
 
@@ -905,6 +941,7 @@ func maybeSendProbeDailyNotify(now time.Time) {
 //  1. 计划时刻服务没运行 —— 进程启动后发现当天周期未完成，立即补一轮；
 //  2. 触发时模型正在冷却（6004）—— 保留 pending，按重试间隔再来；
 //  3. 网络不畅 / 上游错误 —— 同上。
+//
 // 超过补触发窗口（ScheduledAt + CatchUpHours）仍未成功的，标记为失败并归档。
 // warmupLoopAction 描述 warmupLoop 一次迭代要做的事。
 // 抽成值而非内联分支，是为了让「门闸是否吞掉冷却恢复信号」可被单测覆盖：
@@ -1018,6 +1055,28 @@ func activeCooldownKeys(now time.Time) map[string]time.Time {
 	return out
 }
 
+// warmupRecoveredInScope 从恢复项中筛出「在 warmup 触发名单内」的模型项。
+// key 形如 "账号|模型"；账号级冷却（无模型部分）不属于特定模型，一律视为名单外。
+// allowed 为 normalize 后的模型名集合（warmupSelectModels 输出归一化）。
+//
+// 为什么必须过滤：冷却监听覆盖「所有账号 × 所有模型」，而 warmup 只触发名单内
+// （价格上限/显式指定）的模型 —— 名单外模型的冷却恢复与本功能无关，唤醒只会
+// 空跑一轮并发一条无意义通知（实测 v1.27.3 本机 7/7 次恢复全属此类）。
+func warmupRecoveredInScope(recovered []string, allowed map[string]bool) []string {
+	out := make([]string, 0, len(recovered))
+	for _, key := range recovered {
+		idx := strings.Index(key, "|")
+		if idx < 0 || idx+1 >= len(key) {
+			// 账号级冷却恢复：无模型部分，不作为唤醒依据。
+			continue
+		}
+		if allowed[normalizeModelName(key[idx+1:])] {
+			out = append(out, key)
+		}
+	}
+	return out
+}
+
 // warmupCooldownWatchLoop 监听模型冷却：一旦发现某个「账号|模型」从冷却中恢复，
 // 且当前处于允许触发的时段内，立即补触发一轮（按最小间隔节流，防抖动刷屏）。
 //
@@ -1054,19 +1113,37 @@ func warmupCooldownWatchLoop() {
 		if len(recovered) == 0 {
 			continue
 		}
+		// 只认 warmup 触发名单内模型的恢复：名单外模型（如日常业务高频使用、
+		// 但不在价格上限内的模型）的冷却恢复，唤醒后必然没有待触发项，只会
+		// 空跑一轮并发无意义通知 —— 此处只记日志，不唤醒。
+		allowed := map[string]bool{}
+		for _, m := range warmupSelectModels(rt, now) {
+			allowed[normalizeModelName(m)] = true
+		}
+		inScope := warmupRecoveredInScope(recovered, allowed)
+		if len(inScope) == 0 {
+			sort.Strings(recovered)
+			shown := recovered
+			if len(shown) > 8 {
+				shown = shown[:8]
+			}
+			log.Printf("[Warmup] 冷却恢复 %d 项均不在触发名单内，忽略（%s）",
+				len(recovered), strings.Join(shown, ", "))
+			continue
+		}
 		minGap := time.Duration(rt.CooldownTriggerMinMinutes) * time.Minute
 		if minGap > 0 && now.Sub(lastTrigger) < minGap {
 			continue
 		}
-		sort.Strings(recovered)
-		shown := recovered
+		sort.Strings(inScope)
+		shown := inScope
 		if len(shown) > 8 {
 			shown = shown[:8]
 		}
 		log.Printf("[Warmup] 检测到冷却恢复（%d 项：%s），立即触发一轮（最小间隔 %v）",
-			len(recovered), strings.Join(shown, ", "), minGap)
+			len(inScope), strings.Join(shown, ", "), minGap)
 		lastTrigger = now
-		setWarmupWakeReason("cooldown")
+		setWarmupWake("cooldown", inScope)
 		requestWarmupRun()
 	}
 }
@@ -1192,7 +1269,7 @@ func archiveCycle(rt warmupRuntime, cy *warmupCycle, now time.Time) {
 	log.Printf("[Warmup] %s 周期补触发窗口结束：成功=%d，失败=%d，跳过=%d，已归档",
 		cy.Date, ok, failed, skipped+pending)
 	if rt.Notify {
-		sendWarmupNotify(rt, ok, failed+pending, skipped, "scheduled")
+		sendWarmupNotify(rt, ok, failed+pending, skipped, "scheduled", nil)
 	}
 }
 
@@ -1223,9 +1300,9 @@ type warmupStatusResponse struct {
 	// CooldownTriggerMinMinutes 冷却恢复触发的最小间隔（分钟）。
 	CooldownTriggerMinMinutes int `json:"cooldownTriggerMinMinutes"`
 
-	Cycle *warmupCycle         `json:"cycle,omitempty"`
-	History []warmupHistoryEntry `json:"history,omitempty"`
-	Selected []string           `json:"selected,omitempty"`
+	Cycle    *warmupCycle         `json:"cycle,omitempty"`
+	History  []warmupHistoryEntry `json:"history,omitempty"`
+	Selected []string             `json:"selected,omitempty"`
 }
 
 // windowsToStrings 把时段结构转回配置里的字符串形式，供状态展示。
@@ -1245,18 +1322,18 @@ func warmupStatusNow() warmupStatusResponse {
 	pr := probeScheduleSnapshot()
 	now := time.Now()
 	resp := warmupStatusResponse{
-		Enabled:      rt.Enabled,
-		Time:         rt.Time,
-		MaxPrice:     rt.MaxPrice,
-		Models:       rt.Models,
-		CatchUpHours: rt.CatchUpHours,
-		RetryMinutes: rt.RetryMinutes,
-		Notify:       rt.Notify,
-		TZ:           warmupLocation().String(),
-		ProbeEnabled: pr.Enabled,
-		ProbeFollowWarmup: pr.FollowWarmup,
-		ProbeTime:    pr.Time,
-		ProbeNotify:  pr.Notify,
+		Enabled:                   rt.Enabled,
+		Time:                      rt.Time,
+		MaxPrice:                  rt.MaxPrice,
+		Models:                    rt.Models,
+		CatchUpHours:              rt.CatchUpHours,
+		RetryMinutes:              rt.RetryMinutes,
+		Notify:                    rt.Notify,
+		TZ:                        warmupLocation().String(),
+		ProbeEnabled:              pr.Enabled,
+		ProbeFollowWarmup:         pr.FollowWarmup,
+		ProbeTime:                 pr.Time,
+		ProbeNotify:               pr.Notify,
 		Windows:                   windowsToStrings(rt.Windows),
 		CooldownTrigger:           rt.CooldownTrigger,
 		CooldownTriggerMinMinutes: rt.CooldownTriggerMinMinutes,

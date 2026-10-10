@@ -626,3 +626,56 @@ func TestWarmupNoCooldownWakeKeepsSilent(t *testing.T) {
 		// 预期：静默
 	}
 }
+
+// TestWarmupRecoveredInScope 冷却恢复项过滤：只有「warmup 触发名单内」的模型
+// 恢复才允许唤醒 —— 名单外模型（日常业务高频使用、不在价格上限内）的恢复
+// 唤醒后必然无待触发项，只会空跑并发无意义通知（v1.27.3 本机 7/7 次全属此类）。
+func TestWarmupRecoveredInScope(t *testing.T) {
+	allowed := map[string]bool{"hy3": true, "hunyuan-2.0-instruct": true}
+	got := warmupRecoveredInScope([]string{
+		"workbuddy-131.json|hy4-preview",         // 名单外：忽略
+		"workbuddy-de.json|hy4-preview-f",        // 名单外：忽略
+		"workbuddy-131.json|HY3",                 // 大小写不同：normalize 后应命中
+		"workbuddy-18.json|hunyuan-2.0-instruct", // 名单内：保留
+		"workbuddy-18.json|",                     // 账号级冷却：无模型部分，忽略
+		"workbuddy-18.json",                      // 无分隔符：忽略
+	}, allowed)
+	want := []string{"workbuddy-131.json|HY3", "workbuddy-18.json|hunyuan-2.0-instruct"}
+	if len(got) != len(want) {
+		t.Fatalf("名单内恢复项应恰为 %v，实际=%v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("名单内恢复项应恰为 %v，实际=%v", want, got)
+		}
+	}
+	if got := warmupRecoveredInScope(nil, allowed); len(got) != 0 {
+		t.Fatalf("空恢复项应返回空切片，实际=%v", got)
+	}
+}
+
+// TestWarmupWakeCarriesRecovered setWarmupWake/takeWarmupRecovered 的存取闭环：
+// 取走即清空；兼容入口 setWarmupWakeReason 不携带恢复项。
+func TestWarmupWakeCarriesRecovered(t *testing.T) {
+	resetWarmupStateT(t)
+	takeWarmupWakeReason() // 清干净，避免用例间污染
+
+	if got := takeWarmupRecovered(); len(got) != 0 {
+		t.Fatalf("初始状态恢复项应为空，实际=%v", got)
+	}
+	setWarmupWake("cooldown", []string{"workbuddy-131.json|hy3"})
+	if got := takeWarmupWakeReason(); got != "cooldown" {
+		t.Fatalf("reason 应为 cooldown，实际=%q", got)
+	}
+	rec := takeWarmupRecovered()
+	if len(rec) != 1 || rec[0] != "workbuddy-131.json|hy3" {
+		t.Fatalf("恢复项应恰为 1 项 hy3，实际=%v", rec)
+	}
+	if got := takeWarmupRecovered(); len(got) != 0 {
+		t.Fatalf("取走后应清空，实际=%v", got)
+	}
+	setWarmupWakeReason("cooldown")
+	if got := takeWarmupRecovered(); len(got) != 0 {
+		t.Fatalf("兼容入口不应携带恢复项，实际=%v", got)
+	}
+}
