@@ -861,6 +861,24 @@ const probeSummaryDelay = 30 * time.Minute
 // 02:11 重启后 03:11 的通知只报了重启后探到的 1 个）。落盘后按自然日恢复。
 const probeDailyFile = "wb-probe-daily.json"
 
+// probeVerdictTotals 统计目录内已确认的价格结论总数（free / paid）。
+//
+// 用途：「每日探测汇总」只报当日新探到的结论，若不给「当前已知」对照，
+// 读者容易把「免费 N」误读成全平台免费模型总数（2026-10-10 主人即如此理解）。
+func probeVerdictTotals() (free, paid int) {
+	modelsMu.RLock()
+	defer modelsMu.RUnlock()
+	for _, p := range modelProbes {
+		switch p.Verdict {
+		case "free":
+			free++
+		case "paid":
+			paid++
+		}
+	}
+	return free, paid
+}
+
 // probeDailyPersist 是落盘结构：跨重启恢复当日汇总计数。
 type probeDailyPersist struct {
 	Date   string   `json:"date"` // 计划日期（配置时区自然日），不匹配则忽略
@@ -987,19 +1005,43 @@ func maybeSendProbeDailyNotify(now time.Time) {
 	probeDailySent = true
 	probeDailyMu.Unlock()
 
-	title := "🔍 workbuddy 模型探测结果"
+	// 文案口径（2026-10-10）：只给「免费 N」会被读作全平台免费模型总数。
+	// 标题与取值行都显式标注「当日新增」，并附「当前已知」累计对照。
+	title := "🔍 workbuddy 模型探测结果（当日新增）"
 	date := cycleDateOf(now)
-	body := fmt.Sprintf("探测日期: %s\n免费: %d\n收费: %d\n未判定: %d", date, free, paid, other)
+	totFree, totPaid := probeVerdictTotals()
+	newLine := fmt.Sprintf("免费 %d / 收费 %d / 未判定 %d", free, paid, other)
+	knownLine := fmt.Sprintf("免费 %d / 收费 %d", totFree, totPaid)
+
+	body := fmt.Sprintf("探测日期: %s\n当日新增: %s\n当前已知(累计): %s", date, newLine, knownLine)
 	if len(models) > 0 {
 		body += "\n明细:\n  " + strings.Join(models, "\n  ")
 	}
+	body += "\n口径: 「当日新增」为今天新探测出的价格结论；" +
+		"「当前已知」为目录内已确认的判断总数，两者不是同一个数"
+
+	var b strings.Builder
+	b.WriteString(tgTitle(title))
+	b.WriteString(tgKV("探测日期", date))
+	b.WriteString(tgKV("当日新增", newLine))
+	b.WriteString(tgKV("当前已知", knownLine))
+	tgSection(&b, "明细")
+	if len(models) == 0 {
+		b.WriteString("（无）\n")
+	} else {
+		for _, m := range models {
+			b.WriteString(tgEntry(m) + "\n")
+		}
+	}
+	b.WriteString(tgKV("口径", "当日新增=今天新探出的结论；当前已知=目录内已确认总数"))
+
 	sendNotify(notifyEvent{
 		Kind:  notifyEventProbe,
 		Key:   "probe|" + date,
 		Level: "info",
 		Title: title,
 		Body:  body,
-		HTML:  tgTitle(title) + tgKV("探测日期", date) + tgKV("免费", fmt.Sprint(free)) + tgKV("收费", fmt.Sprint(paid)) + tgKV("未判定", fmt.Sprint(other)),
+		HTML:  b.String(),
 	})
 }
 
