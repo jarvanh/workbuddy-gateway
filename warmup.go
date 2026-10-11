@@ -726,7 +726,7 @@ func runWarmupOnce(rt warmupRuntime, now time.Time) (ok, failed, skipped, pendin
 		// 「本轮没触发任何模型」还是「当天真的全部为零」；正文同时写明恢复项。
 		if rt.Notify && reason == "cooldown" {
 			cok, cfail, cskip, _, _ := countCycle(cy)
-			sendWarmupNotify(rt, cok, cfail, cskip, reason, recoveredKeys)
+			sendWarmupNotify(rt, cok, cfail, cskip, reason, recoveredKeys, cy)
 		}
 		return countCycle(cy)
 	}
@@ -759,6 +759,8 @@ func runWarmupOnce(rt warmupRuntime, now time.Time) (ok, failed, skipped, pendin
 		ok, failed, skipped, pending, _ = countCycleLocked(st.Current)
 		if pending == 0 {
 			st.Current.CompletedAt = time.Now().Unix()
+			// 正常跑完也要归档：否则 history 只剩超窗未完成的异常日。
+			appendCycleHistoryLocked(st)
 		}
 		saveWarmupStateLocked(st)
 	}
@@ -767,7 +769,7 @@ func runWarmupOnce(rt warmupRuntime, now time.Time) (ok, failed, skipped, pendin
 	log.Printf("[Warmup] 第 %d 轮结束：成功=%d，失败=%d，跳过=%d，待补触发=%d",
 		cy.Attempts, ok, failed, skipped, pending)
 	if rt.Notify && pending == 0 {
-		sendWarmupNotify(rt, ok, failed, skipped, reason, recoveredKeys)
+		sendWarmupNotify(rt, ok, failed, skipped, reason, recoveredKeys, st.Current)
 	}
 	return ok, failed, skipped, pending, catchUp
 }
@@ -793,6 +795,40 @@ func countCycleLocked(cy *warmupCycle) (ok, failed, skipped, pending int, catchU
 	return
 }
 
+// appendCycleHistoryLocked 把当前周期结果追加进 history（最新在前，按上限截断）。
+//
+// 背景（2026-10-11）：history 原先只在 archiveCycle 写入，而 archiveCycle 仅在
+// 「超出补触发窗口且当天未完成」时触发 —— 正常跑完的周期（CompletedAt 已置位）
+// 永远不会归档，于是 history 只留下异常日的记录，跑得越正常反而越空
+// （实测 10-03 起每天都有 warmup 日志，history 却空了 8 天）。
+// 现在周期真正跑完（pending 归零）时即归档，archiveCycle 只兜底未完成的日子。
+// 同一天只记一条：冷却恢复唤醒可能重复进入完成分支，不能重复追加。
+// caller 需持有 warmupStateMu。
+func appendCycleHistoryLocked(st *warmupState) {
+	cy := st.Current
+	if cy == nil {
+		return
+	}
+	for _, h := range st.History {
+		if h.Date == cy.Date {
+			return
+		}
+	}
+	ok, failed, skipped, pending, catchUp := countCycleLocked(cy)
+	st.History = append([]warmupHistoryEntry{{
+		Date:        cy.Date,
+		ScheduledAt: cy.ScheduledAt,
+		OK:          ok,
+		Failed:      failed,
+		Skipped:     skipped + pending,
+		CompletedAt: cy.CompletedAt,
+		CatchUp:     catchUp,
+	}}, st.History...)
+	if len(st.History) > warmupHistoryLimit {
+		st.History = st.History[:warmupHistoryLimit]
+	}
+}
+
 // modelDisplayName 从模型目录取回原始大小写的模型名；取不到就用归一化的名字。
 func modelDisplayName(key string) string {
 	ids, _ := mergedModelIDs()
@@ -804,10 +840,111 @@ func modelDisplayName(key string) string {
 	return key
 }
 
+// warmupStatusRank 明细排序权重：失败最需要被看见，排最前。
+func warmupStatusRank(status string) int {
+	switch status {
+	case "failed":
+		return 0
+	case "pending":
+		return 1
+	case "skipped":
+		return 2
+	case "ok":
+		return 3
+	}
+	return 4
+}
+
+// warmupStatusLabel 状态 → 「图标 + 中文」短标签。
+func warmupStatusLabel(status string) string {
+	switch status {
+	case "ok":
+		return "✅ 成功"
+	case "failed":
+		return "❌ 失败"
+	case "skipped":
+		return "⏭ 跳过"
+	case "pending":
+		return "⏳ 待补触发"
+	}
+	return "？ " + status
+}
+
+// shortAccountName 账号文件名 → 短名（workbuddy-131.json → 131），便于通知排版。
+func shortAccountName(acc string) string {
+	s := strings.TrimSuffix(acc, ".json")
+	s = strings.TrimPrefix(s, "workbuddy-")
+	if s == "" {
+		return acc
+	}
+	return s
+}
+
+// truncateRunes 按字符截断并加省略号（通知排版用，避免单行过长）。
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
+}
+
+// warmupModelBrief 明细列文案：失败给原因（最需要解释），成功给计费结论。
+func warmupModelBrief(ms *warmupModelState) string {
+	if ms.Status == "failed" {
+		if ms.Detail == "" {
+			return "原因未记录"
+		}
+		return truncateRunes(ms.Detail, 42)
+	}
+	switch ms.Verdict {
+	case "free":
+		return "免费"
+	case "paid":
+		return "收费"
+	}
+	if ms.Detail != "" {
+		return truncateRunes(ms.Detail, 42)
+	}
+	return "—"
+}
+
+// warmupModelEntries 本周期各模型明细条目（失败在前，其次待补触发/跳过/成功，同档按模型名）。
+//
+// 背景（2026-10-11 主人指出）：通知只给「成功 5 / 失败 1」两个计数，
+// 看不出到底哪个模型失败、为什么 —— 计数回答不了的问题，明细才能回答。
+func warmupModelEntries(cy *warmupCycle) []string {
+	if cy == nil || len(cy.Models) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(cy.Models))
+	for k := range cy.Models {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		ri, rj := warmupStatusRank(cy.Models[keys[i]].Status), warmupStatusRank(cy.Models[keys[j]].Status)
+		if ri != rj {
+			return ri < rj
+		}
+		return keys[i] < keys[j]
+	})
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		ms := cy.Models[k]
+		loc := ""
+		if ms.Site != "" || ms.Account != "" {
+			loc = ms.Site + "/" + shortAccountName(ms.Account)
+		}
+		out = append(out, tgEntry(modelDisplayName(k), warmupStatusLabel(ms.Status), loc, warmupModelBrief(ms)))
+	}
+	return out
+}
+
 // sendWarmupNotify 一轮结束后推送结果（复用 notify 通道）。
 // reason 区分触发来源（scheduled 定时 / cooldown 冷却恢复 / manual 手动），
 // 三者的标题与去重键必须不同，否则主人分不清是哪一路触发的。
-func sendWarmupNotify(rt warmupRuntime, ok, failed, skipped int, reason string, recovered []string) {
+// cy 为当天周期（可为 nil），用于拼出 per-model 明细块。
+func sendWarmupNotify(rt warmupRuntime, ok, failed, skipped int, reason string, recovered []string, cy *warmupCycle) {
 	now := time.Now()
 	var title, keyPrefix string
 	switch reason {
@@ -824,6 +961,7 @@ func sendWarmupNotify(rt warmupRuntime, ok, failed, skipped int, reason string, 
 		}
 		keyPrefix = "warmup|"
 	}
+	entries := warmupModelEntries(cy)
 	body := fmt.Sprintf("触发时刻: %s\n价格上限: %s\n成功: %d\n失败: %d\n跳过: %d",
 		formatDisplayTime(now), formatQuota(rt.MaxPrice), ok, failed, skipped)
 	html := tgTitle(title) + tgKV("触发时刻", formatDisplayTime(now)) + tgKV("价格上限", formatQuota(rt.MaxPrice))
@@ -834,6 +972,15 @@ func sendWarmupNotify(rt warmupRuntime, ok, failed, skipped int, reason string, 
 		html += tgKV("恢复项", names)
 	}
 	html += tgKV("成功", fmt.Sprint(ok)) + tgKV("失败", fmt.Sprint(failed)) + tgKV("跳过", fmt.Sprint(skipped))
+	// per-model 明细块：计数说不清「谁失败、为什么」，明细才说得清。
+	if len(entries) > 0 {
+		body += "\n本周期明细:\n  " + strings.Join(entries, "\n  ")
+		var sb strings.Builder
+		sb.WriteString(html)
+		tgSection(&sb, "本周期明细")
+		sb.WriteString(treeLines(entries) + "\n")
+		html = sb.String()
+	}
 	sendNotify(notifyEvent{
 		Kind: notifyEventWarmup,
 		// 定时与冷却恢复分开去重：冷却恢复一天可能多次，不能共用同一把锁。
@@ -1462,22 +1609,16 @@ func archiveCycle(rt warmupRuntime, cy *warmupCycle, now time.Time) {
 		}
 	}
 	st.Current.CompletedAt = now.Unix()
-	ok, failed, skipped, pending, catchUp := countCycleLocked(st.Current)
-	st.History = append([]warmupHistoryEntry{{
-		Date:        st.Current.Date,
-		ScheduledAt: st.Current.ScheduledAt,
-		OK:          ok, Failed: failed, Skipped: skipped + pending,
-		CompletedAt: now.Unix(), CatchUp: catchUp,
-	}}, st.History...)
-	if len(st.History) > warmupHistoryLimit {
-		st.History = st.History[:warmupHistoryLimit]
-	}
+	ok, failed, skipped, pending, _ := countCycleLocked(st.Current)
+	// 留引用给通知明细：pending 已就地改判为 failed，st.Current 即将置 nil。
+	archived := st.Current
+	appendCycleHistoryLocked(st)
 	st.Current = nil
 	saveWarmupStateLocked(st)
 	log.Printf("[Warmup] %s 周期补触发窗口结束：成功=%d，失败=%d，跳过=%d，已归档",
 		cy.Date, ok, failed, skipped+pending)
 	if rt.Notify {
-		sendWarmupNotify(rt, ok, failed+pending, skipped, "scheduled", nil)
+		sendWarmupNotify(rt, ok, failed+pending, skipped, "scheduled", nil, archived)
 	}
 }
 
