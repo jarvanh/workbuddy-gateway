@@ -759,3 +759,82 @@ func removeIfExists(path string) error {
 	}
 	return nil
 }
+
+// TestWarmupModelEntriesFailedFirst 明细条目必须把失败项排最前，并给出失败原因。
+//
+// 背景（2026-10-11 主人指出）：通知只给「成功 5 / 失败 1」，看不出到底哪个模型
+// 失败、为什么 —— 明细块的首要职责就是让失败项一眼可见。
+func TestWarmupModelEntriesFailedFirst(t *testing.T) {
+	cy := &warmupCycle{Date: "2026-10-11", Models: map[string]*warmupModelState{
+		"hy3":                  {Status: "ok", Site: "cn", Account: "workbuddy-131.json", Verdict: "free"},
+		"hunyuan-2.0-instruct": {Status: "failed", Site: "intl", Account: "workbuddy-18.json", Detail: "6004 模型限流"},
+		"glm-5.3-flash":        {Status: "ok", Site: "intl", Account: "workbuddy-18.json", Verdict: "free"},
+	}}
+	entries := warmupModelEntries(cy)
+	if len(entries) != 3 {
+		t.Fatalf("明细条目数不符: %d", len(entries))
+	}
+	if !strings.Contains(entries[0], "hunyuan-2.0-instruct") {
+		t.Fatalf("失败项未排在最前: %s", entries[0])
+	}
+	if !strings.Contains(entries[0], "❌") || !strings.Contains(entries[0], "6004 模型限流") {
+		t.Fatalf("失败项缺少状态或原因: %s", entries[0])
+	}
+	// 账号长名应缩写，避免通知行过长。
+	if strings.Contains(entries[0], "workbuddy-18.json") {
+		t.Fatalf("账号名未缩写: %s", entries[0])
+	}
+	if !strings.Contains(entries[0], "intl/18") {
+		t.Fatalf("站点/账号缺失: %s", entries[0])
+	}
+}
+
+// TestWarmupModelEntriesNilSafe 无周期或无模型时不应 panic、也不应产出空明细块。
+func TestWarmupModelEntriesNilSafe(t *testing.T) {
+	if got := warmupModelEntries(nil); got != nil {
+		t.Fatalf("nil 周期应返回 nil，实际 %v", got)
+	}
+	if got := warmupModelEntries(&warmupCycle{}); got != nil {
+		t.Fatalf("空模型表应返回 nil，实际 %v", got)
+	}
+}
+
+// TestAppendCycleHistoryOnNormalCompletion 正常跑完的周期也必须归档进 history。
+//
+// 背景（2026-10-11）：archiveCycle 只在「超出补触发窗口且未完成」时触发，
+// 正常跑完（CompletedAt 已置位）的周期永不归档 —— 实测 10-03 起每天都有
+// warmup 日志，history 却空了 8 天。本测试钉住这个回归。
+func TestAppendCycleHistoryOnNormalCompletion(t *testing.T) {
+	st := &warmupState{Schema: warmupStateSchema}
+	st.Current = &warmupCycle{
+		Date:        "2026-10-11",
+		ScheduledAt: 1791662400,
+		StartedAt:   1791662401,
+		CompletedAt: 1791663636,
+		Models: map[string]*warmupModelState{
+			"hy3":                  {Status: "ok"},
+			"hunyuan-2.0-instruct": {Status: "failed"},
+		},
+	}
+	appendCycleHistoryLocked(st)
+	if len(st.History) != 1 {
+		t.Fatalf("正常完成未归档 history: %d 条", len(st.History))
+	}
+	h := st.History[0]
+	if h.Date != "2026-10-11" || h.OK != 1 || h.Failed != 1 {
+		t.Fatalf("归档计数不符: %+v", h)
+	}
+	// 重复进入完成分支（冷却恢复唤醒）不得重复追加。
+	appendCycleHistoryLocked(st)
+	if len(st.History) != 1 {
+		t.Fatalf("同一天重复归档: %d 条", len(st.History))
+	}
+	// 不同日期应各自归档，最新在前。
+	st.Current = &warmupCycle{Date: "2026-10-12", ScheduledAt: 1791748800, Models: map[string]*warmupModelState{
+		"hy3": {Status: "ok"},
+	}}
+	appendCycleHistoryLocked(st)
+	if len(st.History) != 2 || st.History[0].Date != "2026-10-12" {
+		t.Fatalf("新一天未归档或未置顶: %+v", st.History)
+	}
+}
