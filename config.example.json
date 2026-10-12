@@ -10,15 +10,18 @@
     "fallback": "",
     "force": ""
   },
+  "debug": {
+    "enabled": false
+  },
   "log": {
     "dir": "logs",
     "keepDays": 7
   },
+  "logs": {
+    "retentionDays": 0
+  },
   "data": {
     "dir": ""
-  },
-  "debug": {
-    "enabled": false
   },
   "upstream": {
     "headerTimeoutSeconds": 300,
@@ -28,8 +31,12 @@
   },
   "models": {
     "blocklist": [],
-    "allowlist": [],
-    "accounts": {}
+    "accounts": {
+      "all": {
+        "allowlist": [],
+        "blocklist": []
+      }
+    }
   },
   "routing": {
     "tz": "Asia/Shanghai",

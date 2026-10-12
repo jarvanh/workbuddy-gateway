@@ -10,7 +10,13 @@
     lastStatus: null,
     timer: null,
     refreshPending: false,
-    settings: null
+    settings: null,
+    togglePending: false,
+    policyVersion: 0,
+    logSettings: null,
+    logSettingsVersion: 0,
+    settingsLoadVersion: 0,
+    tasksLastPoll: 0
   };
 
   function $(id) { return document.getElementById(id); }
@@ -79,13 +85,14 @@
   }
 
   function lockDashboard() {
+    state.tasksLastPoll = 0;
     $("tabs").classList.add("hidden");
     $("dashboard").classList.add("hidden");
     state.lastStatus = null;
-    ["meta", "summaryCards", "siteSummary", "gatewayInfo", "logBox", "configBox"].forEach(function (id) {
+    ["meta", "summaryCards", "siteSummary", "gatewayInfo", "logBox", "configBox", "tasksInfo"].forEach(function (id) {
       $(id).textContent = "";
     });
-    ["accountsTable", "modelsTable", "credentialsTable"].forEach(function (id) {
+    ["accountsTable", "modelsTable", "tasksTable"].forEach(function (id) {
       $(id).querySelector("tbody").innerHTML = "";
     });
   }
@@ -144,7 +151,8 @@
     ["冷却", "cooldown", "warn"],
     ["付费耗尽", "paidExhausted", "warn"],
     ["已过期", "expired", "warn"],
-    ["失效", "disabled", "danger"]
+    ["失效", "disabled", "danger"],
+    ["已停用", "paused", "warn"]
   ];
 
   function metricCards(s) {
@@ -185,7 +193,7 @@
     $("gatewayInfo").innerHTML = kvRow("版本", g.version) +
       kvRow("监听地址", g.listen) +
       kvRow("API 鉴权", g.apiKeyEnabled ? "已启用" : "未启用") +
-      kvRow("只读管理台", g.webuiEnabled ? "已启用" : "未启用") +
+      kvRow("管理台", g.webuiEnabled ? "已启用" : "未启用") +
       kvRow("模型来源", g.modelSource || "unavailable") +
       kvRow("快照更新", fmtTime(data.updatedAt));
 
@@ -208,16 +216,22 @@
 
   function renderAccounts(list) {
     var tb = $("accountsTable").querySelector("tbody");
+    var focusTarget = focusedPolicyTarget(tb);
     if (!list.length) {
-      tb.innerHTML = '<tr><td colspan="15" class="empty">暂无账号数据（服务是否已写入状态快照？）</td></tr>';
+      tb.innerHTML = '<tr><td colspan="16" class="empty">暂无账号数据（服务是否已写入状态快照？）</td></tr>';
       return;
     }
     tb.innerHTML = list.map(function (a, i) {
       var st = STATE_TEXT[a.state] || a.state || "-";
       var cls = STATE_CLASS[a.state] || "";
+      if (a.schedulingEnabled === false) {
+        st = a.state === "active" ? "已停用" : "已停用 · " + st;
+        cls = "warn";
+      }
       var site = a.edition === "intl" ? "国际站" : "国内站";
       return "<tr>" +
         "<td>" + (i + 1) + "</td>" +
+        "<td>" + policySwitch("account", a.path, a.schedulingEnabled !== false, a.schedulingReason) + "</td>" +
         "<td class='mono'>" + esc(a.path) + "</td>" +
         "<td>" + esc(a.nickname || "-") + "</td>" +
         "<td>" + esc(site) + "</td>" +
@@ -234,9 +248,57 @@
         "<td>" + esc(count(a.refreshFailCount)) + "</td>" +
         "</tr>";
     }).join("");
+    restorePolicyFocus(tb, focusTarget);
   }
 
   // ---- 渲染：模型 --------------------------------------------------------
+  function focusedPolicyTarget(table) {
+    var element = document.activeElement;
+    return element && table.contains(element) && element.classList.contains("policy-switch") ?
+      element.getAttribute("data-target") : null;
+  }
+
+  function restorePolicyFocus(table, target) {
+    if (target === null) return;
+    table.querySelectorAll(".policy-switch").forEach(function (button) {
+      if (button.getAttribute("data-target") === target) button.focus({preventScroll: true});
+    });
+  }
+
+  function policySwitch(kind, target, enabled, reason) {
+    return '<button type="button" role="switch" class="policy-switch" data-kind="' + esc(kind) +
+      '" data-target="' + esc(target) + '" aria-checked="' + enabled + '" aria-label="' +
+      esc((kind === "account" ? "账号 " : "模型 ") + target + " 调度开关") +
+      '" title="' + esc(reason || (enabled ? "允许调度" : "已停用")) + '"' +
+      (state.togglePending ? " disabled" : "") + '><span class="switch-track" aria-hidden="true"></span>' +
+      (enabled ? "已开启" : "已停用") + '</button>';
+  }
+
+  function togglePolicy(event) {
+    var button = event.target.closest("button.policy-switch");
+    if (!button || state.togglePending || !state.apiKey) return;
+    var kind = button.getAttribute("data-kind");
+    var target = button.getAttribute("data-target");
+    var enabled = button.getAttribute("aria-checked") !== "true";
+    var endpoint = "/admin/api/" + kind + "-toggle";
+    state.togglePending = true;
+    state.policyVersion++;
+    document.querySelectorAll(".policy-switch").forEach(function (b) { b.disabled = true; });
+    return api(endpoint, {method: "POST", body: {target: target, enabled: enabled}})
+      .then(function () {
+        // 保存成功才修改控件，不将失败伪装成已生效。
+        button.setAttribute("aria-checked", String(enabled));
+        button.lastChild.textContent = enabled ? "已开启" : "已停用";
+        showAlert("已写入 config.json，" + (kind === "account" ? "账号全局调度" : "模型") +
+          (enabled ? "已开启。" : "已停用。") + "已有请求不被中断。", true);
+      }).catch(function () {}).then(function () {
+        state.togglePending = false;
+        state.policyVersion++;
+        document.querySelectorAll(".policy-switch").forEach(function (b) { b.disabled = false; });
+        refreshActive();
+      });
+  }
+
   function renderModels(data) {
     var list = data.models || [];
     var onlyUsable = $("onlyUsable").checked;
@@ -244,12 +306,17 @@
       list = list.filter(function (m) { return (m.availableAccounts || 0) > 0; });
     }
     var tb = $("modelsTable").querySelector("tbody");
+    var focusTarget = focusedPolicyTarget(tb);
+    $("modelPolicyHint").textContent = data.policyMode === "allowlist" ?
+      "当前使用模型白名单，开关反映白名单规则。首次修改开关会删除 models.allowlist，将当前模型列表的启停状态转为 models.blocklist；以后新增模型默认开启。" :
+      "模型开关写入 models.blocklist 并立即生效；停用模型仍保留在此列表，客户端模型目录会隐藏停用项。";
     if (!list.length) {
-      tb.innerHTML = '<tr><td colspan="9" class="empty">暂无模型数据</td></tr>';
+      tb.innerHTML = '<tr><td colspan="10" class="empty">暂无模型数据</td></tr>';
       return;
     }
     tb.innerHTML = list.map(function (m) {
       return "<tr>" +
+        "<td>" + policySwitch("model", m.id, m.enabled !== false, m.policyReason) + "</td>" +
         "<td class='mono'>" + esc(m.id) + "</td>" +
         "<td>" + esc(m.cnMultiplier || "-") + "</td>" +
         "<td>" + esc(m.intlMultiplier || "-") + "</td>" +
@@ -261,6 +328,7 @@
         "<td>" + esc(m.lastStatus || "-") + "</td>" +
         "</tr>";
     }).join("");
+    restorePolicyFocus(tb, focusTarget);
     if (data.stale) showAlert("模型统计快照过旧，当前展示的是上次数据。");
   }
 
@@ -284,6 +352,7 @@
       if (data.truncated) showAlert("日志达到管理界面的读取预算，只展示完整尾部行；超长单行被省略。原日志文件未修改。");
     }).catch(function () {
       // api 已显示错误，保留上次日志，不把读取失败伪装成空数据。
+      if (!initial && file) return loadLogs(true); // 当前文件被自动清理时重新选择现有日志。
     });
   }
 
@@ -292,69 +361,86 @@
     return api("/admin/api/config").then(function (data) {
       var box = $("configBox");
       if (!data.exists) { box.textContent = "未找到 " + (data.path || "config.json"); return; }
-      box.textContent = $("maskHints").checked ? maskSystemPrompt(data.content) : data.content;
+      box.textContent = data.content;
     }).catch(function () {
       // 保留上次内容。
     });
   }
 
-  // maskSystemPrompt 隐藏 systemPrompt 正文字符数，避免把提示词内容展示在浏览器里。
-  function maskSystemPrompt(text) {
-    try {
-      var obj = JSON.parse(text);
-      if (obj && obj.systemPrompt && typeof obj.systemPrompt === "object") {
-        ["fallback", "force"].forEach(function (k) {
-          if (typeof obj.systemPrompt[k] === "string" && obj.systemPrompt[k].trim() !== "") {
-            obj.systemPrompt[k] = "（已隐藏，长度 " + obj.systemPrompt[k].length + " 字符）";
-          }
-        });
-      }
-      return JSON.stringify(obj, null, 2);
-    } catch (e) {
-      return text;
-    }
+  function renderTasks(data) {
+    var labels = {success: "成功", failed: "失败", partial: "部分失败", cancelled: "已取消",
+      skipped: "跳过", running: "执行中", disabled: "未启用", unknown: "无执行记录"};
+    var classes = {success: "ok", failed: "danger", partial: "warn", cancelled: "warn", running: "warn"};
+    $("tasksInfo").textContent = "服务器日志时区：" + (data.timezone || "-") + "（表内时间按浏览器时区显示） · 刷新 " + fmtTime(data.generatedAt) +
+      (data.truncated ? " · 日志扫描达到预算，缺失记录不代表未执行。" : " · 执行记录以日志为准。");
+    $("tasksTable").querySelector("tbody").innerHTML = (data.tasks || []).map(function (task) {
+      var next = task.nextRunAt ? fmtTime(task.nextRunAt) + (task.nextEstimated ? "（推算）" : "") :
+        (!task.enabled ? "未启用" : task.oneShot && task.lastFinishedAt ? "本次启动已完成" : "等待调度日志");
+      return "<tr><td data-label='任务'>" + esc(task.name) + "</td><td data-label='启用'>" + (task.enabled ? "开启" : "关闭") +
+        "</td><td data-label='执行周期' class='task-description'>" + esc(task.schedule) + "</td><td data-label='上次执行记录'>" + esc(fmtTime(task.lastRunAt)) +
+        "</td><td data-label='上次完成'>" + esc(fmtTime(task.lastFinishedAt)) + "</td><td data-label='执行结果'><span class='badge " +
+        (classes[task.status] || "") + "'>" + esc(labels[task.status] || "无执行记录") +
+        "</span></td><td data-label='下次预计执行'>" + esc(next) + "</td><td data-label='日志说明' class='task-description'>" + esc(task.detail || "当前服务尚无该任务日志，或日志已清理") +
+        (task.logFile ? "<br><span class='mono'>" + esc(task.logFile) + "</span>" : "") + "</td></tr>";
+    }).join("");
   }
 
-  // ---- 渲染：凭据 --------------------------------------------------------
-  function loadCredentials() {
-    return api("/admin/api/credentials").then(function (data) {
-      $("credHint").textContent = data.hint || "";
-      var tb = $("credentialsTable").querySelector("tbody");
-      var list = data.files || [];
-      if (!list.length) {
-        tb.innerHTML = '<tr><td colspan="10" class="empty">未发现凭据文件</td></tr>';
-        return;
-      }
-      tb.innerHTML = list.map(function (c) {
-        var site = c.edition === "intl" ? "国际站" : "国内站";
-        if (!c.exists) {
-          return "<tr><td class='mono'>" + esc(c.path) + "</td><td colspan='9' class='empty'>文件不存在</td></tr>";
-        }
-        if (c.error) {
-          return "<tr><td class='mono'>" + esc(c.path) + "</td><td colspan='9' class='empty'>" + esc(c.error) + "</td></tr>";
-        }
-        return "<tr>" +
-          "<td class='mono'>" + esc(c.path) + "</td>" +
-          "<td>" + esc(site) + "</td>" +
-          "<td>" + esc(c.nickname || "-") + "</td>" +
-          "<td class='mono'>" + esc(c.uid || "-") + "</td>" +
-          "<td>" + esc(c.domain || "-") + "</td>" +
-          "<td class='mono'>" + esc(c.accessTokenMasked || "-") + "</td>" +
-          "<td class='mono'>" + esc(c.refreshTokenMasked || "-") + "</td>" +
-          "<td>" + esc(fmtTime(c.expiresAt)) + "</td>" +
-          "<td>" + esc(fmtTime(c.refreshExpiresAt)) + "</td>" +
-          "<td>" + esc(fmtTime(c.lastRefreshTime)) + "</td>" +
-          "</tr>";
-      }).join("");
-    }).catch(function () {
-      // 保留上次内容；错误由常驻提示区展示。
+  function loadLogSettings() {
+    var version = ++state.logSettingsVersion;
+    $("logRetentionDays").disabled = true;
+    $("saveLogSettings").disabled = true;
+    $("cleanupLogs").disabled = true;
+    return api("/admin/api/log-settings").then(function (data) {
+      if (version !== state.logSettingsVersion) return;
+      state.logSettings = data;
+      $("logRetentionDays").value = data.retentionDays;
+    }).catch(function () {}).then(function () {
+      if (version !== state.logSettingsVersion) return;
+      $("logRetentionDays").disabled = false;
+      $("saveLogSettings").disabled = false;
+      $("cleanupLogs").disabled = false;
     });
+  }
+
+  function saveLogSettings() {
+    var days = Number($("logRetentionDays").value);
+    if ($("logRetentionDays").value.trim() === "" || !Number.isInteger(days) || days < 0 || days > 36500) {
+      showAlert("保留天数必须是 0～36500 的整数，0 表示保留全部。");
+      reportUIEvent("log_validation_failed", "/admin/api/log-settings", 0, traceID());
+      return;
+    }
+    if (days > 0 && !window.confirm("保存后会自动删除超出 " + days + " 天的项目日志，删除不可撤销。是否继续？")) return;
+    $("saveLogSettings").disabled = true;
+    return api("/admin/api/log-settings", {method: "POST", body: {retentionDays: days}})
+      .then(function (data) {
+        state.logSettings = data;
+        $("logCleanupResult").textContent = "已写入 config.json。保留天数：" + days + (days === 0 ? "（不自动清理）。" : " 天，自动清理已启用。");
+      }).catch(function () {}).then(function () { $("saveLogSettings").disabled = false; });
+  }
+
+  function cleanupExpiredLogs() {
+    var days = state.logSettings && state.logSettings.retentionDays;
+    if (!days) {
+      $("logCleanupResult").textContent = "当前配置保留全部，不会删除任何日志。请先保存正数保留天数。";
+      reportUIEvent("log_validation_failed", "/admin/api/log-cleanup", 0, traceID());
+      return;
+    }
+    if (!window.confirm("按已保存的 " + days + " 天保留规则删除过期项目日志，删除不可撤销。是否继续？")) return;
+    $("cleanupLogs").disabled = true;
+    return api("/admin/api/log-cleanup", {method: "POST", body: {}}).then(function (data) {
+      $("logCleanupResult").textContent = "已删除 " + data.deleted + " 个日志文件，回收 " + data.deletedBytes +
+        " 字节；跳过正在写入 " + data.skippedActive + " 个，失败 " + data.failed + " 个。";
+      loadLogs(true);
+    }).catch(function () {}).then(function () { $("cleanupLogs").disabled = false; });
   }
 
   // ---- 路由与轮询 --------------------------------------------------------
   function refreshActive() {
-    if (!state.apiKey || state.refreshPending) return Promise.resolve();
+    if (!state.apiKey || state.refreshPending || state.togglePending) return Promise.resolve();
+    if (state.activeTab === "tasks" && Date.now() - state.tasksLastPoll < 15000) return Promise.resolve();
+    if (state.activeTab === "tasks") state.tasksLastPoll = Date.now();
     state.refreshPending = true;
+    var policyVersion = state.policyVersion;
     var onErr = function () {
       if ($("conn").className.indexOf("danger") === -1) {
         setConn("连接失败", "danger");
@@ -362,16 +448,26 @@
     };
     var pending = Promise.resolve();
     if (state.activeTab === "overview" || state.activeTab === "accounts") {
-      pending = api("/admin/api/status").then(renderStatus).catch(onErr);
+      pending = api("/admin/api/status").then(function (data) {
+        if (!state.togglePending && policyVersion === state.policyVersion) renderStatus(data);
+      }).catch(onErr);
     } else if (state.activeTab === "models") {
-      pending = api("/admin/api/models").then(renderModels).catch(onErr);
+      pending = api("/admin/api/models").then(function (data) {
+        if (!state.togglePending && policyVersion === state.policyVersion) renderModels(data);
+      }).catch(onErr);
     } else if (state.activeTab === "logs") {
       pending = loadLogs(false);
+    } else if (state.activeTab === "tasks") {
+      pending = api("/admin/api/tasks").then(renderTasks).catch(onErr);
     }
-    return pending.then(function () { state.refreshPending = false; }, function () { state.refreshPending = false; });
+    return pending.then(function () {
+      state.refreshPending = false;
+      if (policyVersion !== state.policyVersion && !state.togglePending) return refreshActive();
+    }, function () { state.refreshPending = false; });
   }
 
   function setTab(name) {
+    if (name === "tasks") state.tasksLastPoll = 0;
     state.activeTab = name;
     Array.prototype.forEach.call(document.querySelectorAll(".tab"), function (t) {
       t.classList.toggle("active", t.getAttribute("data-tab") === name);
@@ -379,9 +475,8 @@
     Array.prototype.forEach.call(document.querySelectorAll(".panel"), function (p) {
       p.classList.toggle("active", p.id === "panel-" + name);
     });
-    if (name === "logs") loadLogs(true);
+    if (name === "logs") { loadLogs(true); loadLogSettings(); }
     else if (name === "config") loadConfig();
-    else if (name === "credentials") loadCredentials();
     else if (name === "settings") loadSettings();
     else refreshActive();
   }
@@ -393,10 +488,26 @@
     $("apiKeyState").textContent = data.apiKeyConfigured ? "已配置 API Key，留空将保留原值。" : "尚未配置 API Key。";
     $("apiPortValue").textContent = data.apiPort;
     $("webPortValue").textContent = data.webPort;
+    $("configuredApiPort").value = data.configuredApiPort || data.apiPort;
+    $("configuredWebPort").value = data.configuredWebPort || data.webPort;
+    $("portSettingsStatus").textContent = (data.restartRequired ? "端口配置已保存，待重启生效。 " :
+      "配置端口与实际监听一致。 ") + (data.apiPortOverridden ? "API 端口被启动参数 -port 覆盖，需调整该参数才能按配置启动。 " : "") +
+      "修改并保存后需重启网关，不会立即中断页面或请求。";
   }
 
   function loadSettings() {
-    return api("/admin/api/settings").then(renderSettings).catch(function () {});
+    var version = ++state.settingsLoadVersion;
+    setSettingsBusy(true);
+    return api("/admin/api/settings").then(function (data) {
+      if (version === state.settingsLoadVersion) renderSettings(data);
+    }).catch(function () {}).then(function () {
+      if (version === state.settingsLoadVersion) setSettingsBusy(false);
+    });
+  }
+
+  function setSettingsBusy(busy) {
+    ["apiKeyEnabled", "modelAPIKey", "configuredApiPort", "configuredWebPort", "saveAPISettings", "savePortSettings"]
+      .forEach(function (id) { $(id).disabled = busy; });
   }
 
   function saveAPISettings() {
@@ -407,12 +518,29 @@
       reportUIEvent("settings_validation_failed", "/admin/api/settings", 0, traceID());
       return;
     }
-    $("saveAPISettings").disabled = true;
+    setSettingsBusy(true);
     return api("/admin/api/settings", {method: "POST", body: {apiKeyEnabled: enabled, apiKey: key}})
       .then(function (data) {
         renderSettings(data);
         showAlert("已写入 config.json，API 鉴权设置立即生效；管理鉴权未改变。", true);
-      }).catch(function () {}).then(function () { $("saveAPISettings").disabled = false; });
+      }).catch(function () {}).then(function () { setSettingsBusy(false); });
+  }
+
+  function savePortSettings() {
+    var apiPort = Number($("configuredApiPort").value);
+    var webPort = Number($("configuredWebPort").value);
+    if (!Number.isInteger(apiPort) || !Number.isInteger(webPort) || apiPort < 1 || apiPort > 65535 ||
+      webPort < 1 || webPort > 65535 || apiPort === webPort) {
+      showAlert("端口必须是 1～65535 的整数，且 API 与 Web 端口不能相同。");
+      reportUIEvent("settings_validation_failed", "/admin/api/settings", 0, traceID());
+      return;
+    }
+    setSettingsBusy(true);
+    return api("/admin/api/settings", {method: "POST", body: {apiPort: apiPort, webPort: webPort}})
+      .then(function (data) {
+        renderSettings(data);
+        showAlert("端口已写入 config.json，重启网关后生效；当前监听端口未改变。", true);
+      }).catch(function () {}).then(function () { setSettingsBusy(false); });
   }
 
   // 管理 Key 仅保存在当前标签页会话，验证成功后才保存。
@@ -461,7 +589,7 @@
         if (!data.canInitialize) {
           showAlert("当前不是本机访问，无法在此页面自动生成管理 Key。可选方式：" +
             "① 在服务器本机打开本页面；② 用 SSH 本地端口转发（ssh -L 8316:127.0.0.1:8316 用户@服务器）后访问；" +
-            "③ 直接在服务器上编辑 config.json，把 gateway.adminKey 设为随机字符串后重启网关。");
+            "③ 直接在服务器上编辑 config.json，把 gateway.adminKey 设为随机字符串，保存后约 1 秒生效。");
         }
       } else if (state.apiKey) {
         saveKey();
@@ -497,14 +625,18 @@
     });
     $("initializeAdmin").addEventListener("click", initializeAdmin);
     $("saveAPISettings").addEventListener("click", saveAPISettings);
+    $("savePortSettings").addEventListener("click", savePortSettings);
+    $("saveLogSettings").addEventListener("click", saveLogSettings);
+    $("cleanupLogs").addEventListener("click", cleanupExpiredLogs);
     $("apiKey").addEventListener("keydown", function (e) { if (e.key === "Enter") saveKey(); });
     Array.prototype.forEach.call(document.querySelectorAll(".tab"), function (t) {
       t.addEventListener("click", function () { setTab(t.getAttribute("data-tab")); });
     });
     $("onlyUsable").addEventListener("change", refreshActive);
+    $("accountsTable").addEventListener("click", togglePolicy);
+    $("modelsTable").addEventListener("click", togglePolicy);
     $("logFile").addEventListener("change", function () { loadLogs(false); });
     $("logLines").addEventListener("change", function () { loadLogs(false); });
-    $("maskHints").addEventListener("change", loadConfig);
 
     discoverSetup();
     state.timer = setInterval(refreshActive, POLL_MS);
