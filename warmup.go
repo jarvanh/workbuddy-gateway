@@ -58,6 +58,11 @@ const (
 	warmupCooldownWatchTick = 30 * time.Second
 
 	warmupTickInterval = 30 * time.Second
+
+	// warmupRecoverConfirmTicks 冷却 key 需连续消失多少个 tick 才认定「真的恢复」。
+	// 1 = 旧行为（单次快照消失即判恢复，易被上游标记抖动误触发）；
+	// 2 = 去抖（约 60 秒稳定期），抖动引起的瞬时消失不会唤醒空跑。
+	warmupRecoverConfirmTicks = 2
 )
 
 // warmupConfig 是 config.json 的 warmup 段。指针字段用于区分「未配置」（回落默认）
@@ -637,6 +642,13 @@ func warmupTriggerModel(model string, rt warmupRuntime, now time.Time, ms *warmu
 		lastDetail = fmt.Sprintf("站点 %s：%s", site, out.Detail)
 		if out.Status == "rate_limited" {
 			ms.RateLimitHits++
+			// 登记保护窗口（静默，不推通知）：撞 6004 后必须留下一个可被监听的
+			// 到期时间，否则 activeCooldownKeys 里没有这一项，watchLoop 永远等不到
+			// 「冷却恢复」事件 —— 本周期就只能靠 MaxRateLimitRetries 熔断硬停，
+			// 白白浪费上游已经给出的重置时刻。登记后到期即由 watchLoop 补触发。
+			if out.RetryAt.After(time.Now()) {
+				markModelCooldownQuiet(acc, model, out.RetryAt, out.Detail)
+			}
 		}
 		if out.RetryAt.After(retryAt) {
 			retryAt = out.RetryAt
@@ -1410,6 +1422,61 @@ func activeCooldownKeys(now time.Time) map[string]time.Time {
 	return out
 }
 
+// warmupConfirmedRecovered 在相邻两次冷却快照间判定「真的已恢复」的 key。
+//
+// 判据：key 从 prev 中消失，且**连续**消失次数达到 warmupRecoverConfirmTicks。
+// gone 由调用方持有并跨 tick 传入，记录每个 key 已连续消失的 tick 数；
+// 判定为恢复的 key 会从 gone 中移除，重新出现的 key 计数清零。
+//
+// 为什么需要去抖：tick 级快照比对时，上游冷却标记的一次抖动（瞬时消失又出现）
+// 会被误判成恢复，随即唤醒一轮空跑 —— 实测限流刚结束时这类抖动很常见。
+func warmupConfirmedRecovered(prev, cur map[string]time.Time, gone map[string]int) []string {
+	out := make([]string, 0, len(prev))
+	for k := range prev {
+		if _, still := cur[k]; still {
+			delete(gone, k)
+			continue
+		}
+		gone[k]++
+		if gone[k] >= warmupRecoverConfirmTicks {
+			out = append(out, k)
+			delete(gone, k)
+		}
+	}
+	// prev 中不再出现的 key 已无跟踪意义，清掉残留计数避免 map 无限增长。
+	for k := range gone {
+		if _, seen := prev[k]; !seen {
+			delete(gone, k)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// warmupPendingModelKeys 返回当前周期里仍处于 pending 的模型名集合（已归一化）。
+//
+// 这是「冷却恢复唤醒后有没有活干」的唯一正确判据：runWarmupOnce 只处理
+// cy.Models 中 Status=="pending" 的模型，成功/失败/跳过的模型即使冷却恢复也不会
+// 被重打。warmupSelectModels 返回的是「当前可触发的全目录」，与之并不等价。
+//
+// 返回空集是合法的（当天已全部完成或本周期尚未建立），调用方据此不唤醒。
+func warmupPendingModelKeys(now time.Time) map[string]bool {
+	out := make(map[string]bool)
+	warmupStateMu.Lock()
+	defer warmupStateMu.Unlock()
+	st := loadWarmupState()
+	if st.Current == nil || st.Current.Date != cycleDateOf(now) {
+		// 当天周期还没建立：此刻唤醒也无从判断谁待补触发，返回空集。
+		return out
+	}
+	for k, v := range st.Current.Models {
+		if v != nil && v.Status == "pending" {
+			out[normalizeModelName(k)] = true
+		}
+	}
+	return out
+}
+
 // warmupRecoveredInScope 从恢复项中筛出「在 warmup 触发名单内」的模型项。
 // key 形如 "账号|模型"；账号级冷却（无模型部分）不属于特定模型，一律视为名单外。
 // allowed 为 normalize 后的模型名集合（warmupSelectModels 输出归一化）。
@@ -1440,6 +1507,8 @@ func warmupRecoveredInScope(recovered []string, allowed map[string]bool) []strin
 func warmupCooldownWatchLoop() {
 	var prev map[string]time.Time
 	var lastTrigger time.Time
+	// gone 记录某个冷却 key 已连续消失的 tick 数，用于恢复判定去抖。
+	gone := make(map[string]int)
 	for {
 		time.Sleep(warmupCooldownWatchTick)
 		rt := warmupSnapshot()
@@ -1458,23 +1527,23 @@ func warmupCooldownWatchLoop() {
 			prev = cur
 			continue
 		}
-		recovered := make([]string, 0, len(prev))
-		for k := range prev {
-			if _, still := cur[k]; !still {
-				recovered = append(recovered, k)
-			}
-		}
+		// 去抖：key 必须在**连续** warmupRecoverConfirmTicks 个 tick 里都消失，才认定
+		// 真的恢复。tick 级快照比对时，上游冷却标记的一次抖动（瞬时消失又出现）
+		// 会被误判成恢复，随即唤醒一轮空跑 —— 实测这类抖动在限流刚结束时很常见。
+		recovered := warmupConfirmedRecovered(prev, cur, gone)
 		prev = cur
 		if len(recovered) == 0 {
 			continue
 		}
-		// 只认 warmup 触发名单内模型的恢复：名单外模型（如日常业务高频使用、
-		// 但不在价格上限内的模型）的冷却恢复，唤醒后必然没有待触发项，只会
-		// 空跑一轮并发无意义通知 —— 此处只记日志，不唤醒。
-		allowed := map[string]bool{}
-		for _, m := range warmupSelectModels(rt, now) {
-			allowed[normalizeModelName(m)] = true
-		}
+		// 只认「唤醒后真的有活干」的恢复：判据是当前周期里仍处于 pending 的模型，
+		// 而不是 warmupSelectModels 的价格筛选结果 —— 后者筛的是「当前可触发的
+		// 全目录」，而 runWarmupOnce 只处理 cy.Models 里 Status==pending 的模型，
+		// 两个集合不是一回事。用错集合会让真正待补触发的模型被判成「名单外」，
+		// 于是永远不唤醒（实测 v1.27.x 本机 7/7 次恢复全被误判）。
+		//
+		// 名单外/已完成的模型冷却恢复，唤醒后必然没有待触发项，只会空跑一轮并发
+		// 无意义通知 —— 此处只记日志，不唤醒。
+		allowed := warmupPendingModelKeys(now)
 		inScope := warmupRecoveredInScope(recovered, allowed)
 		if len(inScope) == 0 {
 			sort.Strings(recovered)

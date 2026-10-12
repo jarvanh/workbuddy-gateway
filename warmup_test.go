@@ -838,3 +838,164 @@ func TestAppendCycleHistoryOnNormalCompletion(t *testing.T) {
 		t.Fatalf("新一天未归档或未置顶: %+v", st.History)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 2026-10-12 冷却补触发闭环（①pending 判据 / ②6004 静默登记 / ③恢复去抖）
+// ---------------------------------------------------------------------------
+
+// TestWarmupPendingModelKeys ①：pending 判据必须只看当前周期待触发的模型，
+// 已 ok/failed/skipped 的模型即使冷却恢复也不该被算作「有活干」。
+func TestWarmupPendingModelKeys(t *testing.T) {
+	resetWarmupStateT(t)
+	chdirTemp(t)
+	now := time.Now()
+
+	// 周期还没建立：应返回空集（此刻唤醒无从判断谁待补触发）
+	if got := warmupPendingModelKeys(now); len(got) != 0 {
+		t.Fatalf("无当前周期时应返回空集，实际=%v", got)
+	}
+
+	warmupStateMu.Lock()
+	st := loadWarmupState()
+	date := cycleDateOf(now)
+	st.Current = &warmupCycle{Date: date, Models: map[string]*warmupModelState{
+		"hy3":                  {Status: "pending"},
+		"hunyuan-2.0-instruct": {Status: "pending"},
+		"done-ok":              {Status: "ok"},
+		"done-failed":          {Status: "failed"},
+		"done-skipped":         {Status: "skipped"},
+	}}
+	saveWarmupStateLocked(st)
+	warmupStateMu.Unlock()
+
+	got := warmupPendingModelKeys(now)
+	if len(got) != 2 || !got["hy3"] || !got["hunyuan-2.0-instruct"] {
+		t.Fatalf("应恰包含 2 个 pending 模型，实际=%v", got)
+	}
+	for _, k := range []string{"done-ok", "done-failed", "done-skipped"} {
+		if got[k] {
+			t.Fatalf("%s 已完成，不应判为待补触发", k)
+		}
+	}
+}
+
+// TestWarmupConfirmedRecoveredDebounce ③：单次消失不算恢复，需连续消失
+// warmupRecoverConfirmTicks 个 tick 才算；中途重新出现必须清零计数（抖动不得误触发）。
+// 断言按阈值泛化，调整常量不会让本用例假失败。
+func TestWarmupConfirmedRecoveredDebounce(t *testing.T) {
+	key := "a.json|hy3"
+	prev := map[string]time.Time{key: time.Now().Add(time.Minute)}
+	cur := map[string]time.Time{}
+	gone := map[string]int{}
+
+	// 前 N-1 次消失都不应判恢复
+	for i := 1; i < warmupRecoverConfirmTicks; i++ {
+		if got := warmupConfirmedRecovered(prev, cur, gone); len(got) != 0 {
+			t.Fatalf("第 %d 次消失不应判恢复（去抖生效），实际=%v", i, got)
+		}
+		if gone[key] != i {
+			t.Fatalf("第 %d 次消失后计数应为 %d，实际=%d", i, i, gone[key])
+		}
+	}
+
+	// 第 N 次消失：判恢复
+	got := warmupConfirmedRecovered(prev, cur, gone)
+	if len(got) != 1 || got[0] != key {
+		t.Fatalf("连续 %d 次消失应判恢复，实际=%v", warmupRecoverConfirmTicks, got)
+	}
+	if _, still := gone[key]; still {
+		t.Fatal("判定恢复后应清除计数，避免重复唤醒")
+	}
+
+	// 抖动：消失一次后又出现 → 计数必须清零，重新累积
+	gone = map[string]int{}
+	_ = warmupConfirmedRecovered(prev, cur, gone)
+	back := map[string]time.Time{key: time.Now().Add(time.Minute)}
+	if got := warmupConfirmedRecovered(cur, back, gone); len(got) != 0 {
+		t.Fatalf("重新出现不应判恢复，实际=%v", got)
+	}
+	if _, still := gone[key]; still {
+		t.Fatal("重新出现后计数应清零")
+	}
+}
+
+// TestWarmupRateLimitRegistersQuietCooldown ②：撞 6004 后必须登记保护窗口，
+// 否则 watchLoop 等不到恢复事件；同时**不得**推送任何通知（静默）。
+func TestWarmupRateLimitRegistersQuietCooldown(t *testing.T) {
+	resetWarmupStateT(t)
+	chdirTemp(t)
+	resetNotifyState()
+
+	// 通知通道指向探针：一旦发送就会被记录
+	called := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	setNotify(notifyConfig{Enabled: true, Type: "webhook", Webhook: srv.URL})
+	defer setNotify(notifyConfig{})
+
+	modelsMu.Lock()
+	catalogModels = map[string][]catalogModel{
+		"cn": {{ID: "m-free", HasMultiplier: true, Multiplier: 0, FromLive: true}},
+	}
+	modelsMu.Unlock()
+
+	// 上游消息里的重置时刻按 UTC+8 墙钟解析（parseDateTimeTZ 默认 +8），
+	// 所以这里必须用 +8 固定时区生成时间串，否则解析后会被平移 8 小时、
+	// 落到过去而误判「无需登记」。
+	loc8 := time.FixedZone("UTC+8", 8*3600)
+	resetAt := time.Now().Add(30 * time.Minute).Truncate(time.Second).In(loc8)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"data":{"code":6004,"msg":"频率限制，将在 ` +
+			resetAt.Format("2006-01-02 15:04:05") + ` UTC+8 重置"}}}`))
+	}))
+	defer server.Close()
+
+	oldBase, oldOrigin := profileCN.Base, profileCN.Origin
+	oldClient := cfg.HttpClient
+	acc := &Account{
+		Path:       "cn.json",
+		Auth:       &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()}},
+		QuotaKnown: true, QuotaRemaining: 100,
+	}
+	accountMu.Lock()
+	oldAccounts, oldRR := accounts, rrIndex
+	accounts, rrIndex = []*Account{acc}, 0
+	accountMu.Unlock()
+	profileCN.Base, profileCN.Origin = server.URL, server.URL
+	cfg.HttpClient = server.Client()
+	defer func() {
+		profileCN.Base, profileCN.Origin = oldBase, oldOrigin
+		cfg.HttpClient = oldClient
+		accountMu.Lock()
+		accounts, rrIndex = oldAccounts, oldRR
+		accountMu.Unlock()
+	}()
+
+	_, _, _, pending, _ := runWarmupOnce(warmupSnapshot(), time.Now())
+	if pending != 1 {
+		t.Fatalf("限流后应保留 1 个待补触发，实际=%d", pending)
+	}
+
+	// 关键断言：保护窗口已登记 → activeCooldownKeys 能看见（watchLoop 可监听恢复）
+	accountMu.Lock()
+	state := acc.ModelStates[normalizeModelName("m-free")]
+	accountMu.Unlock()
+	if state == nil || !state.CooldownUntil.After(time.Now()) {
+		t.Fatalf("6004 后应静默登记模型冷却至上游给出的重置时刻，实际=%+v", state)
+	}
+	keys := activeCooldownKeys(time.Now())
+	if _, ok := keys["cn.json|"+normalizeModelName("m-free")]; !ok {
+		t.Fatalf("登记的冷却应出现在 activeCooldownKeys 中，实际=%v", keys)
+	}
+
+	// 关键断言：静默 —— 不得推送任何通知
+	time.Sleep(400 * time.Millisecond)
+	if called {
+		t.Fatal("warmup 主动探测撞 6004 是自身行为，不应推送「模型冷却」告警")
+	}
+}

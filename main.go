@@ -1865,14 +1865,28 @@ func quotaBlockedListText(items []quotaBlockEntry) string {
 	return b.String()
 }
 
-func markModelCooldown(acc *Account, model string, until time.Time, msg string) {
+// markModelCooldownQuiet 只登记模型冷却，不推送任何通知。
+//
+// 为什么需要它：warmup 主动探测撞到 6004 时也要登记保护窗口（否则 watchLoop
+// 等不到「恢复」事件、只能靠熔断硬停），但那是**我们自己触发**的限流，不是服务
+// 故障 —— 借用 markModelCooldown 会让主人收到「⚠️ workbuddy 模型冷却」告警却
+// 查不到任何真故障，等于用假告警换真保护。
+//
+// 静默登记的效果与完整版一致：冷却信息照样进 activeCooldownKeys（watchLoop 能
+// 监听恢复）、照样让调度规避该模型，只是不吵人。
+func markModelCooldownQuiet(acc *Account, model string, until time.Time, msg string) {
 	accountMu.Lock()
 	state := modelStateLocked(acc, model)
 	state.CooldownUntil = until
 	state.LastReason = msg
 	accountMu.Unlock()
-	log.Printf("[ModelCooldown] 账号 %s 模型 %s 触发模型级频率限制，仅屏蔽该模型至 %s；其他模型仍可调度", acc.Path, model, formatDisplayTime(until))
+	log.Printf("[ModelCooldown] 账号 %s 模型 %s 触发模型级频率限制，仅屏蔽该模型至 %s；其他模型仍可调度（静默登记，不推送通知）",
+		acc.Path, model, formatDisplayTime(until))
 	writeStatusSnapshot()
+}
+
+func markModelCooldown(acc *Account, model string, until time.Time, msg string) {
+	markModelCooldownQuiet(acc, model, until, msg)
 	name := filepath.Base(acc.Path)
 	reason := truncate(msg, 200)
 	now := time.Now()
