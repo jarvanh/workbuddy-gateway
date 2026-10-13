@@ -1,7 +1,8 @@
 # WorkBuddy Local Gateway
 
-<img width="917" height="754" alt="image" src="https://github.com/user-attachments/assets/7dcfc461-1357-4991-9565-279047687898" />
+纯 Go、零 CGO 依赖的跨平台单二进制网关，支持国内站与国际站、多账号调度、OpenAI / Anthropic 协议及可选网页控制台。
 
+## 快速开始
 
 基于腾讯 **CodeBuddy** 协议开发的**纯 Go、零 CGO 依赖、跨平台单二进制**本地 AI 代理网关。默认无 Web UI，全部通过命令行（CLI）完成登录、凭据续期与服务控制；可选开启网页管理台（`-webui`，见下文）。
 
@@ -104,270 +105,28 @@ workbuddy-gateway [command] [options]
 **价格探测默认关闭（含旧版本升级）**：只有显式指定 `-allow-price-probes` 或 `-allow-price-probes=true` 才开启后台价格探测。旧启动脚本中的 `-disable-price-probes` 仍可使用；两个参数同时传入且旧禁用参数为 `true` 时，禁用优先，与参数顺序无关。仅传入 `-disable-price-probes=false` 不会开启探测。此开关是启动参数，修改后需重启服务。
 
 ```bash
-# 默认不主动生成价格探测请求；正常客户端请求仍自动学习计费状态
-workbuddy-gateway serve -webui
-
-# 明确允许主动探测；可能产生额外积分消耗
-workbuddy-gateway serve -webui -allow-price-probes
+go build -o workbuddy-gateway .
+./workbuddy-gateway login
+./workbuddy-gateway serve -webui
 ```
 
-### 配置网页控制台与模型 API 鉴权
+Windows 可使用 `.\workbuddy-gateway.exe`。管理端口默认 `8316`，模型 API 默认 `8317`。
 
-工作目录 `config.json` 的 `gateway` 段控制监听端口、网页控制台管理 Key 和模型 API 鉴权，全部为明文配置（`config.json` 已被 Git 忽略，请自行限制文件权限）：
+- 首次使用可复制 `config.example.json` 为 `config.json`，并按需要设置管理 Key 和 API 鉴权。
+- **后台价格探测默认关闭**，只有显式传入 `-allow-price-probes` 才开启；主动生成请求可能消耗积分。
+- 网页配置页支持风险确认后的完整 JSON 编辑；监听端口修改需重启服务。
+- `config.json` 和账号凭据含敏感信息，已由 Git 忽略，不要公开分享。
 
-```json
-{
-  "gateway": {
-    "apiPort": 8317,
-    "webPort": 8316,
-    "adminKey": "",
-    "apiKeyEnabled": false,
-    "apiKey": ""
-  }
-}
-```
+## 文档
 
-| 配置 | 默认 | 说明 |
-|---|---|---|
-| `apiPort` | `8317` | 模型 API 监听端口，省略或 `0` 使用默认值；也可用 `-port` 临时覆盖 |
-| `webPort` | `8316` | 网页控制台监听端口，省略或 `0` 使用默认值；仅在显式 `-webui` 时监听 |
-| `adminKey` | `""` | 网页控制台管理 Key，有两种设置方式：**① 页面一键生成**——为空时在服务器本机（或 SSH 本地端口转发）打开网页，生成 32 字符随机 Key 写入本文件，并在弹窗中**仅展示一次**；**② 手动编辑本文件**——直接把本字段改成任意随机字符串（建议 32 位），保存后约 1 秒热生效。设置完成后可从其他设备用该 Key 登录 |
-| `apiKeyEnabled` | `false` | 模型 API 是否校验 Key。关闭时不带 Key 或任意 Key 均可调用模型；开启时必须匹配 `apiKey` |
-| `apiKey` | `""` | 模型 API Key。开启校验时必须非空；关闭时保留原值，重新开启即可继续使用 |
-
-网页控制台也可在「访问设置」页切换 `apiKeyEnabled` 并设置 `apiKey`，保存后立即生效并写回本文件；端口修改需要重启。管理 Key 与模型 API Key **相互独立**：关闭模型 API 鉴权不会关闭管理鉴权，模型 API Key 也不能登录网页控制台。为避免他人抢先生成，**页面一键生成**管理 Key 只允许本机访问；**手动编辑 `config.json` 设置 `gateway.adminKey`** 不受此限制，效果与一键生成完全相同。
-
-> **升级顺序（重要）**：新版本能读取不含 `gateway` 段的旧配置，但**旧版本二进制遇到含 `gateway` 段的新配置会启动失败**（`json: unknown field "gateway"`）。请**先替换二进制、再添加 `gateway` 配置**。
-
-### JSON 调试日志
-
-工作目录中的 `config.json` 控制结构化调试日志，默认关闭。修改后约 1 秒热生效，无需重启：
-
-```json
-{
-  "debug": {
-    "enabled": true
-  }
-}
-```
-
-开启后，网关把单行 JSON 写入 `logs/debug-YYYY-MM-DD.jsonl`；普通运行日志仍写入原来的 `logs/gateway-YYYY-MM-DD.log`，两者互不替代。可复制 `config.example.json` 作为起点。
-
-### 日志保留与清理
-
-```json
-{
-  "logs": {
-    "retentionDays": 7
-  }
-}
-```
-
-- `retentionDays` 范围为 `0～36500`：`0` 或省略表示保留全部，兼容旧配置；`7` 表示按服务器本地日期保留今天及此前 6 天。**设为正数后会自动删除过期日志，删除不可撤销。**
-- 配置热加载后应用新规则；启动/规则变化时扫描，此后每小时自动扫描。网页「日志」页可以保存保留天数，也可以立即按已保存规则清理。
-- 只删除 `logs/` 内日期合法的 `gateway-*.log`、`debug-*.jsonl`、`deployment-*.jsonl`、`frontend-*.log`；不跟随符号链接，不删除目录、凭据、配置、报告或其他文件，不删除正在写入的日志。
-- 普通日志和调试日志在跨午夜后的下一次写入切换到新日期文件。尚未切换的旧日志保持保护，关闭后在后续扫描清理。
-- 请先替换新二进制，再添加 `logs` 段；旧二进制可能因未知配置字段拒绝启动。
-
-### 配置系统提示词
-
-工作目录 `config.json` 的 `systemPrompt` 段有两个独立选项（修改后约 1 秒热生效）：
-
-```json
-{
-  "systemPrompt": {
-    "fallback": "",
-    "force": ""
-  }
-}
-```
-
-| 配置 | 空值的默认行为 | 非空时的行为 |
-|---|---|---|
-| `fallback` | 继续使用 `You are a helpful assistant.` | **仅在客户端没有任何 system 时**，替换网关注入的保底提示词；已有 system 不变 |
-| `force` | 不启用；请求提示词完全按原规则处理 | **实验功能**：在 Chat、Responses、Anthropic Messages 三个入口的首条 system 内容**末尾追加**配置文本（后置），使其成为位置最靠后、紧贴用户消息的指令；原 system 内容仍完整保留 |
-
-例如 `{"systemPrompt":{"fallback":"你是一个助手。","force":"请用中文回答。"}}`：客户端没有 system 时，发往上游的是 `你是一个助手。\n\n请用中文回答。`；客户端自带 system 时，发往上游的是 `<客户端原 system>\n\n请用中文回答。`。配置值仅支持 JSON 字符串；空串或全空白视为未配置。不会写出或替换客户端的 user、assistant、tool 消息，也不改变账号选择。普通日志和 JSON 调试日志只记录规则分支、位置与字符数，**不记录提示词正文**。
-
-> **实验功能风险自负：** `force` 后置于 system 末尾（紧贴用户消息），因此比客户端自带指令更"新近"，冲突时通常更有影响力——这正是人设类、风格类指令希望达到的效果，但也可能与客户端的 system 指令冲突、改变模型行为、增加 token 消耗，或触发上游内容/参数校验。需要回退时将 `force` 改回 `""` 并保存；建议先在测试会话验证，切勿在配置中写入密码、密钥或个人隐私。`config.json` 已被 Git 忽略，不要将真实配置提交到仓库。
-
-`/v1/messages/count_tokens` 仅对客户端提供的内容做本地近似估算，不调用上游，也不计入网关随后注入的 `fallback` / `force` 文本；最终消耗以模型返回的 usage 为准。
-
-### 套餐识别与官网一致性
-
-从 v1.13.9 起，账号套餐不再仅凭 `ProTrialStatus=1` 判定为“Pro试用”。每轮额度刷新会额外调用官网的只读通用资源接口，根据有效状态、权益起止时间及当前订阅信息确认套餐：
-
-- 查询不限定 `PackageCodes`，支持分页；官网新增套餐编码不会被固定名单漏掉。
-- 名称按站点区分：国内站四档规范显示为 **体验版 / 标准版 / 高级版 / 旗舰版**；国际站保留 **免费 / pro / Pro试用**。国内标准版不会误标为国际站 pro。
-- 新套餐优先显示接口返回的 `PackageName`，历史套餐也不会强行归入四档。新编码没有名称时显示“未识别订阅”，不猜成 Free 或 Pro。
-- 赠送积分包、加量包不当成订阅；额度用尽但权益未到期的套餐仍保留套餐身份。
-- 已过期、退款、尚未生效的权益不当成当前套餐。试用标记仍为 `1`，但已无有效试用且只有 Free 权益时，显示“免费”。
-- 查询失败或遇到无法解释的字段/子产品时，已有核验结果标 `*`（待刷新），无核验结果显示“待确认”。额度查询成功时仍正常更新额度，不因套餐识别失败丢弃额度。
-- 快照增加 `planCheckedAt`、`planStale` 字段。旧版本未核验的套餐标签不会作为可信结果沿用；新版本启动后会重新校验。
-
-兼容边界：同一产品和资源字段结构下新增套餐通常可直接展示官方名称；若官网改变产品编码、接口、状态枚举或权益规则，仍可能需要更新程序。这不是对未来任意接口变更的保证。此过程只查询会员/额度信息，不领取试用、不购买/续费，也不请求模型。
-
-### 登录凭据自动续期（保活）
-
-登录凭据分两种令牌：**访问令牌**用于请求模型和查询额度；**刷新令牌**用于换取新的访问令牌。刷新令牌本身也有有效期，一旦它到期或被上游判定失效，就必须重新 `login`，程序无法绕过。
-
-从 v1.13.11 起，网关同时使用两条触发路径续期：
-
-| 触发方式 | 时机 | 说明 |
-|---|---|---|
-| 临近过期续期 | 后台每 5 分钟检查，访问令牌剩余不足 15 分钟时刷新 | 保证请求不会用到过期令牌 |
-| **主动定时续期** | `-keepalive-hours` 指定的本地时刻（默认 `22`，即每天 22:00） | 不等访问令牌临近过期就刷新全部账号，避免长期空闲账号静默失效 |
-
-```bash
-# 默认每天 22:00 主动续期
-workbuddy-gateway serve
-
-# 每天 10:00 和 22:00 各一次
-workbuddy-gateway serve -keepalive-hours 10,22
-
-# 关闭主动续期，只保留临近过期时的按需刷新
-workbuddy-gateway serve -keepalive-hours ""
-```
-
-实现要点：
-
-- **只调刷新接口**，不请求模型、不消耗额度、不产生对话记录。
-- **串行 + 节流**：账号之间间隔 1 秒逐个刷新，避免批量并发刷新形成机器特征。
-- **启动补跑**：距上次成功续期超过 20 小时的账号，在服务启动 90 秒后补做一轮，避免重启错过时刻。
-- **失败不轻易删号**：单次失败只累计计数并保留原凭据；连续失败 3 次才判定登录态失效并停止调度。上游明确返回会话失效（如 `12153` / `invalid_grant`）时首次即告警，但仍保留凭据等待阈值。
-- **记录续期元数据**：刷新成功后把 `refreshExpiresAt`、`lastRefreshTime` 写回凭据文件，`status` 与 `monitor` 会显示刷新令牌到期时间，并在剩余不足 7 天或已过期时给出重新登录提醒。
-- **不掩盖问题**：刷新成功但访问令牌期限没有顺延时会单独告警，提示该账号可能已接近上游的登录态上限。
-
-> **注意刷新令牌是独占的。** 每次续期上游通常会下发新的刷新令牌并让旧的失效。如果同一个账号的凭据还被其他工具（脚本、其他网关、桌面客户端）同时使用，双方会互相把对方的刷新令牌作废。请确保一个账号只由一处负责续期。`-keepalive-hours` 留空即可关闭本功能。
-
-#### 凭据覆盖与删除前的校验
-
-凭据文件是登录态的唯一副本，删掉就只能重新登录。因此「覆盖」和「删除」这两个不可逆动作之前都会先做只读校验。
-
-**续期成功、准备覆盖旧凭据之前：**
-
-| 检查 | 目的 | 不通过时 |
-|---|---|---|
-| 新旧凭据账号标识一致（访问令牌 `sub`） | 防止上游串号或响应错配，把凭据写到别的账号上 | 拒绝覆盖，保留旧凭据并告警 |
-| 新旧凭据站点一致（`iss` realm） | 防止国内站/国际站凭据互相覆盖 | 同上 |
-| 新访问令牌能取到账号数据 | 防止「接口返回 200 但实际不可用」的凭据覆盖掉还能用的旧凭据 | 同上 |
-
-校验接口自身不可用时按通过处理，不会因为校验抖动而拒绝有效的新凭据。校验失败**不计入**「判定失效」的计数，因此不会把还能用的账号停掉。
-
-**判定失效、准备删除凭据之前：**
-
-1. 先停止调度并写入失效标记；
-2. 再用只读接口确认该凭据确实取不到账号数据，**才**删除文件；
-3. 凭据仍能取到数据 → 保留文件；
-4. 无法判定（网络故障、上游 5xx）→ 保守保留文件。
-
-凭据文件被保留时，失效标记在重启后依然生效，账号不会被重新调度。如果你重新 `login` 或手动续期了该凭据，凭据文件会比标记更新，网关会自动清除过期标记并恢复该账号。
-
-### 模型黑白名单
-
-`config.json` 的 `models` 段可按模型名启用黑白名单（大小写与首尾空白不敏感）：
-
-```json
-{
-  "models": {
-    "blocklist": ["deepseek-v4-pro"]
-  }
-}
-```
-
-| 字段 | 说明 |
+| 内容 | 位置 |
 |---|---|
-| `blocklist` | 黑名单，命中即禁用 |
-| `allowlist` | 白名单，**非空时**只放行列表内模型，其余一律禁用 |
+| 完整使用手册、配置、客户端接入与部署 | [docs/user-guide.md](docs/user-guide.md) |
+| 目录职责与命名约定 | [docs/project-layout.md](docs/project-layout.md) |
+| 贡献者及方案署名 | [docs/contributors.md](docs/contributors.md) |
+| 测试入口与说明 | [tests/README.md](tests/README.md) |
 
-规则：
-
-- 模型黑名单与白名单**选择一种**。非空 `allowlist` 和非空 `blocklist` 同时存在会校验失败，避免配置歧义；旧示例同时包含两个空数组、或其中一个为空时仍可读取。
-- 两个列表都为空或省略时不做任何限制（默认行为不变）。
-- 被禁用的模型会从 `/v1/models`、`/health` 的 `model_count` 和 `monitor` 的模型统计附表中**直接隐藏**。
-- 请求被禁用模型时返回 `403` 与中文提示，**不会消耗任何上游账号额度**：
-
-```json
-{
-  "error": {
-    "message": "模型 deepseek-v4-pro 已被网关禁用（命中黑名单），请联系管理员调整 config.json",
-    "type": "model_disabled",
-    "code": 403
-  }
-}
-```
-
-`serve` 启动横幅会打印当前名单状态，例如 `模型黑白名单: 已启用 (黑名单 1 个 / 白名单 0 个...)`。
-
-### 按模型限制账号文件
-
-`models.accounts` 是凭据 JSON 文件黑白名单：保留键 **`all`** 控制所有模型的全局账号调度，其余键控制对应模型。未配置 `all` 或全局列表为空时与旧版本相同。全局规则和模型专属规则**都通过**才允许调度，模型专属白名单不能绕过全局停用。与上面的 `models.allowlist` / `models.blocklist`（控制模型是否可调用）互不替代：
-
-```json
-{
-  "models": {
-    "blocklist": [],
-    "accounts": {
-      "all": {
-        "allowlist": [],
-        "blocklist": ["paused-account.json"]
-      },
-      "deepseek-v4.1-flash": {
-        "allowlist": ["intl-a.json", "intl-b.json"],
-        "blocklist": ["intl-b.json"]
-      },
-      "hy3": {
-        "blocklist": ["old-account.json"]
-      }
-    }
-  }
-}
-```
-
-- 同一模型内黑名单优先；账号白名单为空表示不限制，黑名单为空表示不排除。上述示例中 `deepseek-v4.1-flash` 最终只允许 `intl-a.json`，`hy3` 仅排除 `old-account.json`。
-- `all.blocklist` 中的账号不再参与任何模型的请求调度、失败换号和模型生成探测。账号仍显示在管理台，凭据、额度账本和历史统计保留；后台凭据保活/额度查询不属于模型生成，保持原有行为。
-- 全局账号白名单非空时，账号池开关反映白名单规则。首次网页账号操作会删除 `all.allowlist`（包括空数组或 `null`），将**当前账号池**的全局启停状态转换为 `all.blocklist`，再应用本次操作；其他当前账号状态和模型专属规则保留，之后新增账号默认开启（黑名单语义）。
-- 只接受凭据**文件名**（如 `intl-a.json`），不接受路径或通配符；同名凭据位于多个目录时会拒绝匹配，避免误用。模型名忽略大小写，文件名必须与实际凭据文件一致。
-- 请求调度与失败换号都不会绕过账号名单；后台价格探测与本机 `/admin/probe` 也会跳过不允许的账号。若没有匹配的账号，请求返回 `403 model_account_disabled` 中文提示，且不会调用上游。
-- 实时运行日志 `logs/gateway-YYYY-MM-DD.log` 在有账号被排除时记录汇总一行（模型、候选账号数、排除明细）；开启调试时 `logs/debug-YYYY-MM-DD.jsonl` 记录每个账号的 `model_account_policy_checked`。`monitor` 模型统计表的“可用账号”列已按名单过滤，只统计符合规则的账号。
-- 修改 `config.json` 约 1 秒热生效；示例中的文件名均为占位值。没有配置 `models.accounts` 时原行为不变。
-
-### config.json 热生效与旧版本升级
-
-`serve` 独立每 1 秒按文件内容检测配置变化，不受 `-reload-interval 0`（只关闭凭据扫描）影响。网页开关先写入配置文件、再立即应用；外部编辑器修改则在下一次扫描应用。
-
-| 配置 | 生效方式 |
-|---|---|
-| 模型名单、`models.accounts`（含 `all`） | 热生效，控制后续调度 |
-| `gateway.adminKey` / `apiKeyEnabled` / `apiKey` | 热生效；管理 Key 改变后需使用新 Key 登录 |
-| `systemPrompt` / `debug.enabled` | 热生效 |
-| `upstream` 超时、网络重试次数 | 后续上游请求使用新值；已有流式响应保持原空闲超时 |
-| `gateway.apiPort` / `webPort` | 写入配置但**重启后**变更监听；页面仍显示实际监听端口 |
-
-- 配置先整体解析、校验，再应用。运行时遇到半写 JSON、空文件、文件短暂缺失、错误类型或非法账号路径时，**保留上一份有效配置**，错误原因写入 `logs/gateway-YYYY-MM-DD.log`。修正并保存后自动重试；不会把配置读取失败误当作“全部开启”。
-- 要恢复默认规则，请保存有效的 `{}` 或将对应列表设为 `[]`，而不是删除运行中的配置文件。
-- 上一版本省略 `all`、`accounts`、`models` 或 `gateway` 的配置仍可读取；`accounts: {}`、`accounts: null`、`all: {}` 和空名单均表示无全局限制。默认示例包含空的 `models.accounts.all.allowlist/blocklist`。
-- 如旧配置同时填写了**两种非空模型名单**，请在升级前选择并保留一种；新版本不再接受相互冲突的模型黑白名单。运行中错误配置会保留上次生效状态，启动时则给出明确错误。
-- 旧配置中只有白名单生效时，管理页开关反映白名单；首次网页模型操作会删除 `models.allowlist`，将**当前已知模型**的启停状态转换为 `models.blocklist`。其他已知模型状态不变，之后新增的模型默认开启（黑名单语义）。模型账号规则保持独立。
-- 新版本中的 `all` 是保留键；不要把它当作真实模型 ID。**先升级二进制，再添加 `all`**；旧二进制不识别全局语义，会把它当作名为 `all` 的模型专属规则。
-
-每条 JSON 调试日志都包含时间、级别、稳定事件名、`trace_id`、`request_id`、服务/实例/版本、路由、方法、模型、账号、流式标记和累计耗时，并记录客户端地址、代理头、协议、TLS、Content-Type、Content-Length、deadline 等请求元数据。客户端传入的 `X-Trace-ID` 会优先复用并透传到上游。
-
-请求体只记录以下安全摘要，不记录正文：
-
-- `declared_body_bytes`、`actual_body_bytes`、`body_read_ms`
-- `body_sha256_prefix`（SHA-256 前 12 位）
-- `json_valid`、`json_decode_ms`
-- `body_limit_bytes`、`body_limit_exceeded`（当前未设置请求体限制，因此分别为 `0`、`false`）
-- `read_error_type`、脱敏截断后的 `read_error`
-
-调试日志不会记录 `Authorization`、Cookie、API Key、Access Token、Refresh Token 或完整请求体。只记录是否提供 Authorization，以及凭据的不可逆短哈希 `api_key_fingerprint`。
-
----
-
-## serve
-
-启动本地网关，默认命令。
+## 构建与测试
 
 ```bash
 # 默认监听 127.0.0.1:8317，自动加载当前目录下所有 workbuddy*.json
@@ -1356,13 +1115,6 @@ cd workbuddy-gateway
 
 go vet ./...
 go test ./...
-
-# 当前平台
-CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o workbuddy-gateway .
-
-# 交叉编译示例
-GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/workbuddy-gateway-linux-amd64 .
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/workbuddy-gateway-windows-amd64.exe .
 ```
 
 > **自动发布**：推送 `v*` 标签（如 `v1.13.1`）即触发 GitHub Actions（`.github/workflows/release.yml`）自动运行 `go vet` + `go test`、交叉编译全部 5 个平台产物（版本号取自标签名，通过 `-ldflags -X main.version=` 注入）、生成 SHA-256 校验文件并创建 GitHub Release。
@@ -1372,31 +1124,11 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o d
 PowerShell 一键构建：
 
 ```powershell
-.\build.ps1                         # 检查并构建全部 9 个目标
-.\build.ps1 -Only windows           # Windows x86、x64、ARM64
-.\build.ps1 -Only linux             # Linux x86、x64、ARMv7、ARM64
-.\build.ps1 -Only linux -Architecture arm -ArmVersion 6
+.\scripts\test.ps1                 # Go、网页和构建脚本回归
+.\build.ps1                       # 校验并构建全部 9 个平台/架构目标
+.\build.ps1 -Only linux -Architecture amd64
 ```
 
-| 系统 | 架构 | 产物 |
-|---|---|---|
-| Windows | x86 32 位 / `386`（需要 SSE2） | `workbuddy-gateway-windows-386.exe` |
-| Windows | x86-64 / `amd64` | `workbuddy-gateway-windows-amd64.exe` |
-| Windows | ARM64 | `workbuddy-gateway-windows-arm64.exe` |
-| Linux | x86 32 位 / `386`（需要 SSE2） | `workbuddy-gateway-linux-386` |
-| Linux | x86-64 / `amd64` | `workbuddy-gateway-linux-amd64` |
-| Linux | ARM 32 位（默认 ARMv7） | `workbuddy-gateway-linux-armv7` |
-| Linux | ARM64 | `workbuddy-gateway-linux-arm64` |
-| macOS | x86-64 / `amd64` | `workbuddy-gateway-darwin-amd64` |
-| macOS | ARM64 | `workbuddy-gateway-darwin-arm64` |
+Go 单元测试保持与 `package main` 源码同目录，以保留私有函数测试和标准 `go test ./...` 行为；它们不进入生产构建。独立网页与构建脚本测试集中在 `tests/`。完整文档集中在 `docs/`，根目录保留构建入口与配置示例。
 
-- **Windows ARM32 不受当前 Go 工具链支持**，不能用 ARM64 文件替代。Linux ARM32 可用 `-ArmVersion 5/6/7` 选择，文件名与最低 ARM 版本一致。
-- 默认先运行 `go vet`、`go test`；不受调用者遗留的 `GOOS` / `GOARCH` 影响。各目标使用 `CGO_ENABLED=0`，x64 基线为 `GOAMD64=v1`、ARM64 基线为 `GOARM64=v8.0`。成功或失败后恢复原构建环境和工作目录。
-- 默认输出到 `dist/`，同时生成 `SHA256SUMS`、`build-manifest.json` 与空密钥的 `config.example.json`；校验和覆盖二进制、清单与示例配置。
-- `-OutputDir` 必须是项目内的独立子目录；`-Clean` 仅清理已知构建文件，不递归删除目录、配置凭据或其他文件。构建日志写入 `logs/build-YYYY-MM-DD.jsonl`。
-
----
-
-## 免责声明
-
-本项目仅用于个人学习与技术研究。腾讯 CodeBuddy（含国内站与国际站 workbuddy.ai）的接口协议与风控策略可能随时变化；请遵守腾讯服务条款，自行承担使用风险。本仓库不包含任何官方未公开的密钥或凭据。
+本项目仅用于个人学习与技术研究，请遵守上游服务条款。完整安全提示与免责声明见[使用手册](docs/user-guide.md#安全提示)。
