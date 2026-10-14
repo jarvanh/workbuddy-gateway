@@ -626,6 +626,16 @@ func TestCheckinAccountCNAndIntl(t *testing.T) {
 	if checkinCalls != before {
 		t.Fatalf("国际站不应再调用 daily-checkin: before=%d after=%d", before, checkinCalls)
 	}
+
+	enterprise := &Account{Path: "enterprise.json", Auth: &StoredAuth{
+		Edition: "cn",
+		Auth:    StoredTokens{AccessToken: "test-access"},
+		Account: StoredAccount{UID: "user-1", EnterpriseID: "ent-1"},
+	}}
+	result, err = checkinAccount(context.Background(), enterprise)
+	if err != nil || result != "enterprise_skipped" || checkinCalls != 1 {
+		t.Fatalf("enterprise checkin must not call personal endpoint: result=%q calls=%d err=%v", result, checkinCalls, err)
+	}
 }
 
 // 验证授权失效识别（401/403 / invalid token / 登录过期等）

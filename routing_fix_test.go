@@ -7,6 +7,29 @@ import (
 	"time"
 )
 
+// isolatePriceLedger 把价格账本重定向到临时目录并清空内存样本。
+//
+// 必需性：fork 的 observeModelCredit 会把真实请求的 (tokens, credit) 写入全局
+// sitePriceSamples 并按锚点校准倍率。全链路测试（如企业额度 HTTP 流）会真的发请求，
+// 其样本会泄漏到后续用例，改变锚点校准结果（实测 0.6 → 0.51）。
+// 凡会触发真实上游流量的测试都要在开头调用本函数。
+func isolatePriceLedger(t *testing.T) {
+	t.Helper()
+	savedFile, savedDir := priceLedgerFile, priceLedgerMirrorDir
+	priceLedgerFile = filepath.Join(t.TempDir(), "wb-price-ledger.json")
+	priceLedgerMirrorDir = "" // 测试不写 Dropbox
+	sitePriceMu.Lock()
+	savedSamples := sitePriceSamples
+	sitePriceSamples = map[string]*sitePriceSample{}
+	sitePriceMu.Unlock()
+	t.Cleanup(func() {
+		priceLedgerFile, priceLedgerMirrorDir = savedFile, savedDir
+		sitePriceMu.Lock()
+		sitePriceSamples = savedSamples
+		sitePriceMu.Unlock()
+	})
+}
+
 // TestRuleSiteWhitelist 站点白名单语义（2026-09-29 事故修复）：
 // 规则命中的模型，未声明的站点一律 FORBIDDEN。
 // 事故中 hy4-preview 只声明 cn，intl 未声明却被当作无限制参与代偿调度，

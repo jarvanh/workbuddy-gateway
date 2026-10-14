@@ -727,6 +727,11 @@ func guardMinBalance(acc *Account, model string) bool {
 	if cfg.MinBalanceGuard <= 0 || acc == nil {
 		return true
 	}
+	// 企业版分配额度不限量（limitNum=-1）：没有余额下限可言，直接放行。
+	// 此时 QuotaRemaining 是哨兵值 -1（不是「欠费」），拿它比阈值会把不限量账号误杀。
+	if acc.QuotaUnlimited {
+		return true
+	}
 	_, conf := classifyPrice(accountSite(acc), model)
 	if conf == priceFree || conf == priceUnknown {
 		return true
@@ -784,6 +789,12 @@ func reserveInFlightLocked(acc *Account, reqID uint64, model string) bool {
 	}
 	_, conf := classifyPrice(accountSite(acc), model)
 	if conf == priceFree {
+		return true
+	}
+	// 不限量（企业版分配额度 limitNum=-1）：额度无上限，预留没有意义。
+	// 必须在「额度已归零」判定之前处理——不限量的 QuotaRemaining 是哨兵值 -1，
+	// 会被下面的 <=0 分支当成「归零放行」蒙混过关，语义上说不通且脆弱。
+	if acc.QuotaUnlimited {
 		return true
 	}
 	// 额度未知，或额度已归零：没有额度可保护，放行。
