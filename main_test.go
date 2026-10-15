@@ -28,6 +28,11 @@ func TestMain(m *testing.M) {
 	if err := os.Chdir(dir); err != nil {
 		panic(err)
 	}
+	// 全局隔离 Dropbox 价格台账镜像：镜像路径是编译期常量，不受 cwd 影响，
+	// 任何测试触发 recordSitePriceSample → persistPriceLedgerLocked 都会把
+	// 测试内存样本写进生产 ledger（2026-10-15/16 两次污染事故根因）。
+	// routing 测试已有用例级 isolateLedgerMirror，这里兜底覆盖所有测试路径。
+	priceLedgerMirrorDir = dir
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)
