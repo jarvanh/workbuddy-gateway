@@ -163,7 +163,7 @@ func TestWarmupRateLimitHitsResetOnSuccess(t *testing.T) {
 			_, _ = w.Write([]byte("data: {\"error\":{\"data\":{\"code\":6004}}}\n\n"))
 			return
 		}
-		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":{\"total_tokens\":500,\"credit\":0}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":{\"total_tokens\":12000,\"credit\":0}}\n\n"))
 		_, _ = w.Write([]byte("data: [DONE]\n\n"))
 	}))
 	defer server.Close()

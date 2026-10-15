@@ -1146,7 +1146,7 @@ func TestUsageCreditAndObserveModelCost(t *testing.T) {
 	}
 
 	// 样本充足：credit=0 且 total_tokens 达标，判定为免费
-	observeModelCredit(acc, "free-model", map[string]any{"credit": float64(0), "total_tokens": float64(500)}, 1)
+	observeModelCredit(acc, "free-model", map[string]any{"credit": float64(0), "total_tokens": float64(12000)}, 1)
 	accountMu.Lock()
 	state := acc.ModelStates["free-model"]
 	accountMu.Unlock()
@@ -1170,7 +1170,7 @@ func TestKnownFreeModelUsesExhaustedAccountAndLogs(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n")
-		_, _ = io.WriteString(w, "data: {\"choices\":[{\"finish_reason\":\"stop\"}],\"usage\":{\"credit\":0,\"total_tokens\":500}}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"finish_reason\":\"stop\"}],\"usage\":{\"credit\":0,\"total_tokens\":12000}}\n\n")
 		_, _ = io.WriteString(w, "data: [DONE]\n\n")
 	}))
 	defer server.Close()

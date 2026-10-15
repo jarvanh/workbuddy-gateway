@@ -203,13 +203,21 @@ func probeAccountModel(ctx context.Context, acc *Account, model string) probeRes
 		return result
 	}
 
+	// 2026-10-15 修正：max_tokens=300 只是上限，模型实际只生成 ~200 tokens，
+	// 低倍率模型的真实扣费低于 credit 显示精度 0.01 被抹成 0，曾被误判 free。
+	// 一并拉高 max_tokens 并对 flash 模型填充提示词（计费含输入 tokens），
+	// 确保样本量达到扣费精度下限（见 models.go probeTargetMaxTokens 注释）。
+	probeUserContent := probePrompt
+	if strings.Contains(strings.ToLower(model), "flash") {
+		probeUserContent = probePromptFiller + probePrompt
+	}
 	body := map[string]any{
 		"model":      model,
 		"stream":     true,
-		"max_tokens": 300,
+		"max_tokens": probeTargetMaxTokens,
 		"messages": []any{
 			map[string]any{"role": "system", "content": defaultSystemPrompt},
-			map[string]any{"role": "user", "content": probePrompt},
+			map[string]any{"role": "user", "content": probeUserContent},
 		},
 	}
 	payload, err := json.Marshal(body)
@@ -281,9 +289,11 @@ func probeAccountModel(ctx context.Context, acc *Account, model string) probeRes
 		result.Detail = fmt.Sprintf("usage.credit=%s，收费", formatQuota(credit))
 		return result
 	}
-	if tokens < modelFreeMinTokens {
+	// 免费=「实测确实没扣钱」，证据标准必须高于收费判定：credit 显示精度
+	// 0.01，样本不足时真实扣费可能被抹成 0（2026-10-15 intl glm-5.3-flash）。
+	if tokens < probeFreeMinTokens() {
 		result.Status = "unknown"
-		result.Detail = fmt.Sprintf("credit=0 但样本过小（total_tokens=%d < %d），不判定免费", tokens, modelFreeMinTokens)
+		result.Detail = fmt.Sprintf("credit=0 但样本过小（total_tokens=%d < %d），不判定免费", tokens, probeFreeMinTokens())
 		return result
 	}
 	observeModelCredit(acc, model, usage, 0)

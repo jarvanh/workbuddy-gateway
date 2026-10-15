@@ -690,6 +690,51 @@ func mergeCatalogs(live, npm []catalogModel) []catalogModel {
 // 缓存
 // -----------------------------------------------------------------------------
 
+const (
+	// probeTargetMaxTokens 探针请求的 max_tokens：按目录最高倍率 0.79x 的精度
+	// 下限取 16000（0.01/(0.79×24.2e-6) ≈ 523，留足余量覆盖更低倍率模型）。
+	probeTargetMaxTokens = 16000
+	// probePromptFillerUnit 填充片段：单条约 60 tokens，重复拼出大批输入。
+	probePromptFillerUnit = "Evaporation lifts water vapor from oceans; condensation " +
+		"forms clouds; precipitation returns rain and snow to the surface; runoff " +
+		"gathers into rivers; infiltration refills aquifers; transpiration releases " +
+		"vapor from leaves; the cycle renews itself across every basin and season. "
+	// probePromptFillerRepeats 填充片段重复次数（约 8500 tokens 输入侧样本）。
+	probePromptFillerRepeats = 36
+)
+
+// probePromptFiller 对 flash 模型填充提示词：计费按 prompt+completion 统计，
+// flash 模型响应短，仅拉高 max_tokens 不保证实际 tokens 达标，填充输入侧。
+// 约 8500 tokens，叠加输出后任何倍率 ≥0.05 的模型扣费都能越过显示精度。
+var probePromptFiller = "Before answering, silently review the following background " +
+	"notes and keep them in mind. The notes describe the water cycle in detail: " +
+	strings.Repeat(probePromptFillerUnit, probePromptFillerRepeats)
+
+// probeFreeMinTokens 返回 credit=0 可判免费的最小样本。modelFreeMinTokens
+// 已按 2026-10-15 精度事故提升到 8300；此封装保证阈值语义集中在探针侧。
+func probeFreeMinTokens() int64 { return int64(modelFreeMinTokens) }
+
+// invalidateSubPrecisionFreeProbes 启动时清退「样本量不足以证明免费」的探针结论。
+// 2026-10-15 intl glm-5.3-flash 事故：232 tokens 探针的真实扣费低于显示精度
+// 被抹成 0，verdict=free 与账本真实扣费证据矛盾。这类结论不可靠，启动时统一
+// 作废，等下一轮加大样本后的探针或真实流量重新定性。
+func invalidateSubPrecisionFreeProbes() {
+	minTokens := probeFreeMinTokens()
+	invalidated := 0
+	for key, p := range modelProbes {
+		if p.Verdict != "free" || p.Tokens >= minTokens {
+			continue
+		}
+		p.Verdict = ""
+		p.Detail = fmt.Sprintf("credit=0 但样本过小（total_tokens=%d < %d），作废旧结论待重新探测", p.Tokens, minTokens)
+		modelProbes[key] = p
+		invalidated++
+	}
+	if invalidated > 0 {
+		log.Printf("[Models] 价格精度修正：作废 %d 条样本不足的 free 探针结论（阈值 %d tokens），待重新探测", invalidated, minTokens)
+	}
+}
+
 func loadModelsCache() {
 	data, err := os.ReadFile(modelsCacheFile)
 	if err != nil {
@@ -713,6 +758,7 @@ func loadModelsCache() {
 	}
 	if len(cache.Probes) > 0 {
 		modelProbes = cache.Probes
+		invalidateSubPrecisionFreeProbes()
 	}
 	dynamicSource = cache.Source
 	modelsMu.Unlock()
@@ -1494,11 +1540,18 @@ func probeModelPriceEx(acc *Account, model string) probeOutcome {
 		return probeOutcome{Status: "skipped", Detail: reason}
 	}
 
+	// 2026-10-15 修正：旧探针 max_tokens=300 只是上限，模型实际只生成 ~200
+	// tokens，低倍率模型的真实扣费低于 credit 显示精度 0.01 被抹成 0。
+	// 拉高上限并对 flash 模型填充提示词（计费含输入 tokens）保样本达标。
+	probeUserContent := probePrompt
+	if strings.Contains(strings.ToLower(model), "flash") {
+		probeUserContent = probePromptFiller + probePrompt
+	}
 	payload, _ := json.Marshal(map[string]any{
-		"model": model, "stream": true, "max_tokens": 300,
+		"model": model, "stream": true, "max_tokens": probeTargetMaxTokens,
 		"messages": []any{
 			map[string]any{"role": "system", "content": defaultSystemPrompt},
-			map[string]any{"role": "user", "content": probePrompt},
+			map[string]any{"role": "user", "content": probeUserContent},
 		},
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -1545,8 +1598,8 @@ func probeModelPriceEx(acc *Account, model string) probeOutcome {
 		out.Verdict, out.Detail = "paid", fmt.Sprintf("usage.credit=%s 收费", formatQuota(credit))
 		return out
 	}
-	if tokens < modelFreeMinTokens {
-		out.Detail = fmt.Sprintf("credit=0 但样本过小（total_tokens=%d < %d），不判定", tokens, modelFreeMinTokens)
+	if tokens < probeFreeMinTokens() {
+		out.Detail = fmt.Sprintf("credit=0 但样本过小（total_tokens=%d < %d），不判定", tokens, probeFreeMinTokens())
 		return out
 	}
 	out.Verdict, out.Detail = "free", fmt.Sprintf("usage.credit=0，total_tokens=%d 免费", tokens)

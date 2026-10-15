@@ -155,7 +155,7 @@ func TestDefaultDisabledPriceProbeStillLearnsFromNormalRequests(t *testing.T) {
 		usage map[string]any
 		want  string
 	}{
-		{"learn-free", map[string]any{"credit": 0, "total_tokens": 100}, modelCostFree},
+		{"learn-free", map[string]any{"credit": 0, "total_tokens": 12000}, modelCostFree},
 		{"learn-paid", map[string]any{"credit": 1.5, "total_tokens": 10}, modelCostPaid},
 	} {
 		observeModelCredit(acc, tc.model, tc.usage, 1)

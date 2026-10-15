@@ -560,9 +560,11 @@ const (
 	modelCostPaid    = "paid"
 	modelProbeDelay  = 5 * time.Minute
 
-	// modelFreeMinTokens 判定“免费模型”所需的最小样本：上游对极小请求也可能记
-	// credit=0（例如探针请求），那不是真正的免费，不能据此让零余额账号请求收费模型。
-	modelFreeMinTokens = 100
+	// modelFreeMinTokens 判定“免费模型”所需的最小样本：credit 显示精度 0.01，
+	// 低倍率模型（目录最低 0.05x）极小请求的真实扣费会被显示抹成 0 ——
+	// 2026-10-15 intl glm-5.3-flash（0.206x）232 tokens 探针被判 free 的根因。
+	// 下限 = 0.01/(0.05×24.2e-6) ≈ 8300 tokens；不足该样本的 credit=0 一律不判免费。
+	modelFreeMinTokens = 8300
 )
 
 type modelRuntimeState struct {

@@ -55,10 +55,10 @@ func TestProbeAccountModelLearnsFreeAndPaid(t *testing.T) {
 	acc := probeAccount()
 	withProbeAccount(t, acc, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte(sseWithUsage(`{"credit":0,"total_tokens":500}`)))
+		_, _ = w.Write([]byte(sseWithUsage(`{"credit":0,"total_tokens":12000}`)))
 	})
 	res := probeAccountModel(context.Background(), acc, "hy3")
-	if res.Status != "free" || res.Tokens != 500 {
+	if res.Status != "free" || res.Tokens != 12000 {
 		t.Fatalf("expected free, got %+v", res)
 	}
 	accountMu.Lock()
