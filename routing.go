@@ -357,6 +357,17 @@ func siteCreditRate(site, model string) (float64, bool) {
 	return s.Credit / float64(s.Tokens), true
 }
 
+// siteSample 同 siteCreditRate，但一并返回样本 token 量（供锚点挑选时评估证据量）。
+func siteSample(site, model string) (rate float64, tokens int64, ok bool) {
+	sitePriceMu.Lock()
+	s := sitePriceSamples[site+"|"+normalizeModelName(model)]
+	sitePriceMu.Unlock()
+	if s == nil || s.Tokens <= 0 {
+		return 0, 0, false
+	}
+	return s.Credit / float64(s.Tokens), s.Tokens, true
+}
+
 // priceConfidence 价格结论可信度。
 type priceConfidence int
 
@@ -378,9 +389,70 @@ func lastCreditFor(site, model string) float64 {
 	return s.LastCredit
 }
 
+// lastKnownCredit 返回该站点该模型「最近一次已知扣费金额」：
+// 真实请求台账的 lastCredit 优先，无台账样本时退回探针记录的单笔扣费；
+// 都没有返回 0。用于「付费但无法定标」时的预算兜底判断。
+func lastKnownCredit(site, model string) float64 {
+	if last := lastCreditFor(site, model); last >= 0 {
+		return last
+	}
+	return modelProbePaidCredit(site, model)
+}
+
+// anchorSiteRate 返回锚点站点的实测 credit/token 比率。
+func anchorSiteRate(anchor *routingAnchor) (float64, bool) {
+	if anchor == nil || anchor.Multiplier <= 0 {
+		return 0, false
+	}
+	if rate, ok := siteCreditRate(anchor.Site, anchor.Model); ok && rate > 0 {
+		return rate, true
+	}
+	return 0, false
+}
+
+// dynamicAnchor 在配置锚点没有台账样本时，从目录里挑一个「倍率可信
+// （促销未过期）且台账有样本」的模型充当锚——锚不再依赖某个固定模型的流量
+// 分布（2026-10-15 事故：锚点配在 cn flash，flash 样本却全在 intl，校准断供）。
+// 校准语义（决策 17）允许跨站点：锚与目标只要求同为站点级 ledger，
+// 倍率↔credit 汇率视为全站通用（见 TestSiteLedgerCalibration）。
+// 挑选标准：台账样本 token 最多（证据最足）；并列取倍率大者——校准值偏高
+// 只会让价格闸更严，偏低则可能放走超价模型。
+func dynamicAnchor(configured *routingAnchor) *routingAnchor {
+	if _, ok := anchorSiteRate(configured); ok {
+		return configured
+	}
+	modelsMu.RLock()
+	all := make(map[string][]catalogModel, len(catalogModels))
+	for site, entries := range catalogModels {
+		all[site] = append([]catalogModel(nil), entries...)
+	}
+	modelsMu.RUnlock()
+
+	var best *routingAnchor
+	var bestTokens int64
+	for site, entries := range all {
+		for _, e := range entries {
+			if !e.HasMultiplier || e.Multiplier <= 0 || e.PromoExpired {
+				continue
+			}
+			rate, tokens, ok := siteSample(site, e.ID)
+			if !ok || rate <= 0 {
+				continue
+			}
+			if best == nil || tokens > bestTokens || (tokens == bestTokens && e.Multiplier > best.Multiplier) {
+				id := e.ID
+				best = &routingAnchor{Model: id, Site: site, Multiplier: e.Multiplier}
+				bestTokens = tokens
+			}
+		}
+	}
+	return best
+}
+
 // classifyPrice 返回价格结论与可信度。
 // 口径（决策 17）：catalog（促销有效）> 站点级 ledger 校准 > probe 存在性。
 // 校准要求锚点与目标同源（同为站点级 ledger）；混源比率会被小样本偏差污染（约 14 倍）。
+// 锚点优先用配置项；配置锚没有台账样本时退到同站点目录里的动态锚（dynamicAnchor）。
 func classifyPrice(site, model string) (float64, priceConfidence) {
 	// 1) 官方倍率：仅在促销有效时可信
 	if e, ok := modelEntry(site, model); ok && e.HasMultiplier && !e.PromoExpired {
@@ -394,11 +466,10 @@ func classifyPrice(site, model string) (float64, priceConfidence) {
 		if lastCreditFor(site, model) <= 0 {
 			return 0, priceFree // 最近一次免费 → 当前按免费处理
 		}
-		anchor := routingSnapshot().PriceAnchor
-		if anchor != nil && anchor.Multiplier > 0 {
-			if anchorRate, ok := siteCreditRate(anchor.Site, anchor.Model); ok && anchorRate > 0 {
-				return anchor.Multiplier * (rate / anchorRate), pricePaidNum
-			}
+		cfg := routingSnapshot()
+		anchor := dynamicAnchor(cfg.PriceAnchor)
+		if anchorRate, ok := anchorSiteRate(anchor); ok && anchorRate > 0 {
+			return anchor.Multiplier * (rate / anchorRate), pricePaidNum
 		}
 		return 0, pricePaidUnk // 付费但无法定标
 	}
@@ -410,6 +481,32 @@ func classifyPrice(site, model string) (float64, priceConfidence) {
 		return 0, pricePaidUnk
 	}
 	return 0, priceUnknown
+}
+
+// exceedsBudget 兜底判断「付费但无法定标」的模型是否超出价格预算：
+// 无法校准出倍率时，拿最近一次已知扣费（真实请求 lastCredit 优先、探针其次）
+// 与 maxPrice 直接比较。2026-10-15 事故：hy4-preview-f 目录无条目、探针无结论、
+// 校准断供，三路全盲导致 728 笔 × 最高 52.5 credit 放行——此兜底保证只要有
+// 扣费证据就能被价格闸裁决。无任何扣费证据（纯未知）返回 false 不拦截，
+// 保留首次请求学习价格的能力。
+func exceedsBudget(site, model string, maxPrice float64) bool {
+	if maxPrice <= 0 {
+		return false
+	}
+	if _, conf := classifyPrice(site, model); conf != pricePaidUnk {
+		return false
+	}
+	credit := lastKnownCredit(site, model)
+	return credit > maxPrice
+}
+
+// billedEvidence 判断该站点该模型是否有「实测被扣费」的证据（真实请求或探针）。
+// 用于余额保护：只要有扣费证据，即使价格无法定标也按付费模型对待。
+func billedEvidence(site, model string) bool {
+	if last := lastCreditFor(site, model); last > 0 {
+		return true
+	}
+	return modelProbeVerdict(site, model) == "paid"
 }
 
 // effectiveMultiplier 返回该站点该模型的「有效倍率」，用于价格闸与 cheapest-first。
@@ -524,6 +621,8 @@ func evaluateSiteWithLimit(r routingSiteRule, model string, now time.Time, loc *
 	// 2) 时段窗口：窗口内视为该站免费期（政策表达），直接放行、不受价格闸影响。
 	//    窗口必须先于价格闸：如 hy4-preview cn 夜间免费而目录价仍标 0.29x，
 	//    价格闸先行会把免费窗口一并封死（以方案 §九 运行推演为准）。
+	//    但扣费证据优先于政策：窗口期内被实测扣过费（上游改价/政策收回），
+	//    窗口不得继续充当价格闸旁路（2026-10-15 事故：hy4 系窗口内被扣费）。
 	inWindow := false
 	hasWindow := false
 	if r.Window != nil {
@@ -542,12 +641,18 @@ func evaluateSiteWithLimit(r routingSiteRule, model string, now time.Time, loc *
 		} else {
 			inWindow = cur >= startMin && cur < endMin
 		}
-		if inWindow {
+		if inWindow && !billedEvidence(r.Site, model) {
 			return siteInWindow
 		}
 	}
-	// 3) 价格闸（无窗口或窗口外）：超过上限即禁止
+	// 3) 价格闸（无窗口或窗口外）：超过上限即禁止。
+	//    effectiveMultiplier 只在价格数值可信（pricePaidNum）时给出数值；
+	//    「付费但无法定标」（pricePaidUnk）由 exceedsBudget 用最近已知扣费
+	//    兜底比对——有扣费证据就裁决，不再因定标失败而全放行。
 	if mult := effectiveMultiplier(r.Site, model); mult > maxPrice {
+		return siteForbidden
+	}
+	if exceedsBudget(r.Site, model, maxPrice) {
 		return siteForbidden
 	}
 	if !hasWindow {
@@ -733,9 +838,13 @@ func guardMinBalance(acc *Account, model string) bool {
 		return true
 	}
 	_, conf := classifyPrice(accountSite(acc), model)
-	if conf == priceFree || conf == priceUnknown {
+	if conf == priceFree {
 		return true
 	}
+	if conf == priceUnknown && !billedEvidence(accountSite(acc), model) {
+		return true // 纯无数据：放行，保留首次请求学习价格的能力
+	}
+	// 有扣费证据但无法定标（pricePaidUnk）与价格已知（pricePaidNum）同权：保底生效。
 	if !acc.QuotaKnown {
 		return true // 额度未知时不做判断
 	}
@@ -754,9 +863,10 @@ func guardMinBalance(acc *Account, model string) bool {
 //
 // 预留额口径：
 //   - 确认免费（priceFree）：0 —— 免费模型不受限，零余额账号仍可服务；
-//   - 价格已知/可校准（pricePaidNum、pricePaidUnk）：minBalanceGuard；
-//   - 价格未知（priceUnknown）：minBalanceGuard × 10 —— 未知价可能极贵
+//   - 价格已知/可校准（pricePaidNum）、付费但无法定标（pricePaidUnk）：minBalanceGuard；
+//   - 价格未知（priceUnknown，无任何扣费证据）：minBalanceGuard × 10 —— 未知价可能极贵
 //     （事故中 intl hy4-preview 目录标 x0.00，实际等效 x66），按最坏情况预留。
+//     一旦出现扣费证据（billedEvidence），即降为普通付费口径。
 
 const (
 	inFlightReserveTTL    = 30 * time.Minute // 超时未释放的兜底回收阈值
@@ -805,9 +915,10 @@ func reserveInFlightLocked(acc *Account, reqID uint64, model string) bool {
 	}
 	avail := acc.QuotaRemaining - inFlightReservedLocked(acc)
 	reserve := guard
-	if conf == priceUnknown {
+	if conf == priceUnknown && !billedEvidence(accountSite(acc), model) {
 		reserve = guard * inFlightUnknownFactor
 	}
+	// 有扣费证据但无法定标（pricePaidUnk）：按 guard 预留（与 pricePaidNum 同权）。
 	if avail-reserve < 0 {
 		log.Printf("[InFlight] 账号 %s 模型 %s 在途预留超限：剩余=%.2f 在途已占=%.2f 本笔预留=%.2f，跳过该账号",
 			acc.Path, model, acc.QuotaRemaining, acc.QuotaRemaining-avail, reserve)

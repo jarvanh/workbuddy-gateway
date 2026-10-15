@@ -951,6 +951,18 @@ func modelProbeVerdict(site, modelID string) string {
 	return modelProbes[probeKey(site, modelID)].Verdict
 }
 
+// modelProbePaidCredit 返回探测判定为收费时记录的单笔扣费（无判定或免费返回 0）。
+// 用于「付费但无法定标」时的预算兜底：拿最近一次已知的扣费金额直接比 maxPrice。
+func modelProbePaidCredit(site, modelID string) float64 {
+	modelsMu.RLock()
+	defer modelsMu.RUnlock()
+	p := modelProbes[probeKey(site, modelID)]
+	if p.Verdict != "paid" {
+		return 0
+	}
+	return p.Credit
+}
+
 // modelDisplayMultiplier 生成 monitor 附表的倍率文案。
 // 促销过期只表示折扣结束，倍率回落到 credits 原价，并不等于"价格未知"；
 // 只有实测确认收费、且接口给不出有效倍率时，才显示「收费(倍率未知)」。
