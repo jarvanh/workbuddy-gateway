@@ -10,9 +10,22 @@ import (
 	"time"
 )
 
+// isolateLedgerMirror 把价格账本的 Dropbox 镜像重定向到临时目录。
+// 镜像路径是编译期写死的绝对路径（/dropbox/...），不受测试 cwd 影响——
+// 2026-10-15 事故：跑 go test 时测试进程把内存样本覆盖写进生产台账，
+// 7 条样本只剩 1 条，重启后价格记忆近乎清零。
+func isolateLedgerMirror(t *testing.T) {
+	t.Helper()
+	saved := priceLedgerMirrorDir
+	priceLedgerMirrorDir = t.TempDir()
+	t.Cleanup(func() { priceLedgerMirrorDir = saved })
+}
+
 // setTestRouting 装载测试配置并清理预算，避免用例互相污染。
+// 同时隔离 Dropbox 台账镜像：凡经此入口的用例不得触碰生产 ledger。
 func setTestRouting(t *testing.T, cfg routingConfig) {
 	t.Helper()
+	isolateLedgerMirror(t)
 	setRouting(cfg)
 	resetRoutingSpend()
 }
