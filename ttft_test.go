@@ -65,14 +65,12 @@ func TestTTFTAllResponsePaths(t *testing.T) {
 		{"chat_stream", func(w http.ResponseWriter, r *http.Request, resp *http.Response, a *Account, s time.Time) {
 			streamChatResponse(w, r, resp, "metric-model", 1, a, &profileCN, s)
 		}},
-		{"chat_aggregate", func(w http.ResponseWriter, r *http.Request, resp *http.Response, a *Account, s time.Time) {
-			writeChatAggregate(w, r, resp, "metric-model", 1, a, &profileCN, s)
-		}},
+		// 注：fork 已将上游 writeChatAggregate / writeResponsesAggregate 重构为
+		// handleNonStreamUpstream（聚合前不写响应头，支持账号池回退重试），
+		// 其聚合路径由 upstreamretry_test.go / main_test.go / stream_timeout_test.go 覆盖，
+		// 此处仅保留仍存在的直写路径。同步上游 v1.14.19 时确认过。
 		{"responses_stream", func(w http.ResponseWriter, r *http.Request, resp *http.Response, a *Account, s time.Time) {
 			streamResponsesResponse(w, r, resp, "metric-model", 1, a, &profileCN, s)
-		}},
-		{"responses_aggregate", func(w http.ResponseWriter, r *http.Request, resp *http.Response, a *Account, s time.Time) {
-			writeResponsesAggregate(w, r, resp, "metric-model", 1, a, &profileCN, s)
 		}},
 		{"messages_stream", func(w http.ResponseWriter, r *http.Request, resp *http.Response, a *Account, s time.Time) {
 			streamMessagesResponse(w, r, resp, "metric-model", 1, a, &profileCN, s, true)

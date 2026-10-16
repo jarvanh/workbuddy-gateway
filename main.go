@@ -4800,7 +4800,9 @@ func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Respo
 	statsObserveUsage(r, usage, scanErr == nil && finishReason != "")
 	recordModelTokens(modelName, usage, reqID)
 	recordUsageLine(r, modelName, usage)
-	recordModelTTFT(modelName, body.duration())
+	// TTFT 不在此处显式记账：defer finishFirstToken 已统一结算（完整性只由上游流决定，
+	// 截断流不计入平均）。同步上游 v1.14.19 时删掉 fork 遗留的显式
+	// recordModelTTFT 调用，避免与 finishFirstToken 双计（samples=2/sum=2x）。
 	recordModelLatency(modelName, time.Since(startTime))
 	if scanErr == nil && finishReason != "" {
 		log.Printf("[#%d] 流式输出完成 (账号 %s [%s], 结束原因=%s, 耗时 %v, 首Token(v2) %s)", reqID, acc.Path, prof.Label, finishReason, time.Since(startTime), body.text())
