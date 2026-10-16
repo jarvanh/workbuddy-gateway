@@ -228,6 +228,11 @@ type sitePriceSample struct {
 	// 累积 Credit 仍可能 >0，用累积会把当期免费的模型误判为收费。
 	// 累积 Credit/Tokens 只用于数值定价（大样本校准），不做 free/paid 判定。
 	LastCredit float64 `json:"lastCredit"`
+	// UpdatedAt 是 LastCredit 的落账时刻（Unix 秒）。
+	// 只有 12h 内的扣费才可作为「当前价位」证据参与预算兜底；过期说明
+	// 价格水平可能已漂移，但不否认「曾经被扣费」——billedEvidence 不看本字段。
+	// 旧版台账（schema 1 无本字段）加载后为 0，按已过期处理 → 放行一笔重新学习。
+	UpdatedAt int64 `json:"updatedAt,omitempty"`
 }
 
 var (
@@ -245,7 +250,11 @@ var (
 // 落盘后重启不再失明；镜像到 Dropbox 后，runner 重置（/tmp 清空）也能恢复价格记忆。
 
 const (
-	priceLedgerSchema      = 1
+	// priceLedgerSchema 2（2026-10-16）：sitePriceSample 增加 UpdatedAt，
+	// 预算兜底只采信 12h 内的扣费作为「当前价位」。读取同时兼容 schema 1
+	//（无 per-sample 时间戳 → 按已过期处理，放行一笔重新学习），
+	// 累积 Credit/Tokens/LastCredit 仍保留，供 billedEvidence 与倍率校准使用。
+	priceLedgerSchema      = 2
 	priceLedgerMirrorEvery = 30 * time.Second // Dropbox 镜像节流间隔
 )
 
@@ -308,7 +317,7 @@ func loadPriceLedger() {
 			continue
 		}
 		var d priceLedgerFileData
-		if err := json.Unmarshal(data, &d); err != nil || d.Schema != priceLedgerSchema {
+		if err := json.Unmarshal(data, &d); err != nil || (d.Schema != 1 && d.Schema != priceLedgerSchema) {
 			continue
 		}
 		sitePriceMu.Lock()
@@ -319,7 +328,7 @@ func loadPriceLedger() {
 			sitePriceSamples[k] = v
 		}
 		sitePriceMu.Unlock()
-		log.Printf("[PriceLedger] 已恢复 %d 条站点价格样本（来源=%s）", len(d.Samples), p)
+		log.Printf("[PriceLedger] 已恢复 %d 条站点价格样本（来源=%s schema=%d，schema1 样本无时间戳按已过期处理）", len(d.Samples), p, d.Schema)
 		return
 	}
 }
@@ -341,6 +350,7 @@ func recordSitePriceSample(site, model string, tokens int64, credit float64) {
 	s.Tokens += tokens
 	s.Credit += credit
 	s.LastCredit = credit
+	s.UpdatedAt = time.Now().Unix()
 	// 落盘：重启不得让价格记忆清零（2026-09-29 事故根因之一）
 	persistPriceLedgerLocked()
 	sitePriceMu.Unlock()
@@ -389,14 +399,42 @@ func lastCreditFor(site, model string) float64 {
 	return s.LastCredit
 }
 
-// lastKnownCredit 返回该站点该模型「最近一次已知扣费金额」：
-// 真实请求台账的 lastCredit 优先，无台账样本时退回探针记录的单笔扣费；
-// 都没有返回 0。用于「付费但无法定标」时的预算兜底判断。
-func lastKnownCredit(site, model string) float64 {
-	if last := lastCreditFor(site, model); last >= 0 {
-		return last
+// priceFreshnessWindow 价格证据新鲜度窗口（2026-10-16 主人决策：12 小时）。
+// 窗口内的扣费记录代表「当前价位」，可参与预算兜底；窗口外只证明
+// 「曾经被扣费」（billedEvidence 语义不变），不再代表现价——放行一笔
+// 重新学习真实价格。若价格真上涨，该笔扣费会立即刷新台账并恢复封禁
+// （漂移上限 = 1 笔）；变便宜则自然恢复可用。
+const priceFreshnessWindow = 12 * time.Hour
+
+// lastCreditFreshAt 返回台账样本的落账时刻；无样本返回 0。
+// 旧版台账（schema 1 无 updatedAt 字段）加载后即为 0，天然按已过期处理，
+// 等价于升级后各模型一次性重学——正是本版上线的期望行为。
+func lastCreditFreshAt(site, model string) int64 {
+	sitePriceMu.Lock()
+	s := sitePriceSamples[site+"|"+normalizeModelName(model)]
+	sitePriceMu.Unlock()
+	if s == nil {
+		return 0
 	}
-	return modelProbePaidCredit(site, model)
+	return s.UpdatedAt
+}
+
+// lastKnownCreditFresh 返回「当前价位」证据：12h 内的台账 lastCredit 优先，
+// 其次 12h 内的探针扣费；都没有（或证据已过期）返回 0。
+// 用于「付费但无法定标」时的预算兜底判断——过期证据不得裁决现价。
+func lastKnownCreditFresh(site, model string, now time.Time) float64 {
+	if ts := lastCreditFreshAt(site, model); ts > 0 && now.Unix()-ts < int64(priceFreshnessWindow/time.Second) {
+		if last := lastCreditFor(site, model); last >= 0 {
+			return last
+		}
+	}
+	modelsMu.RLock()
+	p := modelProbes[probeKey(site, model)]
+	modelsMu.RUnlock()
+	if p.Verdict == "paid" && p.LastProbeAt > 0 && now.Unix()-p.LastProbeAt < int64(priceFreshnessWindow/time.Second) {
+		return p.Credit
+	}
+	return 0
 }
 
 // anchorSiteRate 返回锚点站点的实测 credit/token 比率。
@@ -484,19 +522,22 @@ func classifyPrice(site, model string) (float64, priceConfidence) {
 }
 
 // exceedsBudget 兜底判断「付费但无法定标」的模型是否超出价格预算：
-// 无法校准出倍率时，拿最近一次已知扣费（真实请求 lastCredit 优先、探针其次）
-// 与 maxPrice 直接比较。2026-10-15 事故：hy4-preview-f 目录无条目、探针无结论、
-// 校准断供，三路全盲导致 728 笔 × 最高 52.5 credit 放行——此兜底保证只要有
-// 扣费证据就能被价格闸裁决。无任何扣费证据（纯未知）返回 false 不拦截，
-// 保留首次请求学习价格的能力。
-func exceedsBudget(site, model string, maxPrice float64) bool {
+// 无法校准出倍率时，拿新鲜窗口（12h）内最近一次已知扣费（真实请求
+// lastCredit 优先、探针其次）与 maxPrice 直接比较。2026-10-15 事故：
+// hy4-preview-f 目录无条目、探针无结论、校准断供，三路全盲导致
+// 728 笔 × 最高 52.5 credit 放行——此兜底保证只要有新鲜扣费证据就能被
+// 价格闸裁决。2026-10-16 增加新鲜度约束：证据超过 12h 视为无当前价位
+// 证据（返回 false 不拦截），放行一笔重新学习，避免旧价位快照永久裁决
+// 漂移后的真实价格（尤其被 403 封禁的模型永远拿不到新样本）。
+// 无任何扣费证据（纯未知）同样返回 false，保留首次请求学习价格的能力。
+func exceedsBudget(site, model string, maxPrice float64, now time.Time) bool {
 	if maxPrice <= 0 {
 		return false
 	}
 	if _, conf := classifyPrice(site, model); conf != pricePaidUnk {
 		return false
 	}
-	credit := lastKnownCredit(site, model)
+	credit := lastKnownCreditFresh(site, model, now)
 	return credit > maxPrice
 }
 
@@ -647,12 +688,13 @@ func evaluateSiteWithLimit(r routingSiteRule, model string, now time.Time, loc *
 	}
 	// 3) 价格闸（无窗口或窗口外）：超过上限即禁止。
 	//    effectiveMultiplier 只在价格数值可信（pricePaidNum）时给出数值；
-	//    「付费但无法定标」（pricePaidUnk）由 exceedsBudget 用最近已知扣费
-	//    兜底比对——有扣费证据就裁决，不再因定标失败而全放行。
+	//    「付费但无法定标」（pricePaidUnk）由 exceedsBudget 用 12h 内的
+	//    最近已知扣费兜底比对——证据新鲜就裁决，不再因定标失败而全放行；
+	//    证据过期视为无当前价位证据，放行一笔重新学习。
 	if mult := effectiveMultiplier(r.Site, model); mult > maxPrice {
 		return siteForbidden
 	}
-	if exceedsBudget(r.Site, model, maxPrice) {
+	if exceedsBudget(r.Site, model, maxPrice, now) {
 		return siteForbidden
 	}
 	if !hasWindow {
@@ -870,7 +912,7 @@ func guardMinBalance(acc *Account, model string) bool {
 
 const (
 	inFlightReserveTTL    = 30 * time.Minute // 超时未释放的兜底回收阈值
-	inFlightUnknownFactor = 10              // 未知价模型的预留放大倍数
+	inFlightUnknownFactor = 10               // 未知价模型的预留放大倍数
 )
 
 // inFlightReserve 单笔在途请求的预留记录。

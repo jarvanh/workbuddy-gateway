@@ -11,6 +11,7 @@ package main
 //   4. 有扣费证据的模型一律受保底余额约束（与可校准付费模型同权）。
 
 import (
+	"os"
 	"testing"
 	"time"
 )
@@ -64,7 +65,7 @@ func TestBudgetFallbackUsesProbeCredit(t *testing.T) {
 	setTestRouting(t, cfg)
 	loc := routingLocation(cfg)
 
-	modelProbes[probeKey("intl", "m-ghost-p")] = modelPriceProbe{Verdict: "paid", Credit: 5.28, Tokens: 385}
+	modelProbes[probeKey("intl", "m-ghost-p")] = modelPriceProbe{Verdict: "paid", Credit: 5.28, Tokens: 385, LastProbeAt: time.Now().Unix()}
 	defer delete(modelProbes, probeKey("intl", "m-ghost-p"))
 
 	if st := evaluateSite(routingSiteRule{Site: "intl"}, "m-ghost-p", time.Now(), loc, cfg); st != siteForbidden {
@@ -72,9 +73,15 @@ func TestBudgetFallbackUsesProbeCredit(t *testing.T) {
 	}
 
 	// 对照：探针扣费在预算内（0.05）仍放行——预算兜底不扩大打击面
-	modelProbes[probeKey("intl", "m-ghost-p")] = modelPriceProbe{Verdict: "paid", Credit: 0.05, Tokens: 385}
+	modelProbes[probeKey("intl", "m-ghost-p")] = modelPriceProbe{Verdict: "paid", Credit: 0.05, Tokens: 385, LastProbeAt: time.Now().Unix()}
 	if st := evaluateSite(routingSiteRule{Site: "intl"}, "m-ghost-p", time.Now(), loc, cfg); st != siteAllowed {
 		t.Fatalf("探针扣费 0.05 未超预算应放行，实际=%v", st)
+	}
+
+	// 对照：探针结论超过 12h 视为无当前价位证据 → 放行重学（价格可能已变）
+	modelProbes[probeKey("intl", "m-ghost-p")] = modelPriceProbe{Verdict: "paid", Credit: 5.28, Tokens: 385, LastProbeAt: time.Now().Add(-13 * time.Hour).Unix()}
+	if st := evaluateSite(routingSiteRule{Site: "intl"}, "m-ghost-p", time.Now(), loc, cfg); st != siteAllowed {
+		t.Fatalf("过期探针证据不得裁决现价，应放行重学，实际=%v", st)
 	}
 }
 
@@ -93,6 +100,62 @@ func TestBudgetFallbackDisabledWhenMaxPriceZero(t *testing.T) {
 	recordSitePriceSample("intl", "m-billed", 385, 16.85)
 	if st := evaluateSite(routingSiteRule{Site: "intl"}, "m-billed", time.Now(), loc, cfg); st != siteAllowed {
 		t.Fatalf("maxPrice=0 时预算兜底应停用，实际=%v", st)
+	}
+}
+
+// setSiteSample 测试辅助：直接写入指定时间戳的台账样本。
+func setSiteSample(site, model string, s sitePriceSample) {
+	sitePriceMu.Lock()
+	sitePriceSamples[site+"|"+normalizeModelName(model)] = &s
+	sitePriceMu.Unlock()
+}
+
+// TestBudgetEvidenceExpiresAfterFreshnessWindow 台账 lastCredit 只代表
+// 「12h 内的价位」：过期证据不得封禁（放行重学），新鲜证据恢复裁决。
+// 背景：被 403 封禁的模型拿不到新样本，旧价会被永久冻结——
+// 主人 2026-10-16 指出「万一现在价格又有了变动呢」，本用例钉住该语义。
+func TestBudgetEvidenceExpiresAfterFreshnessWindow(t *testing.T) {
+	setupBudgetTest(t)
+	catalogModels = map[string][]catalogModel{}
+	t.Cleanup(func() { catalogModels = map[string][]catalogModel{} })
+
+	cfg := defaultRoutingConfig()
+	cfg.MaxPrice = 0.06
+	setTestRouting(t, cfg)
+	loc := routingLocation(cfg)
+	rule := routingSiteRule{Site: "intl"}
+
+	old := time.Now().Add(-13 * time.Hour).Unix()
+	setSiteSample("intl", "m-stale", sitePriceSample{Credit: 900, Tokens: 62500, LastCredit: 16.85, UpdatedAt: old})
+	if st := evaluateSite(rule, "m-stale", time.Now(), loc, cfg); st != siteAllowed {
+		t.Fatalf("过期台账证据应放行一笔重新学习，实际=%v", st)
+	}
+
+	setSiteSample("intl", "m-stale", sitePriceSample{Credit: 916.85, Tokens: 62885, LastCredit: 16.85, UpdatedAt: time.Now().Unix()})
+	if st := evaluateSite(rule, "m-stale", time.Now(), loc, cfg); st != siteForbidden {
+		t.Fatalf("新鲜台账证据应恢复预算裁决，实际=%v", st)
+	}
+}
+
+// TestLedgerSchema1SamplesLoadExpired 升级兼容：schema 1 台账（无时间戳）
+// 加载后扣费证据保留（billedEvidence / 校准可用），但不代表现价（预算兜底不用）。
+func TestLedgerSchema1SamplesLoadExpired(t *testing.T) {
+	setupBudgetTest(t)
+	doc := `{"schema":1,"updatedAt":1792030000,"samples":{"intl|m-old":{"credit":4186.3,"tokens":188565436,"lastCredit":16.85}}}`
+	if err := os.WriteFile(priceLedgerFile, []byte(doc), 0600); err != nil {
+		t.Fatal(err)
+	}
+	loadPriceLedger()
+	t.Cleanup(resetSitePriceSamples)
+
+	if last := lastCreditFor("intl", "m-old"); last != 16.85 {
+		t.Fatalf("schema1 样本应保留 lastCredit 供证据与校准，实际=%v", last)
+	}
+	if ts := lastCreditFreshAt("intl", "m-old"); ts != 0 {
+		t.Fatalf("schema1 样本无时间戳应按已过期处理，实际 ts=%d", ts)
+	}
+	if c := lastKnownCreditFresh("intl", "m-old", time.Now()); c != 0 {
+		t.Fatalf("过期证据不得作为现价参与预算兜底，实际=%v", c)
 	}
 }
 
