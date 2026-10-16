@@ -23,8 +23,8 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map())
   function element(id) {
     if (!elements.has(id)) {
       const node = {innerHTML: "", textContent: "", className: "", value: "", checked: false, disabled: false,
-            querySelector() { return this; }, querySelectorAll() { return []; },
-            addEventListener() {}, focus() {}};
+            style: {}, querySelector() { return this; }, querySelectorAll() { return []; },
+            addEventListener() {}, focus() {}, removeAttribute() {}, setAttribute() {}};
       node.classList = {
         add(name) { node.className += " " + name; },
         remove(name) { node.className = node.className.split(/\s+/).filter(v => v !== name).join(" "); },
@@ -60,10 +60,14 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map())
   let source = fs.readFileSync(path.join(projectRoot, "web", "app.js"), "utf8");
   source = source.replace(/\}\)\(\);\s*$/, `globalThis.review = {
     state, api, renderAccounts, renderModels, renderStatus, refreshActive,
+    renderPoolHealth, renderAccountAlerts, loadAccountAlerts, lockDashboard,
     saveKey, saveAPISettings, initializeAdmin, discoverSetup,
     showConfigWarning, loadConfigEditor, saveConfigEditor, exitConfigEdit, setTab, lockDashboard,
     initListFilters, changeListFilter, reportRestoredListFilters,
     rateCell, rateKey, rateDetailHTML, ensureRateDetails, toggleRateDetail, restoreRateDetails
+    , renderStats, loadStats, changeStatsFilter, statsLineChart, statsComboChart, statsDuration, statsNumber, statsCredit
+    , openAddAccount, startAddAccount, pollAddAccount, closeAddAccount, accountRowActions
+    , initStatsFilter, writeStatsFilterCookie, readStatsFilterCookie
   };})();`);
   vm.createContext(context);
   vm.runInContext(source, context);
@@ -74,11 +78,120 @@ function cells(html) {
   return [...html.matchAll(/<td(?: [^>]*)?>(.*?)<\/td>/g)].map(m => m[1]);
 }
 
+test("运行状态只展示健康度，无账号和过旧快照不能显示100%", () => {
+  const f = fixture();
+  f.review.renderPoolHealth({health: {percent: 100, state: "healthy"}});
+  assert.equal(f.element("poolHealth").textContent, "100%");
+  assert.equal(f.element("poolHealthBar").style.width, "100%");
+  f.review.renderPoolHealth({health: {percent: 66.6, state: "degraded"}});
+  assert.equal(f.element("poolHealth").textContent, "66.6%");
+  assert.match(f.element("poolHealthStatus").textContent, /部分受限/);
+  f.review.renderPoolHealth({health: {percent: null, state: "empty"}});
+  assert.equal(f.element("poolHealth").textContent, "—");
+  assert.match(f.element("poolHealthStatus").textContent, /未加载账号/);
+  f.review.renderPoolHealth({stale: true, health: {percent: 100, state: "healthy"}});
+  assert.equal(f.element("poolHealth").textContent, "—");
+  assert.equal(f.element("poolHealthBar").style.width, "0%");
+  const html = fs.readFileSync(path.join(projectRoot, "web/index.html"), "utf8");
+  assert(!html.includes('id="summaryCards"'));
+  assert(!html.includes('id="siteSummary"'));
+  assert(html.includes('id="accountsTable"'), "账号池详细状态不能删掉");
+  audit("账号池健康度通过", {unknown_not_100: true, count_cards_removed: true});
+});
+test("总览最上面是运行状态（健康度与告警），用量与性能在其后", () => {
+  const html = fs.readFileSync(path.join(projectRoot, "web/index.html"), "utf8");
+  const start = html.indexOf('id="panel-overview"');
+  const end = html.indexOf('id="panel-accounts"');
+  assert(start > -1 && end > start, "总览面板必须存在");
+  const overview = html.slice(start, end);
+  const heading = overview.indexOf("overview-subheading");
+  const health = overview.indexOf("health-layout");
+  const usage = overview.indexOf("usage-section");
+  const info = overview.indexOf("gatewayInfo");
+  assert(heading > -1 && health > -1 && usage > -1 && info > -1, "总览必须包含运行状态、用量与运行信息");
+  assert(heading < health && health < usage, "运行状态必须排在用量与性能之前");
+  assert(usage < info, "运行信息仍应排在最后");
+  audit("总览区块顺序通过", {health_first: true, usage_after_health: true});
+});
+
+
+test("账号日志告警分级、脱敏文本转义、已恢复记录剔除和登录退出清理", () => {
+  const f = fixture();
+  const alerts = [
+    {account: "paused.json", state: "paused", severity: "notice", label: "账号停用", message: "主动停用", at: 1791980002, logFile: "gateway.log"},
+    {account: "dead<script>.json", state: "disabled", severity: "urgent", label: "账号失效", message: '<img src=x onerror="alert(1)">', at: 1791980001, logFile: "gateway.log"},
+    {account: "expired.json", state: "expired", severity: "important", label: "账号过期", message: "请检查续期", at: 1791980000, logFile: "gateway-2026-10-14.log"}
+  ];
+  f.review.state.lastStatus = {accounts: [
+    {path: "expired.json", state: "active"},
+    {path: "dead<script>.json", state: "disabled"},
+    {path: "paused.json", state: "active", schedulingEnabled: false}
+  ]};
+  f.review.renderAccountAlerts({alerts, source: "gateway 普通日志"});
+  const html = f.element("accountAlerts").innerHTML;
+  assert(!html.includes("expired.json"), "恢复后不能继续展示过期告警");
+  assert(html.includes("alert-urgent") && html.includes("紧急"));
+  assert(html.includes("alert-notice") && html.includes("提示"));
+  assert(html.includes("&lt;script&gt;") && !html.includes("<img"));
+  assert(html.indexOf("paused.json") < html.indexOf("dead&lt;script&gt;.json"), "较新的提示告警必须在较旧紧急告警之前，前端不得重新按等级排序");
+  assert.match(f.element("accountAlertsInfo").textContent, /最新告警在上/);
+  assert(!f.element("accountAlertsInfo").textContent.includes("按紧急程度排序"));
+  f.review.renderAccountAlerts({alerts: [], missingLogCount: 1, scanTruncated: true});
+  assert.match(f.element("accountAlerts").innerHTML, /暂未找到对应日志/);
+  assert.match(f.element("accountAlertsInfo").textContent, /读取上限/);
+  f.review.lockDashboard();
+  assert.equal(f.review.state.lastAccountAlerts, null);
+  assert(!f.element("accountAlerts").innerHTML.includes("dead"));
+  audit("账号告警展示通过", {recovered_removed: true, escaped: true, logout_cleared: true});
+});
+
+test("新状态快照恢复后立即剔除旧告警，无需等待再次扫描日志", () => {
+  const f = fixture();
+  const payload = {alerts: [
+    {account: "cooling.json", state: "cooldown", severity: "warning", label: "账号冷却",
+      message: "等待恢复", at: 1791980005, logFile: "gateway.log"},
+    {account: "paused.json", state: "paid_exhausted", severity: "important", label: "积分用尽",
+      message: "等待额度", at: 1791980004, logFile: "gateway.log"},
+    {account: "paused.json", state: "paused", severity: "notice", label: "账号停用",
+      message: "主动停用", at: 1791980003, logFile: "gateway.log"}
+  ]};
+  f.review.state.lastStatus = {accounts: [
+    {path: "cooling.json", state: "cooldown"},
+    {path: "paused.json", state: "paid_exhausted", schedulingEnabled: false}
+  ]};
+  f.review.renderAccountAlerts(payload);
+  assert.match(f.element("accountAlerts").innerHTML, /账号冷却/);
+  assert.match(f.element("accountAlerts").innerHTML, /积分用尽/);
+  // renderStatus re-filters the existing payload on the normal status poll.
+  f.review.renderStatus({accounts: [
+    {path: "cooling.json", state: "active"},
+    {path: "paused.json", state: "active", schedulingEnabled: false}
+  ]});
+  const html = f.element("accountAlerts").innerHTML;
+  assert(!html.includes("账号冷却") && !html.includes("积分用尽"));
+  assert(html.includes("账号停用"), "额度恢复不能自动撤销用户主动停用");
+  audit("新快照剔除已恢复告警通过", {log_rescan_required: false, manual_pause_preserved: true});
+});
+
+test("告警日志加载失败保留旧结果，不假报无异常", async () => {
+  const f = fixture(async route => route === "/admin/api/client-events" ? response(204, {}) : response(503, {error: "日志不可读"}));
+  f.review.state.apiKey = "synthetic-admin";
+  f.element("accountAlerts").innerHTML = "原有告警";
+  await f.review.loadAccountAlerts();
+  assert.equal(f.element("accountAlerts").innerHTML, "原有告警");
+  assert.match(f.element("accountAlertsInfo").textContent, /不代表账号池没有异常/);
+  assert.equal(f.review.state.accountAlertsPending, false);
+  audit("告警加载失败保留结果通过");
+});
+
 test("已知零值显示0，未知额度仍显示横线", () => {
   const f = fixture();
   f.review.renderAccounts([{path: "fixture.json", state: "active", quotaKnown: true}]);
   let row = cells(f.element("accountsTable").innerHTML);
-  for (const i of [7, 8, 9, 11, 12, 15]) assert.equal(row[i], "0");
+  for (const i of [7, 8, 9, 11, 12, 14]) assert.equal(row[i], "0");
+  assert.equal(row.length, 16, "账号表应为 16 列（已去掉刷新令牌到期）");
+  const accountsPage = fs.readFileSync(path.join(projectRoot, "web/index.html"), "utf8");
+  assert(!accountsPage.includes("刷新令牌到期"), "表头不应保留已删除的列");
   f.review.renderAccounts([{path: "fixture.json", state: "active", quotaKnown: false}]);
   row = cells(f.element("accountsTable").innerHTML);
   for (const i of [7, 8, 9]) assert.equal(row[i], "-");
@@ -663,4 +776,398 @@ test("展开原始日志后，轮询刷新不会把它自动折叠", async () =>
   assert.equal(f.review.state.openRawLogs["cn|hy3"], undefined);
   assert(!/<details class='rate-raw' open>/.test(f.review.rateDetailHTML(payload, "cn", "hy3")));
   audit("原始日志展开状态在轮询后保持通过");
+});
+
+// ---- 总览 · 用量与性能 ------------------------------------------------------
+
+function statsBucket(label, over = {}) {
+  return Object.assign({start: 0, label, requests: 0, success: 0, failed: 0, tokens: 0, inputTokens: 0,
+    outputTokens: 0, cachedTokens: 0, tokenSamples: 0, credits: 0, creditSamples: 0, ttftSamples: 0,
+    avgLatencyMs: null, avgTtftMs: null}, over);
+}
+
+function statsPayload(over = {}) {
+  return Object.assign({
+    period: "day", account: "", timezone: "Asia/Shanghai", ttftMetric: "first_token_v2", start: "2026-09-15", end: "2026-10-14",
+    startedAt: 1760000000000, accounts: [{id: "acc-a", file: "workbuddy-a.json", edition: "cn"}],
+    summary: {requests: 2, success: 1, failed: 1, tokens: 300, inputTokens: 200, outputTokens: 100,
+      cachedTokens: 50, tokenSamples: 1, credits: 1.25, creditSamples: 1, ttftSamples: 1,
+      avgLatencyMs: 1200, avgTtftMs: 300},
+    buckets: [statsBucket("2026-10-13", {requests: 1, success: 1, tokens: 300, inputTokens: 200,
+      outputTokens: 100, cachedTokens: 50, tokenSamples: 1, credits: 1.25, creditSamples: 1,
+      ttftSamples: 1, avgLatencyMs: 1200, avgTtftMs: 300}), statsBucket("2026-10-14")],
+    models: [
+      {model: "deepseek-v4.1-flash", requests: 3, success: 3, failed: 0, tokens: 900000,
+        inputTokens: 700000, outputTokens: 200000, cachedTokens: 100000, tokenSamples: 3,
+        credits: 4.5, creditSamples: 3, ttftSamples: 3, avgLatencyMs: 1500, avgTtftMs: 400},
+      {model: "hy3", requests: 1, success: 1, failed: 0, tokens: 0, inputTokens: 0, outputTokens: 0,
+        cachedTokens: 0, tokenSamples: 0, credits: 0, creditSamples: 0, ttftSamples: 1,
+        avgLatencyMs: 800, avgTtftMs: 300},
+    ],
+    modelLatency: [
+      {model: "deepseek-v4.1-flash", avgLatencyMs: [1500, null], avgTtftMs: [400, null]},
+      {model: "hy3", avgLatencyMs: [null, 800], avgTtftMs: [null, 300]},
+    ],
+    storage: {mode: "file", message: "", lastSavedAt: 1760000000000},
+  }, over);
+}
+
+test("TTFT新旧口径隔离：旧快照不伪装成首Token，明确显示排除数", () => {
+  const f=fixture();
+  const old=statsPayload({ttftMetric: undefined});
+  old.summary.avgTtftMs=87190;
+  f.review.renderStats(old);
+  assert(!f.element("usageSummary").innerHTML.includes("87.19"));
+  assert.match(f.element("usageSummary").innerHTML,/平均首Token/);
+  assert.match(f.element("latencyLegend").innerHTML, /deepseek-v4\.1-flash/);
+  assert(!f.element("latencyChart").innerHTML.includes("平均首Token"));
+  const current=statsPayload();
+  current.summary.legacyTtftSamples=12;
+  f.review.renderStats(current);
+  assert.match(f.element("statsInfo").textContent,/排除 12 条/);
+  assert.match(f.element("statsInfo").textContent,/不等同于 dsh 当前会话/);
+  assert.match(f.element("usageSummary").innerHTML,/0\.30 s/);
+  f.review.renderModels({models:[{id:"legacy",avgTtftMs:87190,hasTtft:true}]});
+  assert(!f.element("modelsTable").innerHTML.includes("87.19"));
+  audit("首Token新旧样本隔离通过",{legacy_samples_excluded:true});
+});
+
+test("统计摘要区分未知与零值，并显示落盘状态", () => {
+  const f = fixture();
+  f.review.renderStats(statsPayload());
+  const cards = f.element("usageSummary").innerHTML;
+  assert.match(cards, /总消耗 Token/);
+  assert.match(cards, /1\.25/, "积分必须按实际 usage.credit 展示");
+  assert.match(cards, /1\/2 请求有积分/, "必须暴露积分样本覆盖数");
+  assert.equal(f.element("statsStorage").textContent, "stats.json · 已落盘");
+  // 无样本时显示未知，而不是 0。
+  f.review.renderStats(statsPayload({summary: {requests: 1, success: 1, failed: 0, tokenSamples: 0,
+    creditSamples: 0, ttftSamples: 0, avgLatencyMs: 900, avgTtftMs: null}}));
+  const unknown = f.element("usageSummary").innerHTML;
+  assert.match(unknown, /总消耗 Token<\/div><div class="usage-value">—</, "无 Token 样本不得显示为 0");
+  assert.match(unknown, /总消耗积分<\/div><div class="usage-value">—</, "无积分样本不得显示为 0");
+  // 仅内存模式必须给出明确提示，避免被当成已持久化。
+  f.review.renderStats(statsPayload({storage: {mode: "memory", message: "统计暂时无法写入，仍在内存统计"}}));
+  assert.equal(f.element("statsStorage").textContent, "仅内存 · 未落盘");
+  assert.match(f.element("statsStorage").className, /warn/);
+  assert.match(f.element("statsInfo").textContent, /统计暂时无法写入/);
+  audit("统计摘要与落盘状态展示通过", {unknown_not_zero: true, memory_mode_flagged: true});
+});
+
+test("耗时折线在缺失样本处断开，不伪造零值", () => {
+  const f = fixture();
+  const svg = f.review.statsLineChart([
+    statsBucket("2026-10-12", {avgLatencyMs: 1000, avgTtftMs: 200}),
+    statsBucket("2026-10-13"),
+    statsBucket("2026-10-14", {avgLatencyMs: 2000, avgTtftMs: 400}),
+  ], [
+    {label: "平均总耗时", color: "token", value: b => b.avgLatencyMs},
+    {label: "平均首字", color: "first", value: b => b.avgTtftMs},
+  ], "耗时", v => String(v));
+  assert.match(svg, /<svg /);
+  // 中间桶无样本 ⇒ 每序列各断开成两段，共 4 条折线路径。
+  assert.equal((svg.match(/class="chart-line series-token"/g) || []).length, 2);
+  assert.equal((svg.match(/class="chart-line series-first"/g) || []).length, 2);
+  assert.equal((svg.match(/class="chart-line/g) || []).length, 4, "缺失样本处必须断线");
+  assert.equal(f.review.statsLineChart([statsBucket("2026-10-14")], [
+    {label: "平均总耗时", color: "token", value: b => b.avgLatencyMs},
+  ], "耗时", String), '<p class="stats-empty">该时间范围暂无可用样本</p>', "全空必须显示空状态");
+  audit("耗时折线断点与空状态通过", {no_fake_zero: true, path_segments: 4});
+});
+
+test("请求耗时按模型分线，不把所有模型画成一条平均线", () => {
+  const f = fixture();
+  f.review.renderStats(statsPayload());
+  const svg = f.element("latencyChart").innerHTML;
+  const legend = f.element("latencyLegend").innerHTML;
+  assert(legend.indexOf("deepseek-v4.1-flash") < legend.indexOf("hy3"), "图例保持服务端顺序");
+  assert.equal((svg.match(/class="chart-line series-m0"/g) || []).length, 1);
+  assert.equal((svg.match(/class="chart-line series-m1"/g) || []).length, 1);
+  assert.equal((svg.match(/class="chart-line /g) || []).length, 2, "每个模型一条线");
+  assert.match(svg, /deepseek-v4\.1-flash 1\.50 s/);
+  assert.match(svg, /hy3 0\.80 s/);
+  assert(!svg.includes("series-token"), "不能再画所有模型合成的平均线");
+  f.review.renderStats(statsPayload({modelLatency: []}));
+  assert.match(f.element("latencyChart").innerHTML, /该时间范围暂无可用样本/);
+  assert.equal(f.element("latencyLegend").textContent, "");
+  audit("分模型耗时折线通过", {models: 2, blended_line: false});
+});
+
+test("模型用量排名按服务端顺序渲染，并跟随账号选择", () => {
+  const f = fixture();
+  f.review.renderStats(statsPayload({account: "acc-a"}));
+  const rows = f.element("statsTable").querySelector("tbody").innerHTML;
+  assert.match(rows, /deepseek-v4\.1-flash/);
+  assert.match(rows, /hy3/);
+  // 服务端已按用量排序，前端必须保持该顺序、不得重排。
+  assert(rows.indexOf("deepseek-v4.1-flash") < rows.indexOf("hy3"), "用量多的模型必须排在前");
+  assert.match(rows, /<td>1<\/td><td class='mono'>deepseek/, "必须显示排名序号");
+  assert.match(rows, /Token 0\/1/, "无 usage 的模型仍要列出并标出覆盖数");
+  assert(!/<td>\d{4}-\d{2}-\d{2}<\/td>/.test(rows), "明细不应再输出时间列");
+  const select = f.element("statsAccount").innerHTML;
+  assert.match(select, /全局 · 全部账号/);
+  assert.match(select, /workbuddy-a\.json · 国内/);
+  assert.equal(f.element("statsAccount").value, "acc-a", "必须保持当前选择");
+  assert.equal(f.element("statsStart").value, "2026-09-15");
+  assert.equal(f.element("statsEnd").value, "2026-10-14");
+  // 空范围给出明确空态，而不是空表。放在最后，避免重置上面的选择断言。
+  f.review.renderStats(statsPayload({models: []}));
+  assert.match(f.element("statsTable").querySelector("tbody").innerHTML, /没有模型调用记录/);
+  audit("模型用量排名渲染通过", {server_order_kept: true, no_time_column: true, empty_state: true});
+});
+
+// 回归：统计请求变慢或挂起时，状态轮询必须照常完成，不能被统计拖住。
+test("统计加载不阻塞状态轮询", async () => {
+  let releaseStatus;
+  const routes = [];
+  const f = fixture((route, options) => {
+    routes.push(route);
+    if (route === "/admin/api/client-events") return Promise.resolve(response(204, {}));
+    if (route.startsWith("/admin/api/stats")) return new Promise(() => {}); // 永不返回
+    return new Promise(resolve => { releaseStatus = resolve; });
+  });
+  f.review.state.apiKey = "synthetic-admin-key";
+  f.review.state.activeTab = "overview";
+  const pending = f.review.refreshActive();
+  releaseStatus(response(200, {gateway: {}, accounts: [], summary: {total: 0}}));
+  await pending;
+  assert.equal(f.review.state.refreshPending, false, "统计未返回不得让轮询一直处于 pending");
+  assert(routes.some(r => r.startsWith("/admin/api/stats")), "总览页应触发一次统计请求");
+  audit("统计不阻塞轮询通过", {stats_pending_isolated: true});
+});
+
+test("用量趋势合并为一张图：Token 折线 + 积分柱形，左右双轴", () => {
+  const f = fixture();
+  f.review.renderStats(statsPayload());
+  const svg = f.element("usageChart").innerHTML;
+  assert.match(svg, /class="chart-line series-token"/, "总 Token 必须画成折线");
+  assert.match(svg, /class="chart-bar series-credit"/, "积分必须画成柱形");
+  assert.equal((svg.match(/class="chart-line series-credit"/g) || []).length, 0, "积分不能再画折线");
+  assert.equal((svg.match(/class="chart-bar series-token"/g) || []).length, 0, "Token 不能再画柱形");
+  assert((svg.match(/class="chart-label"/g) || []).length >= 10, "Token 与积分量级不同，必须左右双轴");
+  assert(!/NaN|undefined/.test(svg), "图表不能出现 NaN 或 undefined");
+  audit("用量合并图通过", {token_line: true, credit_bar: true, dual_axis: true});
+});
+
+test("耗时趋势：首 Token 画柱形、总耗时画折线，且都按模型分开", () => {
+  const f = fixture();
+  f.review.renderStats(statsPayload());
+  const svg = f.element("latencyChart").innerHTML;
+  assert.equal((svg.match(/class="chart-line series-m0"/g) || []).length, 1, "总耗时仍是折线");
+  assert.equal((svg.match(/class="chart-line series-m1"/g) || []).length, 1);
+  assert.equal((svg.match(/class="chart-bar series-m0"/g) || []).length, 1, "首 Token 必须是柱形");
+  assert.equal((svg.match(/class="chart-bar series-m1"/g) || []).length, 1);
+  assert.equal((svg.match(/class="chart-line /g) || []).length, 2, "折线数等于模型数");
+  assert.equal((svg.match(/class="chart-bar /g) || []).length, 2, "柱形数等于模型数");
+  assert(!svg.includes("series-token"), "耗时图不能混入用量系列色");
+  audit("耗时柱线组合通过", {ttft_bar: true, latency_line: true, per_model: true});
+});
+
+test("双轴组合图：折线走左轴、柱形走右轴，缺样本处不补零", () => {
+  const f = fixture();
+  const svg = f.review.statsComboChart([
+    statsBucket("2026-10-13", {tokens: 2000000, tokenSamples: 1, credits: 20, creditSamples: 1}),
+    statsBucket("2026-10-14"),
+    statsBucket("2026-10-15", {tokens: 4000000, tokenSamples: 1, credits: 40, creditSamples: 1}),
+  ], {
+    lines: [{label: "总 Token", color: "token", value: b => (b.tokenSamples ? b.tokens : null)}],
+    bars: [{label: "积分", color: "credit", value: b => (b.creditSamples ? b.credits : null)}],
+    title: "双轴", leftFormat: v => (v / 1000000).toFixed(2) + "M",
+    rightFormat: v => Number(v).toFixed(2), box: {w: 600, h: 240}
+  });
+  assert.match(svg, /class="chart-line series-token"/);
+  assert.match(svg, /class="chart-bar series-credit"/);
+  assert((svg.match(/class="chart-label"/g) || []).length >= 10, "双轴必须有左右两套刻度");
+  assert.match(svg, /M<\/text>/, "左轴按 Token 单位显示，右轴按积分精度");
+  assert(!/NaN|undefined/.test(svg), "双轴不能出现 NaN 或 undefined");
+  assert.equal((svg.match(/class="chart-line series-token"/g) || []).length, 2, "中间桶缺样本要断线");
+  assert.equal((svg.match(/class="chart-bar series-credit"/g) || []).length, 2, "中间桶缺样本不画柱");
+  assert(!f.review.statsComboChart([statsBucket("2026-10-14")], {
+    lines: [], bars: [{label: "积分", color: "credit", value: b => (b.creditSamples ? b.credits : null)}],
+    title: "空", leftFormat: String, box: {w: 600, h: 240}
+  }).includes("<svg"), "全空必须显示空状态");
+  audit("双轴组合图通过", {gap_broken: true, dual_axis: true});
+});
+
+test("柱形与折线对齐：柱组中心落在同桶折线点的时间位置", () => {
+  const f = fixture();
+  const svg = f.review.statsComboChart([
+    statsBucket("2026-10-13", {tokens: 10, tokenSamples: 1, credits: 10, creditSamples: 1}),
+    statsBucket("2026-10-14", {tokens: 20, tokenSamples: 1, credits: 20, creditSamples: 1}),
+    statsBucket("2026-10-15", {tokens: 30, tokenSamples: 1, credits: 30, creditSamples: 1}),
+  ], {
+    lines: [{label: "总 Token", color: "token", value: b => (b.tokenSamples ? b.tokens : null)}],
+    bars: [{label: "积分", color: "credit", value: b => (b.creditSamples ? b.credits : null)}],
+    title: "对齐", leftFormat: String, box: {w: 600, h: 240}
+  });
+  const points = [...svg.matchAll(/<circle class="series-token" cx="([\d.]+)"/g)].map(m => Number(m[1]));
+  const centres = [...svg.matchAll(/<rect class="chart-bar series-credit" x="([\d.]+)" y="[\d.]+" width="([\d.]+)"/g)]
+    .map(m => Number(m[1]) + Number(m[2]) / 2);
+  assert.equal(points.length, 3, "折线点数量");
+  assert.equal(centres.length, 3, "柱形数量");
+  points.forEach((cx, i) => {
+    assert(Math.abs(centres[i] - cx) <= 1.5, "第 " + i + " 个柱组中心必须贴合同桶折线点: " + centres[i] + " vs " + cx);
+  });
+  audit("柱线对齐通过", {bars_centered_on_points: true});
+});
+
+test("账号池：添加账号表单复用登录流程，每行可删除凭据", async () => {
+  const calls = [];
+  const f = fixture(async (url, options) => {
+    const method = (options && options.method) || "GET";
+    calls.push(method + " " + url);
+    if (url === "/admin/api/account-add" && method === "GET") return response(200, {defaultFile: "workbuddy4.json"});
+    if (url === "/admin/api/account-add" && method === "POST") {
+      return response(200, {id: "login-abc", site: "cn", file: "workbuddy4.json", status: "pending",
+        authUrl: "https://example.test/auth?state=x", qrPng: "data:image/png;base64,AAAA"});
+    }
+    if (url.indexOf("/admin/api/account-add?id=") === 0) {
+      return response(200, {id: "login-abc", status: "done", savedAs: "workbuddy4.json"});
+    }
+    if (url === "/admin/api/account-cancel") return response(200, {cancelled: true});
+    if (url === "/admin/api/account-delete") return response(200, {deleted: "workbuddy9.json"});
+    if (url === "/admin/api/status") return response(200, {gateway: {}, accounts: [], summary: {total: 0}});
+    return response(200, {});
+  });
+  f.review.state.apiKey = "synthetic-admin";
+  f.review.state.activeTab = "accounts";
+
+  f.review.renderAccounts([{path: "workbuddy9.json", state: "active", schedulingEnabled: true, edition: "cn"}]);
+  const row = f.element("accountsTable").querySelector("tbody").innerHTML;
+  assert(row.includes('data-account-delete="workbuddy9.json"'), "每行必须有删除按钮并带出凭据名");
+
+  await f.review.openAddAccount();
+  assert.equal(f.element("addFile").value, "workbuddy4.json");
+  assert(!f.element("addFile").value.includes("/"), "默认名不能含路径");
+
+  await f.review.startAddAccount();
+  assert.equal(f.review.state.addAccountId, "login-abc");
+  assert.match(f.element("addAccountQr").src, /^data:image\/png;base64,/);
+  assert.match(f.element("addAccountLink").textContent, /example\.test/);
+
+  await f.review.pollAddAccount(true);
+  assert.equal(f.review.state.addAccountId, "", "完成后必须清空会话，避免继续轮询");
+  assert.match(f.element("addAccountStatus").textContent, /workbuddy4\.json/);
+  assert(calls.some(c => c.indexOf("GET /admin/api/status") === 0), "登录成功后应刷新账号池");
+
+  let asked = "";
+  const originalConfirm = f.window.confirm;
+  f.window.confirm = function (msg) { asked = msg; return true; };
+  await f.review.accountRowActions({target: {closest: () => ({getAttribute: () => "workbuddy9.json"})}});
+  f.window.confirm = originalConfirm;
+  assert.match(asked, /workbuddy9\.json/, "删除前必须确认并指名凭据");
+  assert(calls.indexOf("POST /admin/api/account-delete") > -1, "确认后必须提交删除请求");
+
+  const deletesBefore = calls.filter(c => c === "POST /admin/api/account-delete").length;
+  f.window.confirm = function () { return false; };
+  await f.review.accountRowActions({target: {closest: () => ({getAttribute: () => "workbuddy9.json"})}});
+  f.window.confirm = originalConfirm;
+  assert.equal(calls.filter(c => c === "POST /admin/api/account-delete").length, deletesBefore,
+    "取消确认时不能提交删除");
+
+  const cancelsBefore = calls.filter(c => c === "POST /admin/api/account-cancel").length;
+  await f.review.closeAddAccount();
+  assert(f.element("addAccountPanel").classList.contains("hidden"), "关闭后表单必须隐藏");
+  assert.equal(calls.filter(c => c === "POST /admin/api/account-cancel").length, cancelsBefore,
+    "没有进行中的会话时关闭不应请求取消");
+  audit("账号新增与删除通过", {default_name_no_path: true, confirm_required: true});
+});
+
+test("统计筛选记进 Cookie：粒度/范围/日期可恢复，失效账号退回全局", async () => {
+  const f = fixture(async () => response(200, statsPayload({account: "acc-a"})));
+  f.review.state.apiKey = "synthetic-admin";
+
+  // 用户改过粒度、范围与日期后查询，四项都应写进 Cookie。
+  f.element("statsPeriod").value = "week";
+  f.element("statsStart").value = "2026-10-01";
+  f.element("statsEnd").value = "2026-10-07";
+  f.review.state.statsDatesTouched = true;
+  f.element("statsAccount").value = "acc-a";
+  await f.review.changeStatsFilter(false);
+  const saved = JSON.parse(decodeURIComponent(f.cookies.get("gateway_stats_filter")));
+  assert.equal(saved.period, "week");
+  assert.equal(saved.account, "acc-a");
+  assert.equal(saved.start, "2026-10-01");
+  assert.equal(saved.end, "2026-10-07");
+  const stored = f.cookieWrites[f.cookieWrites.length - 1];
+  assert.match(stored, /Path=\/ui/);
+  assert.match(stored, /SameSite=Lax/);
+  assert.match(stored, /Max-Age=31536000/);
+
+  // 新会话带着同一个 Cookie 打开，控件自动回到上次选择。
+  const restored = fixture(async () => response(200, statsPayload({account: "acc-a"})), new Map(f.cookies));
+  restored.review.initStatsFilter();
+  assert.equal(restored.element("statsPeriod").value, "week");
+  assert.equal(restored.element("statsStart").value, "2026-10-01");
+  assert.equal(restored.element("statsEnd").value, "2026-10-07");
+  assert.equal(restored.review.state.statsAccount, "acc-a");
+
+  // 没动过日期时不冻结默认区间，Cookie 里的日期保持为空。
+  const plain = fixture(async () => response(200, {}), new Map());
+  plain.review.state.apiKey = "synthetic-admin";
+  plain.element("statsStart").value = "";
+  plain.element("statsEnd").value = "";
+  plain.review.state.statsDatesTouched = false;
+  await plain.review.changeStatsFilter(false);
+  const plainSaved = JSON.parse(decodeURIComponent(plain.cookies.get("gateway_stats_filter")));
+  assert.equal(plainSaved.start, "");
+  assert.equal(plainSaved.end, "");
+
+  // 记住的账号已被删除：服务端返回 400 后自动清掉并回到全局查询。
+  const seen = [];
+  const staleJar = new Map([["gateway_stats_filter",
+    encodeURIComponent(JSON.stringify({period: "day", account: "gone", start: "", end: ""}))]]);
+  const stale = fixture(async (url) => {
+    seen.push(url);
+    return url.indexOf("account=gone") > -1
+      ? response(400, {error: "账号统计标识不存在"})
+      : response(200, statsPayload());
+  }, staleJar);
+  stale.review.state.apiKey = "synthetic-admin";
+  stale.review.initStatsFilter();
+  assert.equal(stale.review.state.statsAccount, "gone");
+  await stale.review.loadStats(true);
+  assert.equal(stale.review.state.statsAccount, "", "失效账号必须被清掉");
+  assert(seen.some(function (u) { return u.indexOf("account=") === -1; }), "必须回退到全局查询");
+  assert.equal(JSON.parse(decodeURIComponent(stale.cookies.get("gateway_stats_filter"))).account, "");
+
+  audit("统计筛选 Cookie 通过", {restored: true, dates_opt_in: true, stale_account_fallback: true});
+});
+
+test("告警条目排成一行且不再有日志跳转；统计范围可按站点筛选；版本号可点", async () => {
+  const calls = [];
+  const f = fixture(async (url) => {
+    calls.push(url);
+    if (url.indexOf("/admin/api/stats?") === 0) return response(200, statsPayload());
+    return response(200, {});
+  });
+  f.review.state.apiKey = "synthetic-admin";
+  f.review.state.lastStatus = {accounts: [{path: "a.json", state: "cooldown"}]};
+  f.review.renderAccountAlerts({alerts: [{account: "a.json", state: "cooldown", severity: "warning",
+    label: "账号冷却", message: "等待恢复", at: 1791980005,
+    logFile: "gateway-2026-10-16.log", logOffset: 12345}]});
+  const alertHtml = f.element("accountAlerts").innerHTML;
+  assert(!alertHtml.includes("account-alert-source"), "日志来源整块必须删除");
+  assert(!alertHtml.includes("data-log-file"), "日志跳转入口必须删除");
+  assert(!alertHtml.includes("linklike"), "跳转按钮样式必须删除");
+  assert(/class="account-alert-head">[\s\S]*account-alert-file[\s\S]*<time>/.test(alertHtml),
+    "状态、类别、凭据与时间必须排在同一行");
+
+  f.review.renderStats(statsPayload());
+  const options = f.element("statsAccount").innerHTML;
+  assert(options.includes('value="site:intl"') && options.includes('value="site:cn"'),
+    "统计范围必须包含国际站与国内站");
+  f.element("statsAccount").value = "site:intl";
+  await f.review.changeStatsFilter(false);
+  const siteCall = calls.filter(function (u) { return u.indexOf("site=intl") > -1; });
+  assert(siteCall.length > 0, "选中站点后必须按 site 查询");
+  assert(siteCall.every(function (u) { return u.indexOf("account=") === -1; }), "站点与单账号不能同时下发");
+
+  f.review.renderStatus({gateway: {version: "1.14.17", listen: "127.0.0.1:8317", modelSource: "x"},
+    updatedAt: 1791980005, accounts: [], models: []});
+  const meta = f.element("meta").innerHTML;
+  assert(meta.includes('href="https://github.com/CangShui/workbuddy-gateway"'), "版本号必须指向项目地址");
+  assert(meta.includes('target="_blank"'), "必须在新标签页打开");
+  assert(meta.includes('rel="noreferrer"'), "必须带 rel=noreferrer");
+  audit("告警行重排与站点筛选通过", {jump_removed: true, site_scope: true, chip_link: true});
 });

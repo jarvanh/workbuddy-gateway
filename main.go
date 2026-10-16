@@ -39,7 +39,7 @@ import (
 // version 是网关版本号：默认取开发值，发布流水线会通过
 // -ldflags "-X main.version=<tag>" 注入 tag 版本（因此必须是 var 而非 const）。
 //
-// ⚠️ 上游把这里改成了 const(version = "1.14.3")，fork 不同步这一改动：
+// ⚠️ 上游把这里改成了 const 形态（截至 v1.14.19 仍如此），fork 不同步这一改动：
 // const 会让 release 流水线的 -ldflags 注入失效（Go 不允许对 const 做 linker 注入），
 // 发版产物会永远显示源码里的开发版本号。保留 var 形态。
 var version = "1.13.1"
@@ -272,6 +272,8 @@ func isTransientNetworkError(err error) bool {
 //
 // 返回的 cancel 用于在流式读取结束后取消上游 context（调用方负责）。
 func doUpstreamRequest(r *http.Request, acc *Account, prof *upstreamProfile, upstreamBytes []byte, reqID uint64, traceID string) (*http.Response, context.CancelFunc, error) {
+	// 兼容直接调用与测试；正常入口已经在协议转换前准备完成。只生成一次，不能在 try 循环里重建。
+	prepareConversationContext(r, nil)
 	var lastErr error
 	_, _, retries := upstreamSettings()
 	for try := 0; try <= retries; try++ {
@@ -1158,6 +1160,7 @@ func loadAccounts() error {
 	// 恢复持久化的失效账号标记（凭据文件已删除，仅供控制台提示重新登录）
 	loadDisabledMarkers()
 	restoreAccountRuntimeStateLocked()
+	restoreStatsAccountStatesLocked()
 
 	if len(accounts) == 0 {
 		return fmt.Errorf("未找到有效凭据，请先执行 login 命令扫码登录")
@@ -3424,24 +3427,25 @@ func runRefresh() {
 
 // accountSnapshot 是写入状态快照文件的单个账号状态。
 type accountSnapshot struct {
-	Path              string  `json:"path"`
-	SchedulingEnabled *bool   `json:"schedulingEnabled,omitempty"`
-	SchedulingReason  string  `json:"schedulingReason,omitempty"`
-	Edition           string  `json:"edition,omitempty"` // 站点标识（cn/intl）
-	Nickname          string  `json:"nickname"`
-	UID               string  `json:"uid"`
-	State             string  `json:"state"` // active | cooldown | paid_exhausted | expired | disabled
-	CooldownUntil     int64   `json:"cooldownUntil,omitempty"`
-	CooldownMsg       string  `json:"cooldownMsg,omitempty"`
-	DisabledReason    string  `json:"disabledReason,omitempty"`
-	TokenExpiresAt    int64   `json:"tokenExpiresAt,omitempty"`
-	QuotaTotal        float64 `json:"quotaTotal,omitempty"`
-	QuotaUsed         float64 `json:"quotaUsed,omitempty"`
-	QuotaRemaining    float64 `json:"quotaRemaining"`
-	IsPaidUser        bool    `json:"isPaidUser"`
-	PlanLabel         string  `json:"planLabel,omitempty"` // 官方套餐名称或已知短名称
-	PlanCheckedAt     int64   `json:"planCheckedAt,omitempty"`
-	PlanStale         bool    `json:"planStale,omitempty"`
+	Alerts            []accountAlertMark `json:"alerts,omitempty"`
+	Path              string             `json:"path"`
+	SchedulingEnabled *bool              `json:"schedulingEnabled,omitempty"`
+	SchedulingReason  string             `json:"schedulingReason,omitempty"`
+	Edition           string             `json:"edition,omitempty"` // 站点标识（cn/intl）
+	Nickname          string             `json:"nickname"`
+	UID               string             `json:"uid"`
+	State             string             `json:"state"` // active | cooldown | paid_exhausted | expired | disabled
+	CooldownUntil     int64              `json:"cooldownUntil,omitempty"`
+	CooldownMsg       string             `json:"cooldownMsg,omitempty"`
+	DisabledReason    string             `json:"disabledReason,omitempty"`
+	TokenExpiresAt    int64              `json:"tokenExpiresAt,omitempty"`
+	QuotaTotal        float64            `json:"quotaTotal,omitempty"`
+	QuotaUsed         float64            `json:"quotaUsed,omitempty"`
+	QuotaRemaining    float64            `json:"quotaRemaining"`
+	IsPaidUser        bool               `json:"isPaidUser"`
+	PlanLabel         string             `json:"planLabel,omitempty"` // 官方套餐名称或已知短名称
+	PlanCheckedAt     int64              `json:"planCheckedAt,omitempty"`
+	PlanStale         bool               `json:"planStale,omitempty"`
 	// 登录续期状态：刷新令牌到期时间与最近成功续期时间，便于提前发现需要重新登录的账号。
 	RefreshExpiresAt int64                         `json:"refreshExpiresAt,omitempty"`
 	LastRefreshTime  int64                         `json:"lastRefreshTime,omitempty"`
@@ -3465,6 +3469,7 @@ type modelStateSnapshot struct {
 
 // statusSnapshot 是写入 workbuddy-status.json 的完整快照。
 type statusSnapshot struct {
+	AlertSource  string              `json:"alertSource,omitempty"`
 	UpdatedAt    int64               `json:"updatedAt"`
 	Accounts     []accountSnapshot   `json:"accounts"`
 	Models       []modelStatSnapshot `json:"models,omitempty"`
@@ -3559,6 +3564,7 @@ func writeStatusSnapshot() error {
 	}
 	annotateAccountPolicies(snap.Accounts)
 	snap.ModelCatalog = buildAllModelStatSnapshots(now, accounts)
+	captureAccountStatsLocked()
 	for _, row := range snap.ModelCatalog {
 		if disabled, _ := modelDisabled(row.ID); !disabled {
 			snap.Models = append(snap.Models, row)
@@ -3580,6 +3586,13 @@ func writeStatusSnapshot() error {
 	}
 	accountMu.Unlock()
 
+	// 告警标记与快照同一次写入，避免出现「快照已异常、日志还没扫到」的时间差。
+	marks := recordAccountAlertMarks(snap.Accounts, snap.UpdatedAt)
+	for i := range snap.Accounts {
+		snap.Accounts[i].Alerts = marks[snap.Accounts[i].Path]
+	}
+	snap.AlertSource = alertSourceSnapshot
+
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
 		return err
@@ -3589,7 +3602,10 @@ func writeStatusSnapshot() error {
 	if err := os.WriteFile(tmp, data, 0600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, statusSnapshotFile)
+	if err := os.Rename(tmp, statusSnapshotFile); err != nil {
+		return err
+	}
+	return nil
 }
 
 func displayWidth(s string) int {
@@ -3851,10 +3867,11 @@ func runMonitor() {
 }
 
 func runLogin() {
-	prof := &profileCN
+	site := "cn"
 	if cfg.LoginIntl {
-		prof = &profileINTL
+		site = "intl"
 	}
+	prof := profileForEdition(site)
 
 	fmt.Println("================ WorkBuddy 登录 ================")
 	fmt.Printf("目标站点:     %s (%s)\n", prof.Label, strings.TrimPrefix(prof.Base, "https://"))
@@ -3863,32 +3880,14 @@ func runLogin() {
 	}
 	fmt.Println("正在生成登录凭据与二维码...")
 
-	loginClient := &http.Client{
-		Timeout: 30 * time.Second,
-		Jar:     cfg.HttpClient.Jar,
-	}
-
-	// 轮询 auth/token 时与官方客户端一致，显式声明无 Authorization
-	pollHeaders := func(r *http.Request) {
-		commonHeaders(r, prof)
-		r.Header.Set("X-No-Authorization", "1")
-	}
-
-	data, _, err := doJSON(loginClient, http.MethodPost, prof.authStateURL(), nil, bytes.NewReader([]byte("{}")))
+	// 与网页「添加账号」共用同一条登录流程，避免 CLI 与网页两套实现漂移。
+	s, err := beginAccountLogin(site, cfg.AuthFile)
 	if err != nil {
-		fmt.Printf("获取登录状态失败: %v\n", err)
-		return
-	}
-	var st authStateData
-	_ = json.Unmarshal(data, &st)
-	if st.State == "" || st.AuthURL == "" {
-		fmt.Println("上游返回的登录状态信息异常，请重试。")
+		fmt.Printf("%v\n", err)
 		return
 	}
 
-	// 终端字符二维码
-	qr, err := qrcode.New(st.AuthURL, qrcode.Medium)
-	if err == nil {
+	if qr, qrErr := qrcode.New(s.AuthURL, qrcode.Medium); qrErr == nil {
 		if cfg.LoginIntl {
 			fmt.Println("\n请用手机扫描下方二维码，并在浏览器中完成登录（邮箱 / 验证码 / SSO 等）：")
 		} else {
@@ -3896,68 +3895,37 @@ func runLogin() {
 		}
 		fmt.Println(qr.ToSmallString(false))
 	}
-
 	fmt.Println("如无法扫码，也可在浏览器中直接打开以下链接：")
-	fmt.Printf("%s\n\n", st.AuthURL)
+	fmt.Printf("%s\n\n", s.AuthURL)
 	fmt.Println("等待登录授权完成 (按 Ctrl+C 可取消)...")
 
-	deadline := time.Now().Add(prof.LoginTTL)
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			if time.Now().After(deadline) {
-				fmt.Println("\n登录已超时，请重新执行 login 命令。")
-				return
-			}
-			tokRaw, _, errTok := doJSON(loginClient, http.MethodGet, prof.authTokenURL(st.State), pollHeaders, nil)
-			if errTok != nil {
-				continue
-			}
-			var tok tokenData
-			if err := json.Unmarshal(tokRaw, &tok); err != nil || tok.AccessToken == "" {
-				continue
-			}
-
-			// 登录成功，拉取账号信息
-			var acct accountData
-			acctHeaders := func(r *http.Request) {
-				commonHeaders(r, prof)
-				r.Header.Set("Authorization", "Bearer "+tok.AccessToken)
-			}
-			if acctRaw, _, errAcct := doJSON(loginClient, http.MethodGet, prof.loginAcctURL(st.State), acctHeaders, nil); errAcct == nil {
-				_ = json.Unmarshal(acctRaw, &acct)
-			}
-
-			sa := &StoredAuth{
-				Edition: prof.Key,
-				Auth: StoredTokens{
-					AccessToken:  tok.AccessToken,
-					RefreshToken: tok.RefreshToken,
-					ExpiresAt:    time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix(),
-					Domain:       tok.Domain,
-				},
-				Account: StoredAccount{
-					UID:          acct.UID,
-					EnterpriseID: acct.EnterpriseID,
-					Nickname:     acct.Nickname,
-				},
-			}
-
-			if err := saveAuth(sa); err != nil {
-				fmt.Printf("\n登录成功但保存凭据失败: %v\n", err)
-				return
-			}
-
+	for range ticker.C {
+		snap := s.snapshot()
+		switch snap["status"] {
+		case "done":
 			fmt.Println("\n登录成功")
 			fmt.Printf("站点:         %s (%s)\n", prof.Label, strings.TrimPrefix(prof.Base, "https://"))
-			fmt.Printf("欢迎，%s (UID: %s)\n", sa.Account.Nickname, sa.Account.UID)
-			fmt.Printf("凭据已成功保存至: %s\n", cfg.AuthFile)
-			fmt.Printf("令牌有效期至: %s\n", formatDisplayTime(time.Unix(sa.Auth.ExpiresAt, 0)))
-			fmt.Println("\n现在您可以运行以下命令启动网关服务：")
+			if acct, ok := snap["account"].(map[string]any); ok {
+				fmt.Printf("欢迎，%v (UID: %v)\n", acct["nickname"], acct["uid"])
+				if exp, ok := acct["tokenExpiresAt"].(int64); ok && exp > 0 {
+					// 沿用 fork 约定：用户可见时间统一按 UTC+8 渲染
+					fmt.Printf("访问令牌有效期至: %s\n", formatDisplayTime(time.Unix(exp, 0)))
+				}
+			}
+			fmt.Printf("凭据已成功保存到: %s\n", cfg.AuthFile)
+			fmt.Println("\n现在可以启动网关服务：")
 			fmt.Println("  workbuddy-gateway serve")
+			return
+		case "failed":
+			fmt.Printf("\n%v\n", snap["error"])
+			return
+		case "expired":
+			fmt.Println("\n登录已超时，请重新执行 login 命令。")
+			return
+		case "cancelled":
+			fmt.Println("\n登录已取消。")
 			return
 		}
 	}
@@ -3982,6 +3950,7 @@ func runServe() {
 	configCtx, stopConfigReload := context.WithCancel(context.Background())
 	defer stopConfigReload()
 	loadModelsCache()
+	loadOptionalStats()
 	loadProbeDaily()   // 恢复当日探测汇总计数：重启不得让「每日探测汇总」数字偏低（2026-10-10 修复）
 	loadRoutingSpend() // v6：恢复站点模型预算消耗（重启不再清零）
 	loadPriceLedger()  // 恢复站点价格账本：重启不得让价格记忆清零（2026-09-29 事故修复）
@@ -4020,6 +3989,16 @@ func runServe() {
 
 	// 启动状态快照协程（monitor 命令实时读取展示）
 	go statusSnapshotLoop()
+	statsCtx, stopStats := context.WithCancel(context.Background())
+	statsDone := make(chan struct{})
+	go func() {
+		defer close(statsDone)
+		statsPersistenceLoop(statsCtx)
+	}()
+	defer func() {
+		stopStats()
+		<-statsDone
+	}()
 
 	// 启动凭据热加载协程（新增/更新/删除凭据文件免重启生效）
 	if cfg.ReloadInterval > 0 {
@@ -4223,6 +4202,7 @@ func requestAuditMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("X-Trace-ID", traceID)
 		// 普通落盘审计也需要稳定的 TraceID / requestID；不能依赖可选 JSON 日志。
 		ensureDebugRequestContext(r, traceID, start)
+		r = r.WithContext(context.WithValue(r.Context(), statsRequestContextKey{}, &statsAttempt{}))
 		if debugLoggingEnabled() {
 			debugEvent(r, "info", "request_received", map[string]any{
 				"message": "请求已进入网关，准备执行中间件与路由处理",
@@ -4234,6 +4214,7 @@ func requestAuditMiddleware(next http.Handler) http.Handler {
 		if aw.status == 0 {
 			aw.status = http.StatusOK
 		}
+		statsFinishAttempt(r, aw.status)
 		debugEvent(r, "info", "response_returned", map[string]any{
 			"status_code": aw.status,
 			"result":      http.StatusText(aw.status),
@@ -4309,8 +4290,10 @@ func authMiddleware(next http.Handler) http.Handler {
 // ef.fail 保序；生命周期由本函数 defer stop 收尾，避免定时器在流式直写阶段触发。
 // traceID 由调用方在创建闸门之前读取后显式传入：早发定时器触发后会并发写
 // 响应头，主流程此后再碰 Header() 即构成数据竞争（race detector 实锤过）。
+// v1.14.19 同步：入口兜底补齐模型会话头（幂等，入口已准备过则直接复用），修工具请求 11128。
 func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID uint64, modelName string, upstreamBytes []byte, startTime time.Time, ef *earlyFlushGate) (*http.Response, *Account, *upstreamProfile, bool) {
 	defer ef.stop()
+	prepareConversationContext(r, nil)
 	log.Printf("[业务入口] traceId=%s requestId=%d 业务=上游模型调用 请求体字节数=%d", traceID, reqID, len(upstreamBytes))
 	recordModelRequest(modelName)
 	accountMu.Lock()
@@ -4423,6 +4406,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 		// 注入 CodeBuddy 凭据与指纹 Header
 		// 限制同一账号向腾讯上游的请求严格单并发串行排队，防止并发双发触发腾讯风控
 		acc.lock.Lock()
+		statsSelectAccount(r, acc, modelName)
 		resp, upstreamCancel, err := doUpstreamRequest(r, acc, prof, upstreamBytes, reqID, traceID)
 		acc.lock.Unlock()
 		if err != nil {
@@ -4451,6 +4435,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 
 		// 上游非 200 响应处理
 		if resp.StatusCode >= 400 {
+			statsFinishAttempt(r, resp.StatusCode)
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			upstreamCancel()
@@ -4632,6 +4617,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	isStream, _ := reqObj["stream"].(bool)
 	debugSetModelAndStream(r, modelName, isStream)
 	debugBodyReadCompleted(r, bodyBytes, readDuration, decodeDuration, true, nil)
+	prepareConversationContext(r, reqObj)
 
 	// 模型黑白名单拦截：命中即拒绝，不消耗任何上游账号额度。
 	if disabled, reason := modelDisabled(modelName); disabled {
@@ -4725,6 +4711,7 @@ func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Respo
 	}
 
 	body := newTTFTReader(resp.Body, startTime)
+	defer finishFirstToken(r, modelName, reqID, body)
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	var usage map[string]any
@@ -4743,6 +4730,7 @@ func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Respo
 		}
 		var chunk map[string]any
 		if json.Unmarshal([]byte(cleanData), &chunk) == nil {
+			observeFirstToken(body, chunk)
 			if u, ok := chunk["usage"].(map[string]any); ok {
 				usage = u
 			}
@@ -4754,6 +4742,7 @@ func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Respo
 		}
 	}
 	scanErr := scanner.Err()
+	completeTokenStream(body, scanErr == nil && finishReason != "")
 	if scanErr != nil {
 		// 流被中断（上游卡死 / 超时 / 客户端取消）时，绝不补发 [DONE]：
 		// 补发等于告诉下游「正常结束」，会让残缺的工具调用被当成完整结果执行。
@@ -4808,12 +4797,13 @@ func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Respo
 		})
 	}
 	observeModelCredit(acc, modelName, usage, reqID)
+	statsObserveUsage(r, usage, scanErr == nil && finishReason != "")
 	recordModelTokens(modelName, usage, reqID)
 	recordUsageLine(r, modelName, usage)
 	recordModelTTFT(modelName, body.duration())
 	recordModelLatency(modelName, time.Since(startTime))
 	if scanErr == nil && finishReason != "" {
-		log.Printf("[#%d] 流式输出完成 (账号 %s [%s], 结束原因=%s, 耗时 %v, 首字 %v)", reqID, acc.Path, prof.Label, finishReason, time.Since(startTime), body.duration())
+		log.Printf("[#%d] 流式输出完成 (账号 %s [%s], 结束原因=%s, 耗时 %v, 首Token(v2) %s)", reqID, acc.Path, prof.Label, finishReason, time.Since(startTime), body.text())
 	}
 }
 
@@ -5095,6 +5085,7 @@ func backendHeaders(req *http.Request, sa *StoredAuth, prof *upstreamProfile) {
 	reqID := uuid.New().String()
 	req.Header.Set("X-Request-ID", reqID)
 	req.Header.Set("X-Trace-ID", reqID)
+	setConversationHeaders(req)
 	req.Header.Set("X-Client-ID", prof.ClientID)
 	req.Header.Set("X-Client-Version", prof.ClientVer)
 
@@ -5270,6 +5261,7 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 		if json.Unmarshal([]byte(data), &chunk) != nil {
 			continue
 		}
+		observeFirstToken(r, chunk)
 		if v, ok := chunk["id"].(string); ok && v != "" {
 			respID = v
 		}
@@ -5312,6 +5304,7 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 	if finish == "" {
 		return nil, errStreamClosedWithoutFinish
 	}
+	completeTokenStream(r, true)
 
 	message := map[string]any{"role": ifEmpty(role, "assistant"), "content": content}
 	if reasoning != "" {

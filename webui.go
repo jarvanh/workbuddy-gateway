@@ -71,6 +71,11 @@ func registerWebUIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/log-cleanup", handleWebUILogCleanup)
 	mux.HandleFunc("/admin/api/tasks", handleWebUITasks)
 	mux.HandleFunc("/admin/api/rate-detail", handleWebUIRateDetail)
+	mux.HandleFunc("/admin/api/stats", handleWebUIStats)
+	mux.HandleFunc("/admin/api/account-alerts", handleWebUIAccountAlerts)
+	mux.HandleFunc("/admin/api/account-add", handleWebUIAccountAdd)
+	mux.HandleFunc("/admin/api/account-cancel", handleWebUIAccountCancel)
+	mux.HandleFunc("/admin/api/account-delete", handleWebUIAccountDelete)
 }
 
 // 只读日志视图：无额外调度器、任务状态文件或内存任务登记表。
@@ -715,6 +720,7 @@ type webStatusResponse struct {
 	Accounts    []accountSnapshot         `json:"accounts"`
 	Models      []modelStatSnapshot       `json:"models"`
 	Stale       bool                      `json:"stale"`
+	Health      accountHealth             `json:"health"`
 }
 
 // readStatusSnapshot 读取 serve 周期写入的状态快照（与 monitor 命令同一数据源）。
@@ -809,6 +815,7 @@ func handleWebUIStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.Summary = summarizeAccounts(resp.Accounts)
 	resp.SiteSummary = summarizeAccountsBySite(resp.Accounts)
+	resp.Health = summarizeAccountHealth(resp.Accounts, resp.Stale)
 	log.Printf("[管理状态] traceId=%s 结果=读取成功 账号数=%d 模型数=%d 快照过旧=%t 说明=只展示快照，不调用上游或改变账本", debugTraceID(r), len(resp.Accounts), len(resp.Models), resp.Stale)
 	writeAdminData(w, r, resp)
 }
@@ -910,7 +917,20 @@ func handleWebUILogs(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{"files": files, "file": name, "lines": []string{}, "truncated": false, "readBudgetBytes": webUILogReadBudget}
 	if name != "" {
 		log.Printf("[管理日志] traceId=%s 阶段=读取 文件=%s 请求行数=%d 扫描字节预算=%d", debugTraceID(r), name, linesN, webUILogReadBudget)
-		lines, truncated, err := readWebLog(name, linesN)
+		var lines []string
+		var truncated bool
+		var err error
+		// 带 offset 时按告警定位到的字节偏移返回窗口，否则保持读取文件尾部。
+		if focus := parseLogOffset(r.URL.Query().Get("offset")); focus >= 0 {
+			var focusIndex int
+			var resolved bool
+			lines, focusIndex, resolved, err = readWebLogAround(name, focus, 64<<10)
+			if err == nil {
+				resp["focusIndex"], resp["resolved"] = focusIndex, resolved
+			}
+		} else {
+			lines, truncated, err = readWebLog(name, linesN)
+		}
 		if err != nil {
 			log.Printf("[管理日志] traceId=%s 结果=失败 文件=%s 原因=%v 状态码=503", debugTraceID(r), name, err)
 			writeJSONError(w, http.StatusServiceUnavailable, "日志暂不可读，请刷新文件列表后重试")

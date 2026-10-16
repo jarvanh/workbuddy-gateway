@@ -219,9 +219,14 @@ func handleWebUIClientEvent(w http.ResponseWriter, r *http.Request) {
 		"/admin/api/config": true, "/admin/api/credentials": true, "/admin/api/settings": true,
 		"/admin/api/account-toggle": true, "/admin/api/model-toggle": true,
 		"/admin/api/credential-edit": true, "/admin/api/log-settings": true, "/admin/api/log-cleanup": true,
-		"/admin/api/tasks":       true,
-		"/admin/api/config-edit": true,
-		"/admin/api/rate-detail": true,
+		"/admin/api/tasks":          true,
+		"/admin/api/config-edit":    true,
+		"/admin/api/rate-detail":    true,
+		"/admin/api/stats":          true,
+		"/admin/api/account-alerts": true,
+		"/admin/api/account-add":    true,
+		"/admin/api/account-cancel": true,
+		"/admin/api/account-delete": true,
 	}
 	if !allowed[input.Event] || !routes[input.Route] || input.Status < 0 || input.Status > 599 {
 		writeJSONError(w, http.StatusBadRequest, "不接受未定义的前端审计事件")
