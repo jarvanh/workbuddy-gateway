@@ -4897,10 +4897,8 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 	modelIDs, source := mergedModelIDs()
 	modelsList := make([]map[string]any, 0, len(modelIDs))
 	for _, id := range modelIDs {
-		// v6：被站点路由全禁的模型不出现在 /v1/models
-		if rBlocked, _ := routingRejection(id, time.Now()); rBlocked {
-			continue
-		}
+		// 2026-10-17 主人决策：被站点路由全禁的模型也保留在 /v1/models，
+		// 让客户端知道该模型存在；实际调用时由站点路由 403 说明不可用原因。
 		entry := map[string]any{
 			"id": id, "object": "model", "owned_by": "workbuddy", "permission": []any{},
 		}

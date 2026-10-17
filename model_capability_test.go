@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 // withCatalog 在测试期间替换目录快照，结束后恢复。
@@ -210,4 +211,37 @@ func TestHandleModelsOmitsUnknownCapability(t *testing.T) {
 			t.Fatalf("未知能力不得输出 %s：%v", key, row[key])
 		}
 	}
+}
+
+// 2026-10-17 主人决策：被站点路由全禁的模型也必须出现在 /v1/models 列表，
+// 让客户端知道该模型存在；实际调用时由站点路由 403 说明不可用原因。
+func TestHandleModelsKeepsRoutingBlockedModelsVisible(t *testing.T) {
+	resetModelFilter()
+	t.Cleanup(resetModelFilter)
+	t.Cleanup(func() { setRouting(defaultRoutingConfig()) })
+	cfg := defaultRoutingConfig()
+	cfg.Rules = []routingRule{{
+		Models: []string{"m-blocked"},
+		Sites:  []routingSiteRule{{Site: "cn"}, {Site: "intl"}},
+	}}
+	setTestRouting(t, cfg)
+	withCatalog(t, map[string][]catalogModel{
+		"cn":   {{ID: "m-blocked", HasMultiplier: true, Multiplier: 0.29, FromLive: true}},
+		"intl": {{ID: "m-blocked", HasMultiplier: true, Multiplier: 0.29, FromLive: true}},
+	})
+	if blocked, _ := routingRejection("m-blocked", time.Now()); !blocked {
+		t.Fatal("前置条件失败：m-blocked 应被站点路由全禁")
+	}
+	var resp struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(callModels(t), &resp); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range resp.Data {
+		if row["id"] == "m-blocked" {
+			return
+		}
+	}
+	t.Fatalf("全禁模型必须保留在 /v1/models 列表中: %+v", resp.Data)
 }
