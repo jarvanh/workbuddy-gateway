@@ -32,6 +32,12 @@ import (
 type routingWindow struct {
 	Start string `json:"start"` // HH:MM
 	End   string `json:"end"`   // HH:MM
+	// ProbeBudget 未验证窗口的日探针预算（credit/自然日）：窗口证据过期或
+	// 从未观测时，窗口放行但窗口内累计扣费达到预算即禁到当日结束。
+	// 兜住两类敞口：上游在窗口内改价/计费（首笔扣费落账前已在途的并发）、
+	// 窗口结束边界前发出、结束后才返回 usage.credit 的长生成（10-11/10-15
+	// 两次 8.53cr 扣费都是 07:59 发出、08:00 后记账）。0 = 不封顶（不推荐）。
+	ProbeBudget float64 `json:"probeBudget"`
 }
 
 type routingActive struct {
@@ -44,7 +50,11 @@ type routingBudget struct {
 }
 
 type routingSiteRule struct {
-	Site           string         `json:"site"`
+	Site string `json:"site"`
+	// Disabled 显式禁用该站点（意图化表达，取代 window 00:00-00:00 这类
+	// 隐式写法——那依赖「空窗口恒假 → 落价格闸 → 恰好被价拦住」的巧合链，
+	// 目录价或台账一变就会意外开门）。最先判定，与其他一切闸解耦。
+	Disabled       bool           `json:"disabled"`
 	Window         *routingWindow `json:"window"`
 	Outside        string         `json:"outside"`
 	FallbackBudget *routingBudget `json:"fallbackBudget"`
@@ -68,13 +78,18 @@ type routingAnchor struct {
 }
 
 type routingConfig struct {
-	TZ              string         `json:"tz"`
-	DefaultPolicy   string         `json:"defaultPolicy"`
-	AccountOrder    string         `json:"accountOrder"`
-	MinBalanceGuard float64        `json:"minBalanceGuard"`
-	MaxPrice        float64        `json:"maxPrice"`
-	PriceAnchor     *routingAnchor `json:"priceAnchor"`
-	Rules           []routingRule  `json:"rules"`
+	TZ              string  `json:"tz"`
+	DefaultPolicy   string  `json:"defaultPolicy"`
+	AccountOrder    string  `json:"accountOrder"`
+	MinBalanceGuard float64 `json:"minBalanceGuard"`
+	MaxPrice        float64 `json:"maxPrice"`
+	// PriceSampleWindowDays 限定价钱校准只采信近 N 天的累积样本（按自然日，
+	// 配置时区）。免费期的大 token 零扣费样本会把计费期校准值稀释几十倍
+	//（2026-10-16 实测 0.29x→0.143x 假象）；滚动窗口让转计费/转免费在
+	// N 天内反映到校准价。缺省 7 天（setRouting 对非正值回落默认）。
+	PriceSampleWindowDays int            `json:"priceSampleWindowDays"`
+	PriceAnchor           *routingAnchor `json:"priceAnchor"`
+	Rules                 []routingRule  `json:"rules"`
 }
 
 var (
@@ -112,7 +127,7 @@ func pruneRoutingSpendLocked() {
 	out := make(map[string]float64, len(routingSpend))
 	for k, v := range routingSpend {
 		parts := strings.Split(k, "|")
-		if len(parts) == 3 && keep[parts[2]] {
+		if len(parts) >= 3 && keep[parts[len(parts)-1]] {
 			out[k] = v
 		}
 	}
@@ -162,12 +177,13 @@ func loadRoutingSpend() {
 
 func defaultRoutingConfig() routingConfig {
 	return routingConfig{
-		TZ:              "Asia/Shanghai",
-		DefaultPolicy:   "allow",
-		AccountOrder:    "expiringFirst",
-		MinBalanceGuard: 10,
-		MaxPrice:        0.06,
-		PriceAnchor:     &routingAnchor{Model: "glm-5.3-flash", Site: "cn", Multiplier: 0.06},
+		TZ:                    "Asia/Shanghai",
+		DefaultPolicy:         "allow",
+		AccountOrder:          "expiringFirst",
+		MinBalanceGuard:       10,
+		MaxPrice:              0.06,
+		PriceSampleWindowDays: 7,
+		PriceAnchor:           &routingAnchor{Model: "glm-5.3-flash", Site: "cn", Multiplier: 0.06},
 	}
 }
 
@@ -189,6 +205,9 @@ func setRouting(cfg routingConfig) {
 	}
 	if cfg.MaxPrice <= 0 {
 		cfg.MaxPrice = 0.06
+	}
+	if cfg.PriceSampleWindowDays <= 0 {
+		cfg.PriceSampleWindowDays = 7
 	}
 	if cfg.PriceAnchor == nil {
 		cfg.PriceAnchor = &routingAnchor{Model: "glm-5.3-flash", Site: "cn", Multiplier: 0.06}
@@ -233,6 +252,32 @@ type sitePriceSample struct {
 	// 价格水平可能已漂移，但不否认「曾经被扣费」——billedEvidence 不看本字段。
 	// 旧版台账（schema 1 无本字段）加载后为 0，按已过期处理 → 放行一笔重新学习。
 	UpdatedAt int64 `json:"updatedAt,omitempty"`
+	// 证据分域（schema 3，2026-10-19）：窗口内/外的观测分开记录。限免模型的
+	// 本意就是窗口内外价不同——窗口外扣费对「窗口内收不收费」没有证明力，
+	// 反之亦然（0f77723 用任意窗口外的扣费永久关掉窗口，属误伤）。
+	// 落账域按记账时刻的窗口状态判定。
+	InWindow *sitePriceEvidence `json:"inWindow,omitempty"`
+	// OffWindow 保留全部历史口径（累积/最近一次/时间戳），既是窗口外证据，
+	// 也是数值校准与预算兜底的数据源，字段语义与 schema 1/2 完全一致。
+	OffWindow *sitePriceEvidence `json:"offWindow,omitempty"`
+	// Daily 按自然日（配置时区）分桶的 (credit, tokens) 样本，供价格校准做
+	// 滚动窗口：免费期的大 token 零扣费样本会稀释计费期校准值（10-16 实测
+	// 0.29x→0.143x 假象）。仅校准使用；free/paid 判定仍看 LastCredit。
+	// schema 1/2 迁移样本无分桶 → 校准回退全历史累积口径。
+	Daily []sitePriceDaySample `json:"daily,omitempty"`
+}
+
+// sitePriceDaySample 单日累积的价格样本桶。
+type sitePriceDaySample struct {
+	Day    string  `json:"day"` // 2006-01-02（配置时区）
+	Credit float64 `json:"credit"`
+	Tokens int64   `json:"tokens"`
+}
+
+// sitePriceEvidence 单个观测域（窗口内/窗口外）的最近证据。
+type sitePriceEvidence struct {
+	LastCredit float64 `json:"lastCredit"`
+	UpdatedAt  int64   `json:"updatedAt"`
 }
 
 var (
@@ -250,11 +295,11 @@ var (
 // 落盘后重启不再失明；镜像到 Dropbox 后，runner 重置（/tmp 清空）也能恢复价格记忆。
 
 const (
-	// priceLedgerSchema 2（2026-10-16）：sitePriceSample 增加 UpdatedAt，
-	// 预算兜底只采信 12h 内的扣费作为「当前价位」。读取同时兼容 schema 1
-	//（无 per-sample 时间戳 → 按已过期处理，放行一笔重新学习），
-	// 累积 Credit/Tokens/LastCredit 仍保留，供 billedEvidence 与倍率校准使用。
-	priceLedgerSchema      = 2
+	// priceLedgerSchema 3（2026-10-19）：sitePriceSample 增加 inWindow/offWindow
+	// 证据分域，窗口判定改按「本域新鲜证据」裁决。读取同时兼容 schema 1/2
+	//（无分域字段 → 迁移时历史证据整体归入 offWindow，窗口内视为从未观测），
+	// 累积 Credit/Tokens/LastCredit 仍保留，供数值校准与预算兜底使用。
+	priceLedgerSchema      = 3
 	priceLedgerMirrorEvery = 30 * time.Second // Dropbox 镜像节流间隔
 )
 
@@ -317,18 +362,26 @@ func loadPriceLedger() {
 			continue
 		}
 		var d priceLedgerFileData
-		if err := json.Unmarshal(data, &d); err != nil || (d.Schema != 1 && d.Schema != priceLedgerSchema) {
+		if err := json.Unmarshal(data, &d); err != nil || (d.Schema != 1 && d.Schema != 2 && d.Schema != priceLedgerSchema) {
 			continue
 		}
 		sitePriceMu.Lock()
+		migrated := 0
 		for k, v := range d.Samples {
 			if v == nil || sitePriceSamples[k] != nil {
 				continue
 			}
+			if v.InWindow == nil && v.OffWindow == nil {
+				// schema 1/2 迁移：分域之前的历史证据整体归入窗口外域——
+				// 无法分辨当时是否处于窗口内，按最保守口径处理（不赋予
+				// 窗口放行/关窗效力）。schema 1 无 UpdatedAt → 过期，行为不变。
+				v.OffWindow = &sitePriceEvidence{LastCredit: v.LastCredit, UpdatedAt: v.UpdatedAt}
+				migrated++
+			}
 			sitePriceSamples[k] = v
 		}
 		sitePriceMu.Unlock()
-		log.Printf("[PriceLedger] 已恢复 %d 条站点价格样本（来源=%s schema=%d，schema1 样本无时间戳按已过期处理）", len(d.Samples), p, d.Schema)
+		log.Printf("[PriceLedger] 已恢复 %d 条站点价格样本（来源=%s schema=%d，schema1 样本无时间戳按已过期处理，迁移分域 %d 条）", len(d.Samples), p, d.Schema, migrated)
 		return
 	}
 }
@@ -336,7 +389,10 @@ func loadPriceLedger() {
 // recordSitePriceSample 累加一次真实请求的 (tokens, credit) 样本。
 // 仅由 observeModelCredit（真实业务流量）调用；探测小样本不进入此处。
 // credit=0 的免费样本同样入账——这正是「免费模型」结论的数据来源。
-func recordSitePriceSample(site, model string, tokens int64, credit float64) {
+// inWindowAtSettle 表示该请求记账时刻是否处于站点窗口内（由调用方传入调度
+// 时判定的窗口状态：长生成可能跨窗口边界，以请求发出时刻的口径为准），
+// 样本除累积口径外同步写入对应分域（inWindow/offWindow）的最近证据。
+func recordSitePriceSampleInWindow(site, model string, tokens int64, credit float64, inWindow bool) {
 	if site == "" || tokens <= 0 {
 		return
 	}
@@ -351,20 +407,94 @@ func recordSitePriceSample(site, model string, tokens int64, credit float64) {
 	s.Credit += credit
 	s.LastCredit = credit
 	s.UpdatedAt = time.Now().Unix()
+	domain := &s.OffWindow
+	if inWindow {
+		domain = &s.InWindow
+	}
+	if *domain == nil {
+		*domain = &sitePriceEvidence{}
+	}
+	(*domain).LastCredit = credit
+	(*domain).UpdatedAt = s.UpdatedAt
+	day := time.Now().In(routingSnapshotLocation()).Format("2006-01-02")
+	bucket := s.dailyBucket(day)
+	bucket.Credit += credit
+	bucket.Tokens += tokens
 	// 落盘：重启不得让价格记忆清零（2026-09-29 事故根因之一）
 	persistPriceLedgerLocked()
 	sitePriceMu.Unlock()
 }
 
+// recordSitePriceSample 窗口外口径的兼容入口（历史调用与测试使用）。
+func recordSitePriceSample(site, model string, tokens int64, credit float64) {
+	recordSitePriceSampleInWindow(site, model, tokens, credit, false)
+}
+
+// routingSnapshotLocation 按 当前配置 返回时区（落账路径用，免传 cfg）。
+func routingSnapshotLocation() *time.Location {
+	return routingLocation(routingSnapshot())
+}
+
+// dailyBucket 返回指定自然日的累积桶（无则创建），并淘汰 30 天前的旧桶
+// （校准窗口最长也就几天，30 天足够宽裕，避免台账无限膨胀）。
+func (s *sitePriceSample) dailyBucket(day string) *sitePriceDaySample {
+	for i := range s.Daily {
+		if s.Daily[i].Day == day {
+			return &s.Daily[i]
+		}
+	}
+	s.Daily = append(s.Daily, sitePriceDaySample{Day: day})
+	s.Daily = append(s.Daily, sitePriceDaySample{Day: day})
+	if len(s.Daily) > 30 {
+		sort.Slice(s.Daily, func(i, j int) bool { return s.Daily[i].Day < s.Daily[j].Day })
+		s.Daily = s.Daily[len(s.Daily)-30:]
+	}
+	return &s.Daily[len(s.Daily)-1]
+}
+
 // siteCreditRate 返回该站点该模型的实测「每 token 消耗 credit」。
+// 校准价新鲜度（2026-10-19）：优先用近 N 天（priceSampleWindowDays，配置
+// 时区自然日）的 Daily 滚动样本——免费期的大 token 零扣费样本会把计费期
+// 校准值稀释几十倍（2026-10-16 实测 0.29x→0.143x 假象）；无分桶（schema 1/2
+// 迁移样本）或窗口内无样本时回退全历史累积口径（旧行为，不因升级失明）。
 func siteCreditRate(site, model string) (float64, bool) {
 	sitePriceMu.Lock()
 	s := sitePriceSamples[site+"|"+normalizeModelName(model)]
+	rate, ok := 0.0, false
+	if s != nil {
+		if rate, ok = rollingCreditRate(s); !ok && s.Tokens > 0 {
+			rate, ok = s.Credit/float64(s.Tokens), true
+		}
+	}
 	sitePriceMu.Unlock()
-	if s == nil || s.Tokens <= 0 {
+	if !ok {
 		return 0, false
 	}
-	return s.Credit / float64(s.Tokens), true
+	return rate, true
+}
+
+// rollingCreditRate 按配置的样本窗口天数聚合 Daily 桶；无分桶数据返回 false。
+func rollingCreditRate(s *sitePriceSample) (float64, bool) {
+	if len(s.Daily) == 0 {
+		return 0, false
+	}
+	days := routingSnapshot().PriceSampleWindowDays
+	if days <= 0 {
+		days = defaultRoutingConfig().PriceSampleWindowDays
+	}
+	minDay := time.Now().In(routingSnapshotLocation()).AddDate(0, 0, -(days - 1)).Format("2006-01-02")
+	var credit float64
+	var tokens int64
+	for i := range s.Daily {
+		if s.Daily[i].Day >= minDay {
+			credit += s.Daily[i].Credit
+			tokens += s.Daily[i].Tokens
+		}
+	}
+	if tokens <= 0 {
+		return 0, false
+	}
+	return credit / float64(tokens), true
 }
 
 // siteSample 同 siteCreditRate，但一并返回样本 token 量（供锚点挑选时评估证据量）。
@@ -387,6 +517,78 @@ const (
 	pricePaidNum                        // 付费且数值可信（catalog / 同源 ledger 校准）
 	pricePaidUnk                        // 付费但数值不可信（仅 probe 存在性判断）
 )
+
+// 窗口证据判定（2026-10-19 证据分域）。
+// 窗口的信任只来自「本域 12h 内实测」：窗口内收不收费，只有窗口内的
+// 扣费/免费样本有证明力——限免的本意就是窗口内外价不同，拿窗口外扣费
+// 关窗口等于用促销存在的前提否定促销本身（0f77723 误伤夜免昼费模型）。
+const (
+	windowEvidenceUnknown = iota // 本域从未观测或证据过期：未验证窗口
+	windowEvidenceFree           // 12h 内本域实测免费
+	windowEvidencePaid           // 12h 内本域实测被扣费（窗口收回）
+)
+
+// windowEvidenceState 返回该站点该模型在指定域（窗口内/外）的证据结论。
+// 探针结论跨域共享：探针是受控实测，与请求发出时刻是否在窗口内无关。
+func windowEvidenceState(site, model string, inWindow bool, now time.Time) int {
+	key := site + "|" + normalizeModelName(model)
+	sitePriceMu.Lock()
+	s := sitePriceSamples[key]
+	var ev *sitePriceEvidence
+	if s != nil {
+		if inWindow {
+			ev = s.InWindow
+		} else {
+			ev = s.OffWindow
+		}
+	}
+	sitePriceMu.Unlock()
+	if ev != nil && ev.UpdatedAt > 0 && now.Unix()-ev.UpdatedAt < int64(priceFreshnessWindow/time.Second) {
+		if ev.LastCredit > 0 {
+			return windowEvidencePaid
+		}
+		return windowEvidenceFree
+	}
+	modelsMu.RLock()
+	p := modelProbes[probeKey(site, model)]
+	modelsMu.RUnlock()
+	if p.LastProbeAt > 0 && now.Unix()-p.LastProbeAt < int64(priceFreshnessWindow/time.Second) {
+		switch p.Verdict {
+		case "paid":
+			return windowEvidencePaid
+		case "free":
+			return windowEvidenceFree
+		}
+	}
+	return windowEvidenceUnknown
+}
+
+// probeBudgetKey 窗口探针预算记账键：站点|模型|probe|日期（配置时区自然日）。
+// 与 fallbackBudget 共用 routingSpend 存储，靠中段标记区分，互不污染。
+func probeBudgetKey(site, model string, now time.Time, loc *time.Location) string {
+	return site + "|" + normalizeModelName(model) + "|probe|" + now.In(loc).Format("2006-01-02")
+}
+
+// probeBudgetUsed 返回当日窗口探针已消耗的 credit。
+func probeBudgetUsed(site, model string, now time.Time, loc *time.Location) float64 {
+	routingMu.RLock()
+	defer routingMu.RUnlock()
+	return routingSpend[probeBudgetKey(site, model, now, loc)]
+}
+
+// consumeProbeBudget 累加当日窗口探针消耗（仅真扣费才计）。
+// 窗口内发出的请求被实测扣费时调用：未验证窗口的敞口封顶就靠它。
+func consumeProbeBudget(site, model string, credit float64, now time.Time) {
+	if credit <= 0 {
+		return
+	}
+	cfg := routingSnapshot()
+	loc := routingLocation(cfg)
+	routingMu.Lock()
+	defer routingMu.Unlock()
+	routingSpend[probeBudgetKey(site, model, now, loc)] += credit
+	persistRoutingSpendLocked()
+}
 
 // lastCreditFor 返回该站点该模型最近一次真实请求的扣费（无样本返回 -1）。
 func lastCreditFor(site, model string) float64 {
@@ -635,6 +837,10 @@ func evaluateSite(r routingSiteRule, model string, now time.Time, loc *time.Loca
 
 // evaluateSiteWithLimit 同 evaluateSite，但允许覆盖价格上限（按规则覆盖时用）。
 func evaluateSiteWithLimit(r routingSiteRule, model string, now time.Time, loc *time.Location, cfg routingConfig, maxPrice float64) siteState {
+	// 0) 显式禁用：意图化表达，先于一切闸（与价格/证据/窗口全部解耦）。
+	if r.Disabled {
+		return siteForbidden
+	}
 	// 1) 生效区间
 	if r.Active != nil {
 		var from, until time.Time
@@ -662,8 +868,10 @@ func evaluateSiteWithLimit(r routingSiteRule, model string, now time.Time, loc *
 	// 2) 时段窗口：窗口内视为该站免费期（政策表达），直接放行、不受价格闸影响。
 	//    窗口必须先于价格闸：如 hy4-preview cn 夜间免费而目录价仍标 0.29x，
 	//    价格闸先行会把免费窗口一并封死（以方案 §九 运行推演为准）。
-	//    但扣费证据优先于政策：窗口期内被实测扣过费（上游改价/政策收回），
-	//    窗口不得继续充当价格闸旁路（2026-10-15 事故：hy4 系窗口内被扣费）。
+	//    证据分域（2026-10-19）：窗口的信任只来自「本域 12h 内实测」——
+	//    新鲜 paid → 窗口收回，落价格闸；新鲜 free → 放行；
+	//    未验证 → 放行但受 probeBudget 日封顶（兜住窗口内改价的在途并发、
+	//    以及跨 08:00 边界长生成的延迟记账）。
 	inWindow := false
 	hasWindow := false
 	if r.Window != nil {
@@ -682,8 +890,22 @@ func evaluateSiteWithLimit(r routingSiteRule, model string, now time.Time, loc *
 		} else {
 			inWindow = cur >= startMin && cur < endMin
 		}
-		if inWindow && !billedEvidence(r.Site, model) {
-			return siteInWindow
+		if inWindow {
+			switch windowEvidenceState(r.Site, model, true, now) {
+			case windowEvidenceFree:
+				return siteInWindow
+			case windowEvidencePaid:
+				// 窗口已收回：落价格闸（第 3 步）
+			default: // 未验证窗口：放行，但封住单日敞口
+				budget := r.Window.ProbeBudget
+				if budget <= 0 {
+					budget = defaultWindowProbeBudget
+				}
+				if probeBudgetUsed(r.Site, model, now, loc) >= budget {
+					return siteForbidden
+				}
+				return siteInWindow
+			}
 		}
 	}
 	// 3) 价格闸（无窗口或窗口外）：超过上限即禁止。
@@ -713,6 +935,73 @@ func evaluateSiteWithLimit(r routingSiteRule, model string, now time.Time, loc *
 		return siteBudgeted
 	}
 	return siteForbidden
+}
+
+// defaultWindowProbeBudget 未验证窗口的默认日探针预算（credit/自然日）。
+// 设计目标：窗口内意外计费时，单日损失封顶在「一次可控的学习成本」，
+// 远小于 10-15 事故的单笔 52.5 credit。
+const defaultWindowProbeBudget = 0.5
+
+// markAccountReqWindow 记录请求派发时刻的窗口状态（accountMu 外包装）。
+func markAccountReqWindow(acc *Account, reqID uint64, inWindow bool) {
+	accountMu.Lock()
+	if acc.reqWindow == nil {
+		acc.reqWindow = map[uint64]bool{}
+	}
+	acc.reqWindow[reqID] = inWindow
+	accountMu.Unlock()
+}
+
+// modelDispatchedInWindow 判断模型在指定站点、当前时刻是否处于配置窗口内。
+// 与 evaluateSiteWithLimit 第 2 步同一窗口口径（跨午夜同款算法）。
+func modelDispatchedInWindow(model, site string) bool {
+	cfg := routingSnapshot()
+	loc := routingLocation(cfg)
+	key := normalizeModelName(model)
+	var win *routingWindow
+	for i := range cfg.Rules {
+		for _, s := range cfg.Rules[i].Sites {
+			if s.Site != site {
+				continue
+			}
+			for _, m := range cfg.Rules[i].Models {
+				if normalizeModelName(m) == key {
+					win = s.Window
+					break
+				}
+			}
+			if win != nil {
+				break
+			}
+		}
+		if win != nil {
+			break
+		}
+	}
+	if win == nil {
+		return false
+	}
+	startMin, ok1 := parseClock(win.Start)
+	endMin, ok2 := parseClock(win.End)
+	if !ok1 || !ok2 {
+		return false
+	}
+	lt := time.Now().In(loc)
+	cur := lt.Hour()*60 + lt.Minute()
+	if startMin > endMin {
+		return cur >= startMin || cur < endMin
+	}
+	return cur >= startMin && cur < endMin
+}
+
+// accountReqWindow 返回请求派发时刻的窗口状态（缺省视为窗口外）。
+func accountReqWindow(acc *Account, reqID uint64) bool {
+	if acc == nil || reqID == 0 {
+		return false
+	}
+	accountMu.Lock()
+	defer accountMu.Unlock()
+	return acc.reqWindow[reqID]
 }
 
 // routingRejection 对模型做站点级判定。
@@ -983,6 +1272,7 @@ func releaseInFlight(acc *Account, reqID uint64) {
 	}
 	accountMu.Lock()
 	delete(acc.inFlight, reqID)
+	delete(acc.reqWindow, reqID)
 	accountMu.Unlock()
 }
 

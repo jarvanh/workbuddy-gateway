@@ -549,6 +549,7 @@ type Account struct {
 	QuotaUnlimited bool                          // 企业版 limitNum=-1：分配额度不限，禁止按 0 余额阻断
 	ModelStates    map[string]*modelRuntimeState // 按模型隔离的成本、限流和额度阻断状态
 	inFlight       map[uint64]inFlightReserve    // 在途预留：reqID → 预留 credit（运行时，不入盘）
+	reqWindow      map[uint64]bool               // 派发时窗口状态：reqID → 是否窗口内发出（记账分域依据，运行时，不入盘）
 	fingerprint    string                        // 凭据文件变更指纹（mtime+size，凭据热加载用）
 	lock           sync.Mutex                    // 单账号串行锁（防止同账号并发触发 11128）
 	// 续期失败计数（仅内存，重启清零）：单次失败可能是上游抖动，连续失败才判定登录态失效。
@@ -2751,9 +2752,12 @@ func observeModelCredit(acc *Account, model string, usage map[string]any, reqID 
 	accountMu.Unlock()
 	recordModelCredit(model, credit)
 	if n, ok := usageTotalTokens(usage); ok {
-		recordSitePriceSample(acc.Profile().Key, model, n, credit)
+		recordSitePriceSampleInWindow(acc.Profile().Key, model, n, credit, accountReqWindow(acc, reqID))
 	}
 	consumeBudget(acc.Profile().Key, model, credit, time.Now())
+	if accountReqWindow(acc, reqID) {
+		consumeProbeBudget(acc.Profile().Key, model, credit, time.Now())
+	}
 	recordModelCostClass(model, acc.Profile().Key, credit <= 0)
 
 	if credit <= 0 {
@@ -4364,6 +4368,9 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 		}
 		attempted[acc] = true
 		pendingRelease = acc
+		// 记录派发时刻的窗口状态：usage.credit 按该口径分域落账（长生成可能
+		// 跨窗口边界，以请求发出时刻为准；免费/扣费证据跟随本域）。
+		markAccountReqWindow(acc, reqID, modelDispatchedInWindow(modelName, accSiteLocked(acc)))
 		debugSetAccount(r, acc.Path)
 		debugEvent(r, "debug", "account_selected", map[string]any{
 			"selection": string(selection),

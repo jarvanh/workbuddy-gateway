@@ -44,6 +44,7 @@
     "accountOrder": "expiringFirst",
     "minBalanceGuard": 10,
     "maxPrice": 0.06,
+    "priceSampleWindowDays": 7,
     "priceAnchor": null,
     "rules": []
   },
