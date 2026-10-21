@@ -1472,6 +1472,18 @@ func usableForModelLocked(acc *Account, model string, now time.Time) (accountSel
 	return selectionProbeExhausted, true
 }
 
+// siteIsFreeNowLocked 把选号层已算好的 routingStates 收敛成布尔量，
+// 供 reserveInFlightLocked 的窗口豁免消费（调用方持有 accountMu，
+// 因此不得在此调用会取锁的 routingRejection，只读 map）。
+// 语义与 freeNow 过滤器一致：站点未出现在 states 里（无规则约束）视为可用。
+func siteIsFreeNowLocked(site string, states map[string]siteState) bool {
+	st, ok := states[site]
+	if !ok {
+		return true
+	}
+	return st.isFreeNow()
+}
+
 // nextAccountForModel 按「免费耗尽账号优先 → 有余额账号 → 零余额未知模型受控探测」选号。
 func nextAccountForModel(model string, attempted map[*Account]bool, reqID uint64) (*Account, accountSelectionKind, error) {
 	// 站点优先级必须在加锁前计算：preferredFreeSites 会读取账号账本并自行获取 accountMu，
@@ -1534,7 +1546,10 @@ func nextAccountForModel(model string, attempted map[*Account]bool, reqID uint64
 				}
 				// v6.1：在途预留（并发烧穿护栏）：已在途请求按预留额记账，
 				// 避免「选号时余额够、请求过程中被烧穿」（2026-09-29 事故）
-				if !reserveInFlightLocked(acc, reqID, model) {
+				// 窗口豁免（2026-10-21）：站点处于免费时段（siteAllowed/siteInWindow）时
+				// 免预留，否则限免模型会因 priceUnknown×10 预留死锁在 503
+				// （目录价超上限 → 学不到免费 → 永久拒绝 → 永远拿不到 usage）。
+				if !reserveInFlightLocked(acc, reqID, model, siteIsFreeNowLocked(accSiteLocked(acc), routingStates)) {
 					continue
 				}
 				if kind == selectionProbeExhausted {

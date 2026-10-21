@@ -153,3 +153,54 @@ func TestInFlightReserveFreeModelUnlimited(t *testing.T) {
 	}
 	releaseInFlight(acc, 1)
 }
+
+// TestInFlightReserveSiteWindowExempt 站点免费时段豁免在途预留（2026-10-21 修复）：
+// 回归 intl deepseek-v4.1-flash 限免模型被永拒 503 的死锁。
+// 链路：目录价 0.11 > maxPrice 0.06 → 价格闸 forbidden；intl 无目录条目 →
+// priceUnknown → 预留 10×guard；账号余额 195 < 250 → 拒绝请求；
+// 拿不到 usage.credit → ModelStates.CostClass 永远学不到 free → 永久 503。
+// 站点被声明为免费时段（siteInWindow）时必须免预留，放开学习闭环。
+func TestInFlightReserveSiteWindowExempt(t *testing.T) {
+	cfg := defaultRoutingConfig()
+	cfg.MinBalanceGuard = 25
+	cfg.MaxPrice = 0.06
+	setTestRouting(t, cfg)
+	// intl 目录里没有 deepseek-v4.1-flash（限免促销模型不进目录）→ priceUnknown
+	catalogModels = map[string][]catalogModel{}
+	defer func() { catalogModels = map[string][]catalogModel{} }()
+
+	acc := &Account{Path: "intl-acc", Auth: &StoredAuth{Edition: "intl"}, QuotaKnown: true, QuotaRemaining: 195.6}
+
+	// 1) 不传窗口豁免（旧口径）：应被 10×guard=250 挡住 —— 复现死锁
+	if reserveInFlightLocked(acc, 1, "deepseek-v4.1-flash") {
+		t.Fatal("旧口径应挡住：195.6 - 250 < 0（未知价 10×guard 预留）")
+	}
+
+	// 2) 传窗口豁免=true：应放行，且不占预留额
+	if !reserveInFlightLocked(acc, 2, "deepseek-v4.1-flash", true) {
+		t.Fatal("站点免费时段应免预留（窗口豁免）")
+	}
+	// 豁免不该产生在途记录（否则会白占额度且需释放）
+	if len(acc.inFlight) != 0 {
+		t.Fatalf("窗口豁免不应占预留额，实际在途记录=%d", len(acc.inFlight))
+	}
+	// 释放不存在的 reqID 也必须安全
+	releaseInFlight(acc, 2)
+
+	// 3) 窗口外（false）恢复旧口径：仍应挡住
+	if reserveInFlightLocked(acc, 3, "deepseek-v4.1-flash", false) {
+		t.Fatal("窗口外应回到旧口径并挡住")
+	}
+
+	// 4) 无规则约束的站点（states 里查不到）视为可用 → siteIsFreeNowLocked=true
+	states := map[string]siteState{"intl": siteInWindow, "cn": siteForbidden}
+	if !siteIsFreeNowLocked("intl", states) {
+		t.Fatal("intl 处于窗口内应判为免费可用")
+	}
+	if siteIsFreeNowLocked("cn", states) {
+		t.Fatal("cn 被 forbidden 不应判为免费可用")
+	}
+	if !siteIsFreeNowLocked("jp", states) {
+		t.Fatal("未声明站点应视为可用（与 freeNow 过滤器同语义）")
+	}
+}

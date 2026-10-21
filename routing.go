@@ -1198,6 +1198,14 @@ func guardMinBalance(acc *Account, model string) bool {
 //   - 价格未知（priceUnknown，无任何扣费证据）：minBalanceGuard × 10 —— 未知价可能极贵
 //     （事故中 intl hy4-preview 目录标 x0.00，实际等效 x66），按最坏情况预留。
 //     一旦出现扣费证据（billedEvidence），即降为普通付费口径。
+//
+// [窗口豁免]（2026-10-21）站点被路由规则声明为「免费时段内」(siteInWindow) 时，
+// 无论价格闸判定为何，一律按免费口径免预留。否则会死锁：
+// 限免模型（如 intl deepseek-v4.1-flash，官方促销目录价仍标 x0.11）
+// 目录价超 maxPrice → priceUnknown/pricePaidUnk，而「样本过小不予判定免费」
+// 又让 ModelStates.CostClass 永远学不到 free → 预留 10×guard 永久拒绝请求 →
+// 拿不到 usage → 学不到免费 → 永久 503。窗口是运维显式声明的政策表达，
+// 优先级高于价格闸（与 evaluateSiteWithLimit 第 2 步同序）。
 
 const (
 	inFlightReserveTTL    = 30 * time.Minute // 超时未释放的兜底回收阈值
@@ -1211,11 +1219,17 @@ type inFlightReserve struct {
 }
 
 // reserveInFlightLocked 检查并提交一笔在途预留（调用方持有 accountMu）。
-func reserveInFlightLocked(acc *Account, reqID uint64, model string) bool {
+// siteFreeNow 为可选参数：选号层把「站点免费时段」语义传进来（见下方窗口豁免），
+// 旧的三参调用点不传即保持原口径。
+func reserveInFlightLocked(acc *Account, reqID uint64, model string, siteFreeNow ...bool) bool {
 	cfg := routingSnapshot()
 	guard := cfg.MinBalanceGuard
 	if acc == nil || guard <= 0 {
 		return true // 保底关闭时整体停用（沿用原语义）
+	}
+	// 窗口豁免先于一切价格口径：站点处于免费时段即按免费模型处理。
+	if len(siteFreeNow) > 0 && siteFreeNow[0] {
+		return true
 	}
 	now := time.Now()
 	// 兜底回收：流式异常中断而未走到释放路径的残留
