@@ -26,8 +26,16 @@ func isolateLedgerMirror(t *testing.T) {
 func setTestRouting(t *testing.T, cfg routingConfig) {
 	t.Helper()
 	isolateLedgerMirror(t)
+	// 快照并恢复全局 routing 配置：否则 defaultPolicy=reject 这类用例会把
+	// 状态泄漏给后续测试（2026-10-21 同步上游 v1.14.21 后暴露：
+	// 新测试文件排在 routing_test 之后，被 reject 误伤 403）。
+	prev := routingSnapshot()
 	setRouting(cfg)
 	resetRoutingSpend()
+	t.Cleanup(func() {
+		setRouting(prev)
+		resetRoutingSpend()
+	})
 }
 
 func TestEffectiveMultiplierUsesCatalogWhenPromoValid(t *testing.T) {

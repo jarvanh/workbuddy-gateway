@@ -18,6 +18,23 @@ func isolatePolicies(t *testing.T) {
 	isolatedGatewayConfig(t)
 	resetModelsStateT(t)
 	resetModelStats()
+	// 快照并恢复全局 routing：任何用例把 defaultPolicy 留成 reject 都会
+	// 污染后续协议入口测试（2026-10-21 同步上游 v1.14.21 后暴露）。
+	prevRouting := routingSnapshot()
+	// 同样快照站点级价格台账：isolateGatewayConfig 只把台账**落盘**隔离到临时
+	// cwd，内存里的 sitePriceSamples 仍是进程级全局。走完整请求链路的用例
+	// （如上游 v1.14.21 新增的协议入口净化测试）会真实记账，校准倍率被推到
+	// 远超 maxPrice，后续同模型请求全被「幽灵模型护栏」403 误杀。
+	sitePriceMu.Lock()
+	prevSamples := sitePriceSamples
+	sitePriceSamples = map[string]*sitePriceSample{}
+	sitePriceMu.Unlock()
+	t.Cleanup(func() {
+		setRouting(prevRouting)
+		sitePriceMu.Lock()
+		sitePriceSamples = prevSamples
+		sitePriceMu.Unlock()
+	})
 	oldHeader, oldIdle, oldRetries := upstreamSettings()
 	oldAccounts := accounts
 	oldRetention := logRetentionDays.Load()
