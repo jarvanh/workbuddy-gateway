@@ -6,6 +6,9 @@ on:
   push:
     tags:
       - "v*"
+  # 手动入口：GitHub 事件管道异常时（2026-10-21 实测 tag push 事件丢失）
+  # 可直接 dispatch 指定 tag 重跑，版本号仍取自 GITHUB_REF_NAME。
+  workflow_dispatch:
 
 permissions:
   contents: write
