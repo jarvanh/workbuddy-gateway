@@ -10,6 +10,21 @@
     "fallback": "",
     "force": ""
   },
+  "identity": {
+    "enabled": true,
+    "target": "WorkBuddy",
+    "replacements": {
+      "Claude Code": "WorkBuddy",
+      "Claude": "WorkBuddy",
+      "DeepSeek Harness": "WorkBuddy",
+      "Codex": "WorkBuddy",
+      "ZCode": "WorkBuddy"
+    }
+  },
+  "concurrent": {
+    "MaxAcc": 4,
+    "MaxGlobal": 0
+  },
   "debug": {
     "enabled": false,
     "fullRequests": false
@@ -25,10 +40,13 @@
     "dir": ""
   },
   "upstream": {
+    "requestProfile": "official",
     "headerTimeoutSeconds": 300,
     "idleTimeoutSeconds": 120,
     "transientRetries": 2,
-    "earlyFlushGraceSeconds": 30
+    "earlyFlushGraceSeconds": 30,
+    "streamKeepaliveSeconds": 15,
+    "enableFirstByteRetry": true
   },
   "models": {
     "blocklist": [],

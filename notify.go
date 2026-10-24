@@ -316,7 +316,7 @@ func tgEntry(subject string, meta ...string) string {
 //
 // 前缀刻意用裸文本、不套 <code>：条目主体本身以 <code> 机器值开头，前缀若也是 <code>，
 // 两个相邻 code 实体之间 Telegram 会渲染出一对空反引号（实测冷却告警条目显示为
-// 「  ├─  」紧跟 ``），整行看起来像排版错乱。规范 4.2 的示例前缀同样是裸空格。
+// 「  ├─  」紧跟 “），整行看起来像排版错乱。规范 4.2 的示例前缀同样是裸空格。
 func treeLines(entries []string) string {
 	var sb strings.Builder
 	for i, e := range entries {

@@ -120,9 +120,10 @@ func TestJWTExpiryAndRefreshTokenExpiryFallback(t *testing.T) {
 }
 
 func TestSanitizeUpstreamTextHidesIdentifiers(t *testing.T) {
-	raw := `upstream 401: {"msg":"userID:1191c369-95c2-4f51-9eda-1da71ae17784","token":"Bearer eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.sig"}`
+	// Synthetic identifier only; never copy identifiers from live accounts.
+	raw := `upstream 401: {"msg":"userID:00000000-0000-4000-8000-000000000001","token":"Bearer eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.sig"}`
 	got := sanitizeUpstreamText(raw)
-	for _, secret := range []string{"1191c369-95c2-4f51-9eda-1da71ae17784", "eyJhbGciOiJSUzI1NiJ9"} {
+	for _, secret := range []string{"00000000-0000-4000-8000-000000000001", "eyJhbGciOiJSUzI1NiJ9"} {
 		if strings.Contains(got, secret) {
 			t.Fatalf("敏感片段未隐去: %s", got)
 		}

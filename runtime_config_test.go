@@ -36,6 +36,9 @@ func isolatePolicies(t *testing.T) {
 		sitePriceMu.Unlock()
 	})
 	oldHeader, oldIdle, oldRetries := upstreamSettings()
+	upstreamConfigMu.RLock()
+	oldKeepalive, oldFirstByteRetry := streamKeepalive, enableFirstByteRetry
+	upstreamConfigMu.RUnlock()
 	oldAccounts := accounts
 	oldRetention := logRetentionDays.Load()
 	runtimeConfigMu.Lock()
@@ -55,6 +58,7 @@ func isolatePolicies(t *testing.T) {
 		accountMu.Unlock()
 		upstreamConfigMu.Lock()
 		upstreamHeaderTimeout, upstreamIdleTimeout, upstreamTransientRetries = oldHeader, oldIdle, oldRetries
+		streamKeepalive, enableFirstByteRetry = oldKeepalive, oldFirstByteRetry
 		upstreamConfigMu.Unlock()
 	})
 }

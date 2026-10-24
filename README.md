@@ -112,10 +112,11 @@ go build -o workbuddy-gateway .
 
 Windows 可使用 `.\workbuddy-gateway.exe`。管理端口默认 `8316`，模型 API 默认 `8317`。
 
-- 首次使用可复制 `config.example.json` 为 `config.json`，并按需要设置管理 Key 和 API 鉴权。
+- 首次启动会在工作目录生成完整的默认 `config.json`；旧配置自动补齐缺失的 `identity`、`concurrent` 配置，已有值不覆盖。默认单账号模型并发 `4`，全局不限；修改 `concurrent.MaxAcc/MaxGlobal` 可热加载。
 - **后台价格探测默认关闭**，只有显式传入 `-allow-price-probes` 才开启；主动生成请求可能消耗积分。
 - 网页配置页支持风险确认后的完整 JSON 编辑；监听端口修改需重启服务。
 - `config.json` 和账号凭据含敏感信息，已由 Git 忽略，不要公开分享。
+- 多 Harness 可使用 `upstream.requestProfile: "official"` 开启统一出站兼容；旧配置省略该项保持原行为。见[出站兼容说明](docs/outbound-compatibility.md)。
 
 ## 文档
 
@@ -125,6 +126,8 @@ Windows 可使用 `.\workbuddy-gateway.exe`。管理端口默认 `8316`，模型
 | 目录职责与命名约定 | [docs/project-layout.md](docs/project-layout.md) |
 | 贡献者及方案署名 | [docs/contributors.md](docs/contributors.md) |
 | 测试入口与说明 | [tests/README.md](tests/README.md) |
+| 多 Harness 出站对齐、协议参数与兼容边界 | [docs/outbound-compatibility.md](docs/outbound-compatibility.md) |
+| DSH 历史回放、GUI 环境句与 11128 兼容说明 | [docs/11128-dsh-history.md](docs/11128-dsh-history.md) |
 
 ## 构建与测试
 

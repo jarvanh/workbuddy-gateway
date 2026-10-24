@@ -44,8 +44,8 @@ func warmupRateLimitFixture(t *testing.T, maxRetries int) warmupRuntime {
 	accountMu.Lock()
 	oldAccounts, oldRR := accounts, rrIndex
 	accounts, rrIndex = []*Account{{
-		Path: "cn.json",
-		Auth: &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()}},
+		Path:       "cn.json",
+		Auth:       &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()}},
 		QuotaKnown: true, QuotaRemaining: 100,
 	}}, 0
 	accountMu.Unlock()
@@ -179,8 +179,8 @@ func TestWarmupRateLimitHitsResetOnSuccess(t *testing.T) {
 	accountMu.Lock()
 	oldAccounts, oldRR := accounts, rrIndex
 	accounts, rrIndex = []*Account{{
-		Path: "cn.json",
-		Auth: &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()}},
+		Path:       "cn.json",
+		Auth:       &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()}},
 		QuotaKnown: true, QuotaRemaining: 100,
 	}}, 0
 	accountMu.Unlock()

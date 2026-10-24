@@ -4,15 +4,20 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
+
+//go:embed config.example.json
+var embeddedDefaultRuntimeConfig []byte
 
 // 所有进程内配置文件读改写共用此锁，避免网页写入与热加载互相覆盖。
 // 锁序：runtimeConfigMu -> gatewayConfigMu；调度不持有此锁。
@@ -63,6 +68,9 @@ func parseRuntimeConfig(data []byte) (runtimeFileConfig, error) {
 	if c.Logs.RetentionDays < 0 || c.Logs.RetentionDays > 36500 {
 		return c, gatewayValidationError("logs.retentionDays 必须为 0～36500 的整数；0 表示不自动清理")
 	}
+	if _, err := normalizeRequestProfile(c.Upstream.RequestProfile); err != nil {
+		return c, err
+	}
 	return c, nil
 }
 
@@ -73,6 +81,128 @@ func hasModelNames(names []string) bool {
 		}
 	}
 	return false
+}
+
+// ensureRuntimeConfigFile creates a complete default config for a new user and
+// adds missing default sections to older configs. Existing values are preserved;
+// initialization errors are warnings at startup, not a reason to stop serving.
+func ensureRuntimeConfigFile(path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return writeNewRuntimeConfig(path)
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("config.json 不是普通文件")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &doc); err != nil || doc == nil {
+		return nil // 交给正常配置校验报错；不覆盖半写或非法配置。
+	}
+	changed := false
+	hasKey := func(object map[string]json.RawMessage, name string) bool {
+		for k := range object {
+			if strings.EqualFold(k, name) {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasKey(doc, "identity") {
+		doc["identity"], err = json.Marshal(defaultIdentityConfig())
+		if err != nil {
+			return err
+		}
+		changed = true
+	}
+	if !hasKey(doc, "concurrent") {
+		doc["concurrent"], _ = json.Marshal(normalizeConcurrentConfig(concurrentFileConfig{}))
+		changed = true
+	} else {
+		for key, value := range doc {
+			if !strings.EqualFold(key, "concurrent") {
+				continue
+			}
+			var fields map[string]json.RawMessage
+			if json.Unmarshal(value, &fields) != nil || fields == nil {
+				break
+			}
+			if !hasKey(fields, "MaxAcc") {
+				fields["MaxAcc"] = json.RawMessage("4")
+				changed = true
+			}
+			if !hasKey(fields, "MaxGlobal") {
+				fields["MaxGlobal"] = json.RawMessage("0")
+				changed = true
+			}
+			doc[key], _ = json.Marshal(fields)
+			break
+		}
+	}
+	if !changed {
+		return nil
+	}
+	updated, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	updated = append(updated, '\n')
+	if bytes.Equal(updated, raw) {
+		return nil
+	}
+	temporary := path + ".identity-" + fmt.Sprint(os.Getpid()) + ".tmp"
+	fd, err := os.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL, info.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	defer os.Remove(temporary)
+	if _, err := fd.Write(updated); err != nil {
+		fd.Close()
+		return err
+	}
+	if err := fd.Sync(); err != nil {
+		fd.Close()
+		return err
+	}
+	if err := fd.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporary, path); err != nil {
+		return err
+	}
+	log.Printf("[配置初始化] 已补充缺失的 identity/concurrent 默认配置；已有值和其他配置保留，后续修改仍可热加载")
+	return nil
+}
+
+func writeNewRuntimeConfig(path string) error {
+	data := append([]byte(nil), embeddedDefaultRuntimeConfig...)
+	fd, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if errors.Is(err, os.ErrExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := fd.Write(data); err != nil {
+		fd.Close()
+		os.Remove(path)
+		return err
+	}
+	if err := fd.Sync(); err != nil {
+		fd.Close()
+		return err
+	}
+	if err := fd.Close(); err != nil {
+		return err
+	}
+	log.Printf("[配置初始化] 已生成默认 config.json")
+	return nil
 }
 
 func loadRuntimeConfig(path string) error {
@@ -97,6 +227,10 @@ func loadRuntimeConfig(path string) error {
 
 // 调用前已完整校验。热加载不修改监听端口，不中断正在输出的流。
 func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
+	profile, err := normalizeRequestProfile(c.Upstream.RequestProfile)
+	if err != nil {
+		return err
+	}
 	if hot {
 		if err := switchDebugLogging(c.Debug.Enabled); err != nil {
 			return err // 日志文件不可写时，整份配置仍保留上一版本。
@@ -120,6 +254,26 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 	setModelFilter(c.Models.Blocklist, c.Models.Allowlist)
 	_ = setModelAccountFilter(c.Models.Accounts)
 	setSystemPromptConfig(c.SystemPrompt.Fallback, c.SystemPrompt.Force)
+	setIdentityConfig(c.Identity)
+	modelConcurrency.configure(c.Concurrent)
+	logConcurrentConfig(trace)
+	identityEnabled, identityTarget, identityRuleCount := identitySettingsSummary()
+	log.Printf("[身份替换配置] traceId=%s 启用=%t 目标=%s 规则数=%d 说明=仅处理 system/developer/assistant 文本；热加载只影响后续请求", trace, identityEnabled, identityTarget, identityRuleCount)
+	previousProfile := officialRequests.Load()
+	setRequestProfile(profile)
+	// 未配置 upstream.requestProfile 时会回退 legacy，出站请求体因此不压缩。
+	// 该回退此前是静默的：升级后只能从「请求体没变小」间接推断，故启动时无条件打印一次。
+	profileSource := "config.json upstream.requestProfile"
+	if c.Upstream.RequestProfile == "" {
+		profileSource = "缺省：config.json 未提供 upstream.requestProfile"
+	}
+	switch {
+	case !hot:
+		log.Printf("[出站兼容配置] traceId=%s profile=%s 来源=%s 结果=已应用 说明=legacy 不压缩出站请求体，official 启用出站 gzip 与桌面端指纹；只影响后续模型请求，不修改登录与凭据",
+			trace, profile, profileSource)
+	case previousProfile != officialRequests.Load():
+		log.Printf("[出站兼容配置] traceId=%s profile=%s 结果=已应用 说明=只影响后续模型请求，正在执行的请求沿用原快照，不修改登录和凭据", trace, profile)
+	}
 	logRetentionDays.Store(int64(c.Logs.RetentionDays))
 	header, idle, retries := upstreamHeaderTimeoutDefault, upstreamIdleTimeoutDefault, upstreamTransientRetriesDefault
 	if n := c.Upstream.HeaderTimeoutSeconds; n > 0 {
@@ -131,8 +285,18 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 	if n := c.Upstream.TransientRetries; n != nil && *n >= 0 {
 		retries = *n
 	}
+	keepalive := streamKeepaliveDefault
+	if n := c.Upstream.StreamKeepaliveSeconds; n > 0 {
+		keepalive = time.Duration(n) * time.Second
+	}
+	firstByteRetry := enableFirstByteRetryDefault
+	if n := c.Upstream.EnableFirstByteRetry; n != nil {
+		firstByteRetry = *n
+	}
 	upstreamConfigMu.Lock()
 	upstreamHeaderTimeout, upstreamIdleTimeout, upstreamTransientRetries = header, idle, retries
+	streamKeepalive = keepalive
+	enableFirstByteRetry = firstByteRetry
 	upstreamConfigMu.Unlock()
 	// --- fork 专有段：以下是 fork 自身能力的装载，上游没有对应逻辑 ---
 	// 5 小时窗口主动触发 + 主动探测调度（默认开启，缺失字段回落默认值）。
@@ -183,8 +347,8 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 		intlCheckinDedupe = *c.Checkin.Intl.Dedupe
 	}
 	if hot {
-		log.Printf("[配置热加载] traceId=%s 结果=成功 模型黑名单=%d 模型白名单=%d 账号规则=%d 调试日志=%t 日志保留天数=%d 响应头超时=%v 流空闲超时=%v 重试次数=%d 说明=后续请求使用新配置，凭据及历史账本保留，端口变更需重启",
-			trace, len(c.Models.Blocklist), len(c.Models.Allowlist), len(c.Models.Accounts), c.Debug.Enabled, c.Logs.RetentionDays, header, idle, retries)
+		log.Printf("[配置热加载] traceId=%s 结果=成功 模型黑名单=%d 模型白名单=%d 账号规则=%d 调试日志=%t 日志保留天数=%d 响应头超时=%v 流空闲超时=%v 重试次数=%d 流心跳=%v 首字节重放=%t 说明=后续请求使用新配置，凭据及历史账本保留，端口变更需重启",
+			trace, len(c.Models.Blocklist), len(c.Models.Allowlist), len(c.Models.Accounts), c.Debug.Enabled, c.Logs.RetentionDays, header, idle, retries, keepalive, firstByteRetry)
 	}
 	return nil
 }
@@ -198,6 +362,20 @@ func upstreamSettings() (time.Duration, time.Duration, int) {
 func currentIdleTimeout() time.Duration {
 	_, idle, _ := upstreamSettings()
 	return idle
+}
+
+// currentStreamKeepalive 返回当前流式心跳间隔（0 表示关闭）。
+func currentStreamKeepalive() time.Duration {
+	upstreamConfigMu.RLock()
+	defer upstreamConfigMu.RUnlock()
+	return streamKeepalive
+}
+
+// currentFirstByteRetry 返回当前首字节前重放开关。
+func currentFirstByteRetry() bool {
+	upstreamConfigMu.RLock()
+	defer upstreamConfigMu.RUnlock()
+	return enableFirstByteRetry
 }
 
 func switchDebugLogging(enabled bool) error {

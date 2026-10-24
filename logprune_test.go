@@ -16,9 +16,9 @@ func TestPruneOldLogs(t *testing.T) {
 	dir := t.TempDir()
 
 	// 保留天数设为 7，构造三类文件：
-	old := filepath.Join(dir, "gateway-2020-01-01.log")       // 远超期 → 应删
-	recent := filepath.Join(dir, "debug-" + time.Now().Format("2006-01-02") + ".jsonl") // 今天 → 应留
-	other := filepath.Join(dir, "serve.log")                  // 非滚动日志 → 应留
+	old := filepath.Join(dir, "gateway-2020-01-01.log")                             // 远超期 → 应删
+	recent := filepath.Join(dir, "debug-"+time.Now().Format("2006-01-02")+".jsonl") // 今天 → 应留
+	other := filepath.Join(dir, "serve.log")                                        // 非滚动日志 → 应留
 	for _, p := range []string{old, recent, other} {
 		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
 			t.Fatalf("准备测试文件失败: %v", err)
