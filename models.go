@@ -699,13 +699,15 @@ const (
 		"forms clouds; precipitation returns rain and snow to the surface; runoff " +
 		"gathers into rivers; infiltration refills aquifers; transpiration releases " +
 		"vapor from leaves; the cycle renews itself across every basin and season. "
-	// probePromptFillerRepeats 填充片段重复次数（约 8500 tokens 输入侧样本）。
-	probePromptFillerRepeats = 36
+	// probePromptFillerRepeats 填充片段重复次数（约 8700 tokens 输入侧样本）。
+	// 2026-10-24 修正：原值 36 实测仅约 1.9k tokens（远低于 8300 判定下限），
+	// 导致 credit=0 的免费结论永远无法成立；按 205 字符/段 × 170 ≈ 8.7k tokens 取值。
+	probePromptFillerRepeats = 170
 )
 
-// probePromptFiller 对 flash 模型填充提示词：计费按 prompt+completion 统计，
-// flash 模型响应短，仅拉高 max_tokens 不保证实际 tokens 达标，填充输入侧。
-// 约 8500 tokens，叠加输出后任何倍率 ≥0.05 的模型扣费都能越过显示精度。
+// probePromptFiller 对所有探针模型填充提示词：计费按 prompt+completion 统计，
+// 部分模型响应短，仅拉高 max_tokens 不保证实际 tokens 达标，填充输入侧。
+// 约 8700 tokens，叠加输出后任何倍率 ≥0.05 的模型扣费都能越过显示精度。
 var probePromptFiller = "Before answering, silently review the following background " +
 	"notes and keep them in mind. The notes describe the water cycle in detail: " +
 	strings.Repeat(probePromptFillerUnit, probePromptFillerRepeats)
@@ -1530,11 +1532,9 @@ func probeModelPriceEx(acc *Account, model string) probeOutcome {
 
 	// 2026-10-15 修正：旧探针 max_tokens=300 只是上限，模型实际只生成 ~200
 	// tokens，低倍率模型的真实扣费低于 credit 显示精度 0.01 被抹成 0。
-	// 拉高上限并对 flash 模型填充提示词（计费含输入 tokens）保样本达标。
-	probeUserContent := probePrompt
-	if strings.Contains(strings.ToLower(model), "flash") {
-		probeUserContent = probePromptFiller + probePrompt
-	}
+	// 2026-10-24 修正：filler 只给 flash 且长度不足，hy3/step 等模型实测仅 ~2.2k
+	// tokens，永远达不到 8300 下限；改为所有模型统一填充并加长 filler。
+	probeUserContent := probePromptFiller + probePrompt
 	payload, _ := json.Marshal(map[string]any{
 		"model": model, "stream": true, "max_tokens": probeTargetMaxTokens,
 		"messages": []any{

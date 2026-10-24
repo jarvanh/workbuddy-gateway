@@ -22,7 +22,7 @@ func TestProbeTinySampleNeverFree(t *testing.T) {
 	}
 }
 
-// flash 模型探针必须填充提示词并拉高 max_tokens，确保样本量达到扣费精度下限。
+// 探针必须填充提示词并拉高 max_tokens，确保样本量达到扣费精度下限。
 func TestProbeFlashRequestFillsPrompt(t *testing.T) {
 	acc := probeAccount()
 	var gotBody string
@@ -42,5 +42,22 @@ func TestProbeFlashRequestFillsPrompt(t *testing.T) {
 	_ = json.Unmarshal([]byte(gotBody), &payload)
 	if payload.MaxTokens != probeTargetMaxTokens {
 		t.Fatalf("max_tokens = %d, want %d", payload.MaxTokens, probeTargetMaxTokens)
+	}
+}
+
+// 2026-10-24 回归：非 flash 模型（hy3/step 等）同样必须填充提示词，
+// 否则样本量永远达不到 8300 的免费判定下限。
+func TestProbeNonFlashRequestFillsPrompt(t *testing.T) {
+	acc := probeAccount()
+	var gotBody string
+	withProbeAccount(t, acc, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(sseWithUsage(`{"credit":0,"total_tokens":12000}`)))
+	})
+	_ = probeAccountModel(context.Background(), acc, "hy3")
+	if !strings.Contains(gotBody, probePromptFiller) {
+		t.Fatal("non-flash probe request must contain prompt filler")
 	}
 }

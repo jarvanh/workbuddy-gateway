@@ -205,12 +205,8 @@ func probeAccountModel(ctx context.Context, acc *Account, model string) probeRes
 
 	// 2026-10-15 修正：max_tokens=300 只是上限，模型实际只生成 ~200 tokens，
 	// 低倍率模型的真实扣费低于 credit 显示精度 0.01 被抹成 0，曾被误判 free。
-	// 一并拉高 max_tokens 并对 flash 模型填充提示词（计费含输入 tokens），
-	// 确保样本量达到扣费精度下限（见 models.go probeTargetMaxTokens 注释）。
-	probeUserContent := probePrompt
-	if strings.Contains(strings.ToLower(model), "flash") {
-		probeUserContent = probePromptFiller + probePrompt
-	}
+	// 2026-10-24 修正：filler 仅覆盖 flash 且长度不足，统一改为所有模型填充。
+	probeUserContent := probePromptFiller + probePrompt
 	body := map[string]any{
 		"model":      model,
 		"stream":     true,
