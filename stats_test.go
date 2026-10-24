@@ -48,6 +48,31 @@ func statsQuery(t *testing.T, query string) (int, map[string]any) {
 	return rec.Code, body
 }
 
+func TestStatsServerTimePreservesFutureBuckets(t *testing.T) {
+	resetStatsState(t)
+	before := time.Now().UnixMilli()
+	day := time.Now().In(statsZone).AddDate(0, 0, 1).Format("2006-01-02")
+	code, body := statsQuery(t, "period=hour&start="+day+"&end="+day)
+	after := time.Now().UnixMilli()
+	if code != http.StatusOK {
+		t.Fatalf("stats status=%d", code)
+	}
+	serverTime, ok := body["serverTime"].(float64)
+	if !ok || int64(serverTime) < before || int64(serverTime) > after {
+		t.Fatalf("serverTime must be current Unix milliseconds: %v", body["serverTime"])
+	}
+	buckets := body["buckets"].([]any)
+	if len(buckets) != 24 {
+		t.Fatalf("preserve full future-day time axis, got %d buckets", len(buckets))
+	}
+	for _, item := range buckets {
+		bucket := item.(map[string]any)
+		if bucket["start"].(float64) <= serverTime || bucket["requests"].(float64) != 0 {
+			t.Fatalf("expected future empty bucket, got %v", bucket)
+		}
+	}
+}
+
 // 缺文件时静默启用，从空统计开始，不影响网关运行。
 func TestStatsMissingFileStartsEmpty(t *testing.T) {
 	chdirTemp(t)

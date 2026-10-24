@@ -132,6 +132,8 @@
     state.statsVersion++;
     state.statsLastPoll = 0;
     state.lastStats = null;
+    hideAllStatsChartHover();
+    statsChartControllers = [];
     ["usageSummary", "usageChart", "latencyChart", "statsInfo", "statsRange"].forEach(function (id) {
       $(id).textContent = "";
     });
@@ -240,11 +242,11 @@
         });
       });
     }
-    var notes = ["来源：普通日志 · 只列当前异常，最新告警在上；等级仅区分颜色和标签"];
+    var notes = [];
     if (data.stale || (snapshot && snapshot.stale)) notes.push("快照过旧，以下为上次确认的异常");
     if (data.missingLogCount) notes.push("部分异常暂未找到对应日志，可能等待下一次扫描");
     if (data.scanTruncated || data.listTruncated) notes.push("已达到读取上限，仅显示扫描范围内记录");
-    $("accountAlertsInfo").textContent = notes.join("；") + "。";
+    $("accountAlertsInfo").textContent = notes.length ? notes.join("；") + "。" : "";
     $("accountAlerts").innerHTML = alerts.length ? alerts.map(function (a) {
       var level = labels[a.severity] ? a.severity : "notice";
       return '<article class="account-alert alert-' + level + '"><div class="account-alert-head">' +
@@ -287,11 +289,57 @@
       '</div><div class="usage-value">' + esc(value) + '</div><div class="usage-detail">' + esc(detail) + '</div></article>';
   }
 
-  // 原生 SVG，不访问 CDN。空时间桶及未知耗时断开折线，不伪造连续的零值。
-  // box 决定 viewBox 尺寸。让它贴近容器实际像素（比例≈1:1），
-  // 字号才不会随缩放变小；窄屏用更矮的目标高度。
-  // 原生 SVG，不加载 CDN。折线在时间桶缺样本处断开，不补零；柱形画在下层，折线覆盖在上层。
-  // opts = {lines, bars, title, leftFormat, rightFormat, box}；给了 rightFormat 时柱形改用右轴。
+  function statsChartNow(value) {
+    return typeof value === "number" && isFinite(value) && value > 0 ? value : Date.now();
+  }
+
+  function statsBucketIsFuture(bucket, now) {
+    // Bucket start is an absolute Unix millisecond timestamp, not the displayed
+    // MM-DD label. This works across years and browser time zones.
+    return typeof bucket.start === "number" && isFinite(bucket.start) && bucket.start > now;
+  }
+
+  function statsChartValue(series, bucket, index, now) {
+    if (statsBucketIsFuture(bucket, statsChartNow(now))) return null;
+    var value = series.value(bucket, index);
+    return value === null || value === undefined || !isFinite(value) ? null : Number(value);
+  }
+
+  function statsChartAxes(buckets, opts, cutoff) {
+    var now = statsChartNow(cutoff === undefined ? opts.nowMs : cutoff);
+    var lines = [], bars = [];
+    (opts.lines || []).forEach(function (series) { buckets.forEach(function (b, i) {
+      if (statsBucketIsFuture(b, now)) return;
+      var v = statsChartValue(series, b, i, now);
+      if (v !== null || series.connectZero) lines.push(v === null ? 0 : v);
+    }); });
+    (opts.bars || []).forEach(function (series) { buckets.forEach(function (b, i) {
+      var v = statsChartValue(series, b, i, now);
+      if (v !== null) bars.push(v);
+    }); });
+    var dual = !!opts.rightFormat && bars.length > 0;
+    var scaleMax = function (values) {
+      var maximum = 0;
+      values.forEach(function (v) { maximum = Math.max(maximum, v); });
+      return (maximum > 0 ? maximum : 1) * 1.12;
+    };
+    var leftMax = scaleMax(dual ? lines : lines.concat(bars)), rightMax = scaleMax(dual ? bars : []);
+    var ticks = function (format, maximum) {
+      return [0, 1, 2, 3, 4].map(function (n) { return String(format(maximum * (1 - n / 4))); });
+    };
+    var leftTicks = ticks(opts.leftFormat || String, leftMax);
+    var rightTicks = dual ? ticks(opts.rightFormat, rightMax) : [];
+    var padding = function (labels, minimum) {
+      return Math.min(130, Math.max(minimum, 14 + Math.max.apply(null, labels.map(function (t) { return t.length; })) * 7));
+    };
+    return {hasValues: lines.length + bars.length > 0, dual: dual,
+      leftMax: leftMax, rightMax: rightMax, leftTicks: leftTicks, rightTicks: rightTicks,
+      left: padding(leftTicks, 52), right: dual ? padding(rightTicks, 44) : 16};
+  }
+
+  // 原生 SVG，不访问 CDN。折线默认跨过无样本时间桶连接相邻样本；
+  // series.connectZero=true 时把无样本桶按 0 画（用量图使用）。
+  // 柱形仍只在有样本的桶出现；opts = {lines, bars, title, leftFormat, rightFormat, box}。
   function statsComboChart(buckets, opts) {
     opts = opts || {};
     var lines = opts.lines || [], bars = opts.bars || [];
@@ -299,40 +347,34 @@
     var leftFormat = opts.leftFormat || function (v) { return String(v); };
     var rightFormat = opts.rightFormat || null;
     var box = opts.box || {w: 900, h: 260};
-    var pick = function (s, b, i) {
-      var v = s.value(b, i);
-      return (v === null || v === undefined || !isFinite(v)) ? null : Number(v);
+    var now = statsChartNow(opts.nowMs);
+    var pick = function (s, b, i) { return statsChartValue(s, b, i, now); };
+    var lineValue = function (s, b, i) {
+      if (statsBucketIsFuture(b, now)) return null;
+      var value = pick(s, b, i);
+      return value === null && s.connectZero ? 0 : value;
     };
-    var gather = function (list) {
-      var out = [];
-      list.forEach(function (s) { buckets.forEach(function (b, i) {
-        var v = pick(s, b, i);
-        if (v !== null) out.push(v);
-      }); });
-      return out;
-    };
-    var lineValues = gather(lines), barValues = gather(bars);
-    if (!lineValues.length && !barValues.length) return '<p class="stats-empty">该时间范围暂无可用样本</p>';
-    var dual = !!rightFormat && barValues.length > 0;
-    var scaleMax = function (values) {
-      var m = values.length ? Math.max.apply(null, values) : 0;
-      if (m <= 0) m = 1;
-      return m * 1.12;
-    };
-    var leftMax = scaleMax(dual ? lineValues : lineValues.concat(barValues));
-    var rightMax = scaleMax(dual ? barValues : []);
+    var axes = statsChartAxes(buckets, opts, now);
+    if (!axes.hasValues) {
+      var futureOnly = buckets.length && buckets.every(function (b) { return statsBucketIsFuture(b, now); });
+      return '<p class="stats-empty">' + (futureOnly ? "所选时间范围尚未开始" : "该时间范围暂无可用样本") + '</p>';
+    }
+    var dual = axes.dual, leftMax = axes.leftMax, rightMax = axes.rightMax;
     var width = Math.max(260, Math.round(box.w)), height = Math.max(190, Math.round(box.h));
     var top = 18, bottom = 40;
-    var leftTicks = [0, 1, 2, 3, 4].map(function (n) { return leftFormat(leftMax * (1 - n / 4)); });
-    var rightTicks = dual ? [0, 1, 2, 3, 4].map(function (n) { return rightFormat(rightMax * (1 - n / 4)); }) : [];
-    var left = Math.min(130, Math.max(52, 14 + Math.max.apply(null, leftTicks.map(function (t) { return t.length; })) * 7));
-    var right = dual ? Math.min(130, Math.max(44, 14 + Math.max.apply(null, rightTicks.map(function (t) { return t.length; })) * 7)) : 16;
+    var leftTicks = axes.leftTicks, rightTicks = axes.rightTicks;
+    var left = axes.left, right = axes.right;
+    // 两张图共用同一组边距时，日期刻度和十字线才能逐像素对齐。
+    if (opts.plotPad) {
+      if (opts.plotPad.left != null) left = opts.plotPad.left;
+      if (opts.plotPad.right != null) right = opts.plotPad.right;
+    }
     var plotW = width - left - right, plotH = height - top - bottom;
     var x = function (i) { return buckets.length < 2 ? left + plotW / 2 : left + i * plotW / (buckets.length - 1); };
     var yLeft = function (v) { return top + plotH * (1 - v / leftMax); };
     var yRight = function (v) { return top + plotH * (1 - v / rightMax); };
-    var out = '<svg viewBox="0 0 ' + width + ' ' + height + '" role="img" aria-label="' + esc(title) +
-      '"><title>' + esc(title) + '</title>';
+    var out = '<div class="chart-canvas"><svg viewBox="0 0 ' + width + ' ' + height + '" role="img" aria-label="' + esc(title) +
+      '" data-chart-model=""><title>' + esc(title) + '</title>';
     for (var n = 0; n <= 4; n++) {
       var yy = top + plotH * n / 4;
       out += '<line class="chart-grid" x1="' + left + '" y1="' + yy + '" x2="' + (width - right) + '" y2="' + yy + '"/>' +
@@ -384,6 +426,7 @@
       out += '<text class="chart-label" text-anchor="' + t.anchor + '" x="' + t.tx + '" y="' + (height - 12) + '">' +
         esc(tickLabel(buckets[t.i].label)) + '</text>';
     });
+    var model = {width: width, height: height, left: left, top: top, plotW: plotW, plotH: plotH, count: buckets.length, buckets: []};
     if (bars.length) {
       // 柱组必须居中在该桶折线点的时间位置上，否则柱会比线偏半个桶位；
       // 只做 SVG 边界保护，正常尺寸下不会触发。
@@ -399,33 +442,290 @@
           var yy = (dual ? yRight : yLeft)(value);
           var h = Math.max(1, baseY - yy);
           out += '<rect class="chart-bar series-' + s.color + '" x="' + (groupX + j * barW).toFixed(2) +
-            '" y="' + yy.toFixed(2) + '" width="' + Math.max(1, barW - 1).toFixed(2) + '" height="' + h.toFixed(2) + '">' +
-            '<title>' + esc(b.label + " · " + s.label + " " + (dual ? rightFormat : leftFormat)(value)) + '</title></rect>';
+            '" y="' + yy.toFixed(2) + '" width="' + Math.max(1, barW - 1).toFixed(2) + '" height="' + h.toFixed(2) + '"></rect>';
         });
       });
     }
     lines.forEach(function (s) {
-      var points = [], paths = [];
+      var points = [], paths = [], connectGaps = s.connectGaps !== false;
       buckets.forEach(function (b, i) {
-        var value = pick(s, b, i);
+        var value = lineValue(s, b, i);
         if (value === null) {
-          if (points.length) paths.push(points.join(" "));
-          points = [];
+          if (!connectGaps && points.length) {
+            paths.push(points.join(" "));
+            points = [];
+          }
           return;
         }
         var xx = x(i), yy = yLeft(value);
         points.push((points.length ? "L" : "M") + xx.toFixed(2) + "," + yy.toFixed(2));
-        out += '<circle class="series-' + s.color + '" cx="' + xx + '" cy="' + yy + '" r="' + (buckets.length > 80 ? 1.8 : 3.2) +
-          '"><title>' + esc(b.label + " · " + s.label + " " + leftFormat(value)) + '</title></circle>';
+        out += '<circle class="series-' + s.color + '" cx="' + xx.toFixed(2) + '" cy="' + yy.toFixed(2) +
+          '" r="' + (buckets.length > 80 ? 1.8 : 3.2) + '"></circle>';
       });
       if (points.length) paths.push(points.join(" "));
       paths.forEach(function (p) { out += '<path class="chart-line series-' + s.color + '" d="' + p + '"/>'; });
     });
-    return out + "</svg>";
+    buckets.forEach(function (b, i) {
+      var row = {label: b.label, x: x(i), future: statsBucketIsFuture(b, now), lines: [], bars: []};
+      lines.forEach(function (s) {
+        var value = lineValue(s, b, i);
+        row.lines.push({label: s.label, color: s.color, value: value,
+          display: value === null ? "—" : leftFormat(value), y: value === null ? null : yLeft(value)});
+      });
+      bars.forEach(function (s) {
+        var value = pick(s, b, i);
+        row.bars.push({label: s.label, color: s.color, value: value,
+          display: value === null ? "—" : (dual ? rightFormat : leftFormat)(value),
+          y: value === null ? null : (dual ? yRight : yLeft)(value)});
+      });
+      // Shared overview readout is separate from the model-specific plotted series.
+      row.readout = typeof opts.tooltipRows === "function" ? opts.tooltipRows(b) : null;
+      if (row.future && row.readout) row.readout = row.readout.map(function (item) {
+        return {label: item.label, color: item.color, display: "—"};
+      });
+      model.buckets.push(row);
+    });
+    // 十字线、命中点和浮层都由同一份几何模型驱动，避免 SVG 缩放后坐标漂移。
+    out += '<line class="chart-crosshair" x1="0" y1="0" x2="0" y2="0" visibility="hidden"/>' +
+      '<g class="chart-hover-dots">';
+    lines.forEach(function (s) {
+      out += '<circle class="chart-hover-dot series-' + s.color + '" r="4" visibility="hidden"/>';
+    });
+    out += '</g><rect class="chart-hover-area" x="' + left + '" y="' + top + '" width="' + plotW + '" height="' + plotH +
+      '" fill="transparent" pointer-events="all"/>';
+    out += '</svg><div class="chart-tooltip" hidden></div></div>';
+    return out.replace('data-chart-model=""', 'data-chart-model="' + esc(JSON.stringify(model)) + '"');
+  }
+
+  function bindStatsChartHover(container) {
+    if (!container || !container.querySelector) return;
+    var svg = container.querySelector("svg");
+    var tooltip = container.querySelector(".chart-tooltip");
+    if (!svg || !tooltip || !svg.getAttribute) return;
+    var model;
+    try { model = JSON.parse(svg.getAttribute("data-chart-model") || "{}"); } catch (_) { return; }
+    if (!model.buckets || !model.buckets.length) return;
+    var area = svg.querySelector(".chart-hover-area");
+    var cross = svg.querySelector(".chart-crosshair");
+    var dots = svg.querySelectorAll ? svg.querySelectorAll(".chart-hover-dot") : [];
+    if (!area || !cross) return;
+    var group = (container.id === "usageChart" || container.id === "latencyChart") ? $("statsCharts") : null;
+    var sharedLine = group ? $("statsChartsCrosshair") : null;
+    var plottedIndex = -1, tooltipIndex = -1, tooltipSize = null, tooltipHTML = [];
+    if (sharedLine) cross.setAttribute("visibility", "hidden");
+    var hide = function () {
+      cancelStatsChartHover(controller);
+      cross.setAttribute("visibility", "hidden");
+      Array.prototype.forEach.call(dots, function (dot) { dot.setAttribute("visibility", "hidden"); });
+      tooltip.hidden = true;
+      plottedIndex = -1;
+    };
+    var show = function (index, withTooltip, pointer, rect) {
+      var row = model.buckets[index];
+      if (!row) return;
+      // Only the active pane needs a tooltip or a size measurement. Build its
+      // content once per bucket, not once per physical pointer event.
+      if (withTooltip !== false) {
+        if (tooltipIndex !== index) {
+          if (!tooltipHTML[index]) {
+            var rows = row.readout || row.lines.concat(row.bars);
+            tooltipHTML[index] = '<div class="chart-tooltip-date">' + esc(row.label) + '</div>' +
+              (row.future ? '<div class="chart-tooltip-status">未到该时间</div>' : '') +
+              rows.map(function (item) {
+                var dot = item.color ? '<i class="series-dot ' + esc(item.color) + '"></i>' : "";
+                return '<div class="chart-tooltip-row"><span class="chart-tooltip-key">' + dot + esc(item.label) +
+                  '</span><span class="chart-tooltip-value">' + esc(item.display) + '</span></div>';
+              }).join("");
+          }
+          tooltip.innerHTML = tooltipHTML[index];
+          tooltipIndex = index;
+          tooltipSize = null;
+        }
+        if (tooltip.hidden) tooltip.hidden = false;
+        // One layout read when content changes. All chart/group rectangles
+        // have already been read before this frame starts changing the DOM.
+        if (!tooltipSize) tooltipSize = {width: tooltip.offsetWidth || 180, height: tooltip.offsetHeight || 80};
+      } else if (!tooltip.hidden) {
+        tooltip.hidden = true;
+      }
+      if (plottedIndex !== index) {
+        if (!sharedLine) {
+          cross.setAttribute("x1", row.x); cross.setAttribute("x2", row.x);
+          cross.setAttribute("y1", model.top); cross.setAttribute("y2", model.top + model.plotH);
+          cross.setAttribute("visibility", "visible");
+        }
+        row.lines.forEach(function (line, i) {
+          var dot = dots[i];
+          if (!dot) return;
+          if (line.value === null) { dot.setAttribute("visibility", "hidden"); return; }
+          dot.setAttribute("cx", row.x); dot.setAttribute("cy", line.y);
+          dot.setAttribute("visibility", "visible");
+        });
+        plottedIndex = index;
+      }
+      if (withTooltip === false) return;
+      var scaleX = rect.width ? rect.width / model.width : 1;
+      var scaleY = rect.height ? rect.height / model.height : 1;
+      var px = pointer && isFinite(pointer.clientX) ? pointer.clientX - rect.left : row.x * scaleX;
+      var py = pointer && isFinite(pointer.clientY) ? pointer.clientY - rect.top : (model.top + model.plotH / 2) * scaleY;
+      var width = tooltipSize.width, height = tooltipSize.height;
+      var left = px + 14;
+      if (left + width > rect.width) left = px - width - 14;
+      if (left < 4) left = 4;
+      var top = py - height / 2;
+      if (top < 4) top = 4;
+      if (top + height > rect.height) top = rect.height - height - 4;
+      tooltip.style.transform = "translate3d(" + left + "px," + Math.max(4, top) + "px,0)";
+    };
+    if (!group || !sharedLine) {
+      area.addEventListener("pointermove", function (event) {
+        queueStatsChartHover(controller, event);
+      });
+    }
+    area.addEventListener("pointerleave", function () {
+      // Keep the guide through the inter-card gap; the group owns its lifetime.
+      if (!group || !sharedLine) hide();
+    });
+    area.addEventListener("pointercancel", group && sharedLine ? hideAllStatsChartHover : hide);
+    var controller = {
+      id: container.id, show: show, hide: hide,
+      group: group, guide: sharedLine, model: model,
+      measure: function () {
+        return svg.getBoundingClientRect ? svg.getBoundingClientRect() :
+          {left: 0, top: 0, width: model.width, height: model.height};
+      },
+      position: function (index, rect) {
+        var row = model.buckets[index];
+        if (!row) return null;
+        var scale = rect.height / model.height;
+        return {x: rect.left + row.x * rect.width / model.width,
+          top: rect.top + model.top * scale, bottom: rect.top + (model.top + model.plotH) * scale};
+      }
+    };
+    if (group && sharedLine) {
+      statsChartControllers.push(controller);
+      if (!group.statsHoverBound) {
+        // The axes, labels, card padding and inter-card gap are part of the
+        // linked chart too. Listening only on the transparent plot rect leaves
+        // dead zones where the retained guide appears to freeze.
+        group.addEventListener("pointermove", function (event) {
+          queueStatsChartHover(null, event, group);
+        });
+        group.addEventListener("pointerleave", hideAllStatsChartHover);
+        group.addEventListener("pointercancel", hideAllStatsChartHover);
+        group.statsHoverBound = true;
+      }
+    }
+  }
+
+  var statsChartControllers = [];
+  var statsChartHoverTrace = "";
+  var statsChartHoverFrame = null, statsChartHoverPending = null, statsChartHoverGeneration = 0;
+
+  function cancelStatsChartHover(controller) {
+    if (controller && (!statsChartHoverPending || statsChartHoverPending.controller !== controller)) return;
+    if (statsChartHoverFrame !== null && window.cancelAnimationFrame) window.cancelAnimationFrame(statsChartHoverFrame);
+    statsChartHoverFrame = null;
+    statsChartHoverPending = null;
+    statsChartHoverGeneration++;
+  }
+
+  function queueStatsChartHover(controller, event, group) {
+    // Keep only the latest coordinates across BOTH charts. High-polling-rate
+    // mice must not generate hundreds of DOM/layout updates between frames.
+    if (group && !statsChartControllers.length) return;
+    statsChartHoverPending = {controller: controller, group: group, clientX: event.clientX, clientY: event.clientY};
+    if (statsChartHoverFrame !== null) return;
+    var generation = statsChartHoverGeneration;
+    var paint = function () {
+      if (generation !== statsChartHoverGeneration) return;
+      statsChartHoverFrame = null;
+      var pointer = statsChartHoverPending;
+      statsChartHoverPending = null;
+      if (!pointer) return;
+      var source = pointer.controller, rect, frames = null;
+      if (pointer.group) {
+        // Pick the nearest SVG, including its axes, without reading layout in
+        // the physical pointer handler. A gap/title hover uses the nearer pane.
+        var nearest = Infinity;
+        frames = statsChartControllers.filter(function (c) { return c.group === pointer.group; }).map(function (c) {
+          var bounds = c.measure();
+          var distance = Math.max(bounds.top - pointer.clientY, pointer.clientY - bounds.top - bounds.height, 0);
+          if (!source || distance < nearest) {
+            source = c;
+            rect = bounds;
+            nearest = distance;
+          }
+          return {controller: c, rect: bounds};
+        });
+        if (!source) return;
+      } else {
+        rect = source.measure();
+      }
+      var model = source.model;
+      var viewX = (pointer.clientX - rect.left) * model.width / (rect.width || model.width);
+      var index = Math.round((viewX - model.left) / Math.max(1, model.plotW) * (model.count - 1));
+      index = Math.max(0, Math.min(model.count - 1, index));
+      if (source.group && source.guide) {
+        syncStatsChartHover(index, source, source.guide, source.group, pointer, rect, frames);
+      } else {
+        source.show(index, true, pointer, rect);
+      }
+    };
+    if (window.requestAnimationFrame) statsChartHoverFrame = window.requestAnimationFrame(paint);
+    else paint();
+  }
+
+  function syncStatsChartHover(index, source, guide, group, pointer, sourceRect, measuredFrames) {
+    // Read every rectangle before either pane mutates the DOM, avoiding
+    // alternating read/write forced layouts in the linked chart.
+    var positions = [], frames = measuredFrames || statsChartControllers.filter(function (c) {
+      return c.group === group;
+    }).map(function (controller) {
+      return {controller: controller, rect: controller === source ? sourceRect : controller.measure()};
+    });
+    frames.forEach(function (frame) {
+      var position = frame.controller.position(index, frame.rect);
+      if (position) positions.push(position);
+    });
+    if (!positions.length) return;
+    var bounds = group.getBoundingClientRect();
+    var top = Math.min.apply(null, positions.map(function (p) { return p.top; }));
+    var bottom = Math.max.apply(null, positions.map(function (p) { return p.bottom; }));
+    source.show(index, true, pointer, sourceRect);
+    frames.forEach(function (frame) {
+      if (frame.controller !== source) frame.controller.show(index, false, null, frame.rect);
+    });
+    guide.style.transform = "translate3d(" + (positions[0].x - bounds.left) + "px," + (top - bounds.top) + "px,0)";
+    var height = (bottom - top) + "px";
+    if (guide.style.height !== height) guide.style.height = height;
+    guide.hidden = false;
+    if (!statsChartHoverTrace) {
+      statsChartHoverTrace = traceID();
+      reportUIEvent("stats_chart_hover_started", "/admin/api/stats", 0, statsChartHoverTrace);
+    }
+  }
+
+  function hideAllStatsChartHover() {
+    cancelStatsChartHover();
+    statsChartControllers.forEach(function (controller) { controller.hide(); });
+    var guide = $("statsChartsCrosshair");
+    if (guide) guide.hidden = true;
+    if (statsChartHoverTrace) {
+      reportUIEvent("stats_chart_hover_ended", "/admin/api/stats", 0, statsChartHoverTrace);
+      statsChartHoverTrace = "";
+    }
   }
 
   function statsLineChart(buckets, series, title, format, box) {
     return statsComboChart(buckets, {lines: series, bars: [], title: title, leftFormat: format, box: box});
+  }
+
+  function renderStatsChart(id, buckets, opts) {
+    var el = $(id);
+    if (!el) return;
+    el.innerHTML = statsComboChart(buckets, opts);
+    bindStatsChartHover(el);
   }
 
   function renderStats(data) {
@@ -436,10 +736,7 @@
     $("statsStorage").textContent = store.mode === "file" ? "stats.json · 已落盘" :
       (store.mode === "memory" ? "仅内存 · 未落盘" : "等待首次落盘");
     $("statsStorage").className = "badge " + (store.mode === "memory" ? "warn" : "");
-    var started = data.startedAt ? new Date(data.startedAt).toLocaleString("zh-CN", {hour12: false}) : "尚未采集";
-    $("statsInfo").textContent = "自 " + started + " 起采集；UTC+8，周从周一开始。按实际上游账号调用统计，失败重试分开记。 " +
-      (store.message || "缺失的 usage 不当作零消耗；缓存读取包含在输入 Token 中，不重复相加。") +
-      " 首Token按有效内容增量计时，仅完整步骤参与平均；旧首响应体样本不混入（排除 " + (s.legacyTtftSamples || 0) + " 条）。不等同于 dsh 当前会话范围。";
+    $("statsInfo").textContent = store.message || "";
     $("statsStart").value = data.start;
     $("statsEnd").value = data.end;
     var choice = state.statsAccount || data.account || "";
@@ -467,14 +764,27 @@
       var el = $(id), w = el && el.clientWidth ? el.clientWidth : 900;
       return {w: w, h: w < 520 ? 230 : 280};
     };
-    $("usageChart").innerHTML = statsComboChart(rows, {
-      lines: [{label: "总 Token", color: "token", value: function (b) { return b.tokenSamples ? b.tokens : null; }}],
+    var chartWidth = Math.min(chartBox("usageChart").w, chartBox("latencyChart").w);
+    var chartNow = statsChartNow(data.serverTime);
+    var sharedBox = {w: chartWidth, h: chartWidth < 520 ? 230 : 280};
+    var tooltipRows = function (b) {
+      return [
+        {label: "总 Token", color: "token", display: b.tokenSamples ? statsNumber(b.tokens) : (b.requests ? "—" : "0")},
+        {label: "积分", color: "credit", display: b.creditSamples ? statsCredit(b.credits) : (b.requests ? "—" : "0")},
+        {label: "平均总耗时", color: "token", display: statsDuration(b.avgLatencyMs)},
+        {label: "平均首Token", color: "first", display: statsDuration(tokenTime(b))}
+      ];
+    };
+    var usageOptions = {
+      lines: [{label: "总 Token", color: "token", connectZero: true, value: function (b) { return b.tokenSamples ? b.tokens : null; }}],
       bars: [{label: "积分", color: "credit", value: function (b) { return b.creditSamples ? b.credits : null; }}],
-      title: "总 Token（折线，左轴）与积分（柱形，右轴）消耗趋势",
+      title: "",
       leftFormat: function (v) { return v >= 1000000 ? (v / 1000000).toFixed(2) + "M" : statsNumber(v); },
       rightFormat: statsCredit,
-      box: chartBox("usageChart")
-    });
+      box: sharedBox,
+      nowMs: chartNow,
+      tooltipRows: tooltipRows
+    };
     var latencyRows = data.modelLatency || [];
     var latencyLines = [], latencyBars = [];
     latencyRows.forEach(function (row, index) {
@@ -491,12 +801,25 @@
     $("latencyLegend").innerHTML = latencyLines.map(function (s) {
       return '<i class="series-dot ' + s.color + '"></i><span>' + esc(s.label) + "</span>";
     }).join("");
-    $("latencyChart").innerHTML = statsComboChart(rows, {
+    var latencyOptions = {
       lines: latencyLines, bars: latencyBars,
-      title: "各模型请求耗时：柱形=首Token，折线=总耗时。按当前时间和账号分别计算",
+      title: "",
       leftFormat: statsDuration,
-      box: chartBox("latencyChart")
-    });
+      box: sharedBox,
+      nowMs: chartNow,
+      tooltipRows: tooltipRows
+    };
+    var usageAxes = statsChartAxes(rows, usageOptions), latencyAxes = statsChartAxes(rows, latencyOptions);
+    var chartPad = {left: Math.max(usageAxes.left, latencyAxes.left), right: Math.max(usageAxes.right, latencyAxes.right)};
+    // Preserve a usable plot even with unusually wide numeric labels on phones.
+    var padScale = Math.min(1, (Math.max(260, chartWidth) - 100) / (chartPad.left + chartPad.right));
+    chartPad.left = Math.ceil(chartPad.left * padScale);
+    chartPad.right = Math.ceil(chartPad.right * padScale);
+    usageOptions.plotPad = latencyOptions.plotPad = chartPad;
+    hideAllStatsChartHover();
+    statsChartControllers = [];
+    renderStatsChart("usageChart", rows, usageOptions);
+    renderStatsChart("latencyChart", rows, latencyOptions);
     // 明细改为按模型排名，跟随同一时间范围与账号筛选；服务端已按用量排序并剔除无调用模型。
     var ranked = data.models || [];
     $("statsRange").textContent = data.start + " → " + data.end + " · " + ranked.length + " 个模型有调用";
@@ -654,11 +977,6 @@
       $("statsStart").value = saved.start;
       $("statsEnd").value = saved.end;
       state.statsDatesTouched = true;
-    }
-    var hint = $("statsFilterStatus");
-    if (hint) {
-      hint.textContent = "已恢复上次的统计筛选；改完点「查询」即可生效。";
-      hint.classList.remove("hidden");
     }
   }
 
@@ -1474,6 +1792,7 @@
 
   function setTab(name) {
     if (name !== "config" && state.configMode !== "preview" && !exitConfigEdit()) return;
+    if (name !== "overview") hideAllStatsChartHover();
     if (name === "tasks") state.tasksLastPoll = 0;
     state.activeTab = name;
     Array.prototype.forEach.call(document.querySelectorAll(".tab"), function (t) {

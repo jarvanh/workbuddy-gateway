@@ -458,6 +458,8 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 }
 
 .usage-charts {
+  position: relative;
+  cursor: crosshair;
   display: grid;
   /* 单列堆叠：合并后的用量图和耗时图都需要完整宽度。 */
   grid-template-columns: minmax(0, 1fr);
@@ -467,6 +469,19 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 
 .chart-card { margin-bottom: 0; }
 .latency-chart { grid-column: 1 / -1; }
+
+.chart-shared-crosshair {
+  position: absolute;
+  left: 0;
+  top: 0;
+  will-change: transform;
+  z-index: 3;
+  width: 0;
+  border-left: 1px dashed var(--text-muted);
+  opacity: .8;
+  pointer-events: none;
+}
+.chart-shared-crosshair[hidden] { display: none; }
 
 .chart-legend {
   display: inline-flex;
@@ -505,6 +520,12 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 
 .stats-chart { width: 100%; }
 
+.chart-canvas { position: relative; width: 100%; }
+
+#statsInfo:empty,
+#statsFilterStatus:empty,
+#accountAlertsInfo:empty { display: none; }
+
 .stats-chart svg {
   display: block;
   width: 100%;
@@ -542,6 +563,50 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .chart-line.series-m5 { stroke: var(--series-m5); }
 .chart-line.series-m6 { stroke: var(--series-m6); }
 .chart-line.series-m7 { stroke: var(--series-m7); }
+
+.chart-crosshair {
+  stroke: var(--text-muted);
+  stroke-width: 1;
+  stroke-dasharray: 4 4;
+  opacity: .7;
+  pointer-events: none;
+}
+
+.chart-hover-area { cursor: crosshair; }
+
+.chart-hover-dot {
+  stroke: var(--surface);
+  stroke-width: 2;
+  pointer-events: none;
+}
+
+.chart-tooltip {
+  position: absolute;
+  left: 0;
+  top: 0;
+  will-change: transform;
+  z-index: 5;
+  min-width: 150px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .18);
+  font-size: 12px;
+  line-height: 1.5;
+  pointer-events: none;
+  max-width: min(340px, calc(100% - 8px));
+  max-height: calc(100% - 8px);
+  overflow: hidden;
+}
+
+.chart-tooltip[hidden] { display: none; }
+.chart-tooltip-date { font-weight: 600; margin-bottom: 4px; }
+.chart-tooltip-status { color: var(--text-muted); margin-bottom: 4px; }
+.chart-tooltip-row { display: flex; justify-content: space-between; gap: 14px; white-space: nowrap; }
+.chart-tooltip-key { display: inline-flex; align-items: center; gap: 6px; min-width: 0; color: var(--text-muted); }
+.chart-tooltip-value { font-variant-numeric: tabular-nums; }
 
 circle.series-token { fill: var(--series-token); }
 circle.series-credit { fill: var(--series-credit); }

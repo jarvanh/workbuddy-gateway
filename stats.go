@@ -724,12 +724,18 @@ func handleWebUIStats(w http.ResponseWriter, r *http.Request) {
 		}
 		modelLatency = append(modelLatency, statsModelLatency{Model: m.Model, AvgLatencyMS: points, AvgTTFTMS: ttftPoints})
 	}
-	log.Printf("[统计查询] traceId=%s 维度=%s 单账号=%t 时间桶=%d 请求记录=%d 耗时线条=%d 存储=%s 结果=成功 说明=耗时按模型分别平均，不把各模型合成一条；UTC+8，周一开周；仅读内存聚合，不请求上游", debugTraceID(r), period, account != "", len(buckets), summary.Requests, len(modelLatency), mode)
+	futureBuckets := 0
+	for _, bucket := range buckets {
+		if bucket.Start > now.UnixMilli() {
+			futureBuckets++
+		}
+	}
+	log.Printf("[统计查询] traceId=%s 维度=%s 单账号=%t 时间桶=%d 尚未开始的桶=%d 图表截止毫秒=%d 请求记录=%d 耗时线条=%d 存储=%s 结果=成功 说明=未来桶保留时间轴但不画点线柱、不补零；当前桶与过去零值正常展示；耗时按模型分别平均；UTC+8，周一开周；仅读内存聚合，不请求上游", debugTraceID(r), period, account != "", len(buckets), futureBuckets, now.UnixMilli(), summary.Requests, len(modelLatency), mode)
 	writeAdminData(w, r, map[string]any{
 		"period": period, "account": account, "site": site, "timezone": "Asia/Shanghai",
 		"start": from.Format("2006-01-02"), "end": to.AddDate(0, 0, -1).Format("2006-01-02"),
 		"startedAt": startedAt, "accounts": choices, "summary": summary, "buckets": buckets, "models": models, "modelLatency": modelLatency,
-		"ttftMetric": ttftMetric,
-		"storage":    map[string]any{"mode": mode, "message": problem, "lastSavedAt": savedAt},
+		"ttftMetric": ttftMetric, "serverTime": now.UnixMilli(),
+		"storage": map[string]any{"mode": mode, "message": problem, "lastSavedAt": savedAt},
 	})
 }

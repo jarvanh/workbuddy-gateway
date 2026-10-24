@@ -56,7 +56,6 @@
         <div id="poolHealth" class="health-value" role="status" aria-live="polite">—</div>
         <div class="health-track" aria-hidden="true"><div id="poolHealthBar"></div></div>
         <p id="poolHealthStatus" class="health-status">等待账号状态</p>
-        <p class="hint">可用且未停用的账号占全部账号的比例。全部可用为 100%；无账号或快照失效时显示未知。</p>
         <p class="hint health-footnote">账号级健康度，不代表每个模型都可调用。</p>
       </section>
       <section class="card account-alert-card" aria-labelledby="accountAlertsTitle">
@@ -69,7 +68,7 @@
     </div>
     <section class="usage-section" aria-labelledby="usageTitle">
       <div class="usage-heading">
-        <div><h2 id="usageTitle">用量与性能</h2><p class="hint">按凭据汇总实际 Token 与积分消耗 · UTC+8</p></div>
+        <div><h2 id="usageTitle">用量与性能</h2></div>
         <span id="statsStorage" class="badge" role="status">等待统计</span>
       </div>
       <div class="stats-controls">
@@ -80,23 +79,21 @@
         <button id="statsApply" type="button">查询</button>
       </div>
       <p id="statsFilterStatus" class="hint hidden" role="status"></p>
-      <p id="statsInfo" class="hint" role="status" aria-live="polite">登录后加载统计。没有历史数据时不会补造记录。</p>
+      <p id="statsInfo" class="hint" role="status" aria-live="polite"></p>
       <div id="usageSummary" class="usage-cards"></div>
-      <div class="usage-charts">
+      <div id="statsCharts" class="usage-charts">
+        <div id="statsChartsCrosshair" class="chart-shared-crosshair" aria-hidden="true" hidden></div>
         <div class="card chart-card">
           <div class="card-title">用量趋势 <span class="chart-legend"><i class="series-dot token"></i>总 Token（折线·左轴） <i class="series-dot credit"></i>积分（柱形·右轴）</span></div>
-          <p class="hint">总 Token 用折线、积分用柱形，放在同一张图里对照；两者量级差很多，分别看左右两侧刻度。某个时间桶没有样本时不画点、不补 0。</p>
           <div id="usageChart" class="stats-chart"><p class="stats-empty">等待统计</p></div>
         </div>
         <div class="card chart-card latency-chart">
           <div class="card-title">请求耗时趋势 <span id="latencyLegend" class="chart-legend"></span></div>
-          <p class="hint">柱形是首 Token，折线是总耗时，同一张图里对照。每条柱、每条线都属于一个模型，不会把不同模型合成一条平均线；该模型在某个时间桶没有样本时柱和线都断开，不画成 0。</p>
           <div id="latencyChart" class="stats-chart"><p class="stats-empty">等待统计</p></div>
         </div>
       </div>
       <div class="card">
         <div class="card-title">模型用量排名 <span id="statsRange" class="hint"></span></div>
-        <p class="hint">跟随上方时间范围与账号选择；只列出有调用的模型，用量（Token）多的排前面，Token 未知时按请求数排。</p>
         <div class="table-wrap"><table id="statsTable">
           <thead><tr><th>#</th><th>模型</th><th>请求</th><th>完整 / 失败</th><th>总 Token</th><th>输入 / 输出</th><th>缓存读取</th><th>积分</th><th>平均总耗时</th><th>平均首Token</th><th>数据覆盖</th></tr></thead>
           <tbody><tr><td colspan="11" class="empty">等待统计</td></tr></tbody>

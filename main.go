@@ -39,7 +39,7 @@ import (
 // version 是网关版本号：默认取开发值，发布流水线会通过
 // -ldflags "-X main.version=<tag>" 注入 tag 版本（因此必须是 var 而非 const）。
 //
-// ⚠️ 上游把这里改成了 const 形态（截至 v1.14.30 仍如此），fork 不同步这一改动：
+// ⚠️ 上游把这里改成了 const 形态（截至 v1.14.35 仍如此），fork 不同步这一改动：
 // const 会让 release 流水线的 -ldflags 注入失效（Go 不允许对 const 做 linker 注入），
 // 发版产物会永远显示源码里的开发版本号。保留 var 形态。
 var version = "1.13.1"

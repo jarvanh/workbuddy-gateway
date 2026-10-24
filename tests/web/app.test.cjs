@@ -22,7 +22,7 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map())
   const cookieWrites = [];
   function element(id) {
     if (!elements.has(id)) {
-      const node = {innerHTML: "", textContent: "", className: "", value: "", checked: false, disabled: false,
+      const node = {id, innerHTML: "", textContent: "", className: "", value: "", checked: false, disabled: false,
             style: {}, querySelector() { return this; }, querySelectorAll() { return []; },
             addEventListener() {}, focus() {}, removeAttribute() {}, setAttribute() {}};
       node.classList = {
@@ -67,7 +67,7 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map())
     rateCell, rateKey, rateDetailHTML, ensureRateDetails, toggleRateDetail, restoreRateDetails
     , renderStats, loadStats, changeStatsFilter, statsLineChart, statsComboChart, statsDuration, statsNumber, statsCredit
     , openAddAccount, startAddAccount, pollAddAccount, closeAddAccount, accountRowActions
-    , initStatsFilter, writeStatsFilterCookie, readStatsFilterCookie
+    , initStatsFilter, writeStatsFilterCookie, readStatsFilterCookie, bindStatsChartHover
   };})();`);
   vm.createContext(context);
   vm.runInContext(source, context);
@@ -134,8 +134,7 @@ test("账号日志告警分级、脱敏文本转义、已恢复记录剔除和�
   assert(html.includes("alert-notice") && html.includes("提示"));
   assert(html.includes("&lt;script&gt;") && !html.includes("<img"));
   assert(html.indexOf("paused.json") < html.indexOf("dead&lt;script&gt;.json"), "较新的提示告警必须在较旧紧急告警之前，前端不得重新按等级排序");
-  assert.match(f.element("accountAlertsInfo").textContent, /最新告警在上/);
-  assert(!f.element("accountAlertsInfo").textContent.includes("按紧急程度排序"));
+  assert.equal(f.element("accountAlertsInfo").textContent, "", "来源说明文案已移除");
   f.review.renderAccountAlerts({alerts: [], missingLogCount: 1, scanTruncated: true});
   assert.match(f.element("accountAlerts").innerHTML, /暂未找到对应日志/);
   assert.match(f.element("accountAlertsInfo").textContent, /读取上限/);
@@ -786,6 +785,64 @@ function statsBucket(label, over = {}) {
     avgLatencyMs: null, avgTtftMs: null}, over);
 }
 
+function chartModel(html) {
+  const attr = html.match(/data-chart-model="([^"]*)"/);
+  assert(attr, "expected SVG chart geometry");
+  return JSON.parse(attr[1].replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&"));
+}
+
+function hoverChart(f, id, rect) {
+  const container = f.element(id), model = chartModel(container.innerHTML), listeners = {};
+  const shared = id === "usageChart" || id === "latencyChart";
+  const group = shared ? f.element("statsCharts") : null;
+  if (group && !group.testHoverListeners) {
+    group.testHoverListeners = {};
+    const add = group.addEventListener;
+    group.addEventListener = (name, fn) => { group.testHoverListeners[name] = fn; add.call(group, name, fn); };
+  }
+  const metrics = {rectReads: 0, attributeWrites: 0, tooltipWrites: 0, sizeReads: 0};
+  const cross = {attributes: {}, setAttribute(k, v) { metrics.attributeWrites++; this.attributes[k] = v; }};
+  const dots = model.buckets[0].lines.map(() => ({attributes: {},
+    setAttribute(k, v) { metrics.attributeWrites++; this.attributes[k] = v; }}));
+  let html = "";
+  const tooltip = {hidden: true, style: {},
+    get innerHTML() { return html; }, set innerHTML(value) { metrics.tooltipWrites++; html = value; },
+    get offsetWidth() { metrics.sizeReads++; return 210; }, get offsetHeight() { metrics.sizeReads++; return 120; }};
+  const area = {addEventListener(name, fn) { listeners[name] = fn; }};
+  const svg = {getAttribute: () => JSON.stringify(model),
+    querySelector: selector => selector === ".chart-hover-area" ? area : cross,
+    querySelectorAll: () => dots, getBoundingClientRect: () => { metrics.rectReads++; return rect; }};
+  container.querySelector = selector => selector === "svg" ? svg : tooltip;
+  container.clientWidth = rect.width;
+  container.clientHeight = rect.height;
+  f.review.bindStatsChartHover(container);
+  // The real shared-chart listener is delegated to the parent, so emulate
+  // bubbling in this DOM stub rather than calling an obsolete plot listener.
+  if (shared) {
+    listeners.pointermove = event => group.testHoverListeners.pointermove(event);
+    listeners.pointerleave = () => {};
+    listeners.pointercancel = event => group.testHoverListeners.pointercancel(event);
+  }
+  return {model, listeners, tooltip, cross, dots, metrics,
+    move(index, y) {
+      listeners.pointermove({clientX: rect.left + model.buckets[index].x * rect.width / model.width,
+        clientY: rect.top + (y === undefined ? rect.height / 2 : y)});
+    }};
+}
+
+function animationClock(f, cancellable = true) {
+  let id = 0;
+  const callbacks = new Map();
+  f.window.requestAnimationFrame = callback => { callbacks.set(++id, callback); return id; };
+  if (cancellable) f.window.cancelAnimationFrame = frame => callbacks.delete(frame);
+  return {get pending() { return callbacks.size; }, flush() {
+    const queued = [...callbacks.values()];
+    callbacks.clear();
+    queued.forEach(callback => callback());
+  }};
+}
+
 function statsPayload(over = {}) {
   return Object.assign({
     period: "day", account: "", timezone: "Asia/Shanghai", ttftMetric: "first_token_v2", start: "2026-09-15", end: "2026-10-14",
@@ -820,12 +877,12 @@ test("TTFT新旧口径隔离：旧快照不伪装成首Token，明确显示排�
   assert(!f.element("usageSummary").innerHTML.includes("87.19"));
   assert.match(f.element("usageSummary").innerHTML,/平均首Token/);
   assert.match(f.element("latencyLegend").innerHTML, /deepseek-v4\.1-flash/);
-  assert(!f.element("latencyChart").innerHTML.includes("平均首Token"));
+  const oldReadout = chartModel(f.element("latencyChart").innerHTML).buckets[0].readout;
+  assert.equal(oldReadout.find(r => r.label === "平均首Token").display, "—", "共享浮层也不能混入旧TTFT口径");
   const current=statsPayload();
   current.summary.legacyTtftSamples=12;
   f.review.renderStats(current);
-  assert.match(f.element("statsInfo").textContent,/排除 12 条/);
-  assert.match(f.element("statsInfo").textContent,/不等同于 dsh 当前会话/);
+  assert.equal(f.element("statsInfo").textContent, "", "统计口径长文案已移除");
   assert.match(f.element("usageSummary").innerHTML,/0\.30 s/);
   f.review.renderModels({models:[{id:"legacy",avgTtftMs:87190,hasTtft:true}]});
   assert(!f.element("modelsTable").innerHTML.includes("87.19"));
@@ -854,7 +911,7 @@ test("统计摘要区分未知与零值，并显示落盘状态", () => {
   audit("统计摘要与落盘状态展示通过", {unknown_not_zero: true, memory_mode_flagged: true});
 });
 
-test("耗时折线在缺失样本处断开，不伪造零值", () => {
+test("耗时折线跨过空桶连接相邻样本，不伪造零值", () => {
   const f = fixture();
   const svg = f.review.statsLineChart([
     statsBucket("2026-10-12", {avgLatencyMs: 1000, avgTtftMs: 200}),
@@ -865,14 +922,16 @@ test("耗时折线在缺失样本处断开，不伪造零值", () => {
     {label: "平均首字", color: "first", value: b => b.avgTtftMs},
   ], "耗时", v => String(v));
   assert.match(svg, /<svg /);
-  // 中间桶无样本 ⇒ 每序列各断开成两段，共 4 条折线路径。
-  assert.equal((svg.match(/class="chart-line series-token"/g) || []).length, 2);
-  assert.equal((svg.match(/class="chart-line series-first"/g) || []).length, 2);
-  assert.equal((svg.match(/class="chart-line/g) || []).length, 4, "缺失样本处必须断线");
+  // 中间桶无样本 ⇒ 仍是一条连续折线，但空桶不画点、不伪造 0ms。
+  assert.equal((svg.match(/class="chart-line series-token"/g) || []).length, 1);
+  assert.equal((svg.match(/class="chart-line series-first"/g) || []).length, 1);
+  assert.equal((svg.match(/class="chart-line/g) || []).length, 2, "空桶应跨过连接，不能断开");
+  assert.equal((svg.match(/<circle class="series-token"/g) || []).length, 2, "空桶不能伪造折线点");
+  assert.match(svg, /data-chart-model=/, "悬浮层必须带几何数据");
   assert.equal(f.review.statsLineChart([statsBucket("2026-10-14")], [
     {label: "平均总耗时", color: "token", value: b => b.avgLatencyMs},
   ], "耗时", String), '<p class="stats-empty">该时间范围暂无可用样本</p>', "全空必须显示空状态");
-  audit("耗时折线断点与空状态通过", {no_fake_zero: true, path_segments: 4});
+  audit("耗时折线跨空桶与空状态通过", {no_fake_zero: true, connected_paths: 2});
 });
 
 test("请求耗时按模型分线，不把所有模型画成一条平均线", () => {
@@ -884,8 +943,9 @@ test("请求耗时按模型分线，不把所有模型画成一条平均线", ()
   assert.equal((svg.match(/class="chart-line series-m0"/g) || []).length, 1);
   assert.equal((svg.match(/class="chart-line series-m1"/g) || []).length, 1);
   assert.equal((svg.match(/class="chart-line /g) || []).length, 2, "每个模型一条线");
-  assert.match(svg, /deepseek-v4\.1-flash 1\.50 s/);
-  assert.match(svg, /hy3 0\.80 s/);
+  assert(svg.includes("deepseek-v4.1-flash"), "模型名必须进入悬浮数据");
+  assert(svg.includes("1.50 s"), "耗时值必须进入悬浮数据");
+  assert(svg.includes("hy3") && svg.includes("0.80 s"));
   assert(!svg.includes("series-token"), "不能再画所有模型合成的平均线");
   f.review.renderStats(statsPayload({modelLatency: []}));
   assert.match(f.element("latencyChart").innerHTML, /该时间范围暂无可用样本/);
@@ -963,7 +1023,7 @@ test("耗时趋势：首 Token 画柱形、总耗时画折线，且都按模型�
   audit("耗时柱线组合通过", {ttft_bar: true, latency_line: true, per_model: true});
 });
 
-test("双轴组合图：折线走左轴、柱形走右轴，缺样本处不补零", () => {
+test("双轴组合图：折线走左轴、柱形走右轴，缺样本处不补柱", () => {
   const f = fixture();
   const svg = f.review.statsComboChart([
     statsBucket("2026-10-13", {tokens: 2000000, tokenSamples: 1, credits: 20, creditSamples: 1}),
@@ -980,13 +1040,377 @@ test("双轴组合图：折线走左轴、柱形走右轴，缺样本处不补�
   assert((svg.match(/class="chart-label"/g) || []).length >= 10, "双轴必须有左右两套刻度");
   assert.match(svg, /M<\/text>/, "左轴按 Token 单位显示，右轴按积分精度");
   assert(!/NaN|undefined/.test(svg), "双轴不能出现 NaN 或 undefined");
-  assert.equal((svg.match(/class="chart-line series-token"/g) || []).length, 2, "中间桶缺样本要断线");
+  assert.equal((svg.match(/class="chart-line series-token"/g) || []).length, 1, "折线应跨过空桶连接");
   assert.equal((svg.match(/class="chart-bar series-credit"/g) || []).length, 2, "中间桶缺样本不画柱");
+  assert.match(svg, /class="chart-crosshair"/, "必须有十字线");
+  assert.match(svg, /class="chart-hover-area"/, "必须有鼠标命中层");
+  assert.match(svg, /class="chart-tooltip"/, "必须有悬浮读数层");
   assert(!f.review.statsComboChart([statsBucket("2026-10-14")], {
     lines: [], bars: [{label: "积分", color: "credit", value: b => (b.creditSamples ? b.credits : null)}],
     title: "空", leftFormat: String, box: {w: 600, h: 240}
   }).includes("<svg"), "全空必须显示空状态");
-  audit("双轴组合图通过", {gap_broken: true, dual_axis: true});
+  audit("双轴组合图通过", {gap_connected: true, dual_axis: true});
+});
+
+test("用量折线把无样本时间桶按 0 连接并生成悬浮数据", () => {
+  const f = fixture();
+  const svg = f.review.statsComboChart([
+    statsBucket("2026-10-13", {tokens: 100, tokenSamples: 1}),
+    statsBucket("2026-10-14"),
+    statsBucket("2026-10-15", {tokens: 300, tokenSamples: 1}),
+  ], {
+    lines: [{label: "总 Token", color: "token", connectZero: true, value: b => (b.tokenSamples ? b.tokens : null)}],
+    bars: [], title: "零值连接", leftFormat: String, box: {w: 600, h: 240}
+  });
+  assert.equal((svg.match(/class="chart-line series-token"/g) || []).length, 1);
+  assert.equal((svg.match(/<circle class="series-token"/g) || []).length, 3, "空桶必须补 0 点");
+  assert.match(svg, /class="chart-tooltip"/, "悬浮层必须存在");
+  assert.match(svg, /data-chart-model=/, "悬浮层必须带逐桶日期与数值");
+  assert(svg.includes("2026-10-14") && svg.includes('&quot;display&quot;:&quot;0&quot;'), "空桶必须按 0 进入悬浮数据");
+  audit("零值连接与悬浮层通过", {zero_points: 3, tooltip: true});
+});
+
+test("图表悬浮层按鼠标位置显示日期和逐系列读数", () => {
+  const f = fixture();
+  const svgText = f.review.statsComboChart([
+    statsBucket("2026-10-13", {tokens: 100, tokenSamples: 1, credits: 2, creditSamples: 1}),
+    statsBucket("2026-10-14"),
+    statsBucket("2026-10-15", {tokens: 300, tokenSamples: 1, credits: 4, creditSamples: 1}),
+  ], {
+    lines: [{label: "总 Token", color: "token", connectZero: true, value: b => (b.tokenSamples ? b.tokens : null)}],
+    bars: [{label: "积分", color: "credit", value: b => (b.creditSamples ? b.credits : null)}],
+    title: "悬浮", leftFormat: String, rightFormat: String, box: {w: 600, h: 240}
+  });
+  const encoded = svgText.match(/data-chart-model="([^"]*)"/)[1]
+    .replace(/&quot;/g, '"').replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&#39;/g, "'");
+  const model = JSON.parse(encoded);
+  const listeners = {};
+  const cross = {attributes: {}, setAttribute(k, v) { this.attributes[k] = v; }};
+  const dots = model.buckets[0].lines.map(() => ({attributes: {}, setAttribute(k, v) { this.attributes[k] = v; }}));
+  const tooltip = {hidden: true, innerHTML: "", style: {}, offsetWidth: 180, offsetHeight: 80};
+  const area = {addEventListener(name, fn) { listeners[name] = fn; }};
+  const svg = {
+    getAttribute: () => JSON.stringify(model),
+    querySelector: selector => selector === ".chart-hover-area" ? area : cross,
+    querySelectorAll: () => dots,
+    getBoundingClientRect: () => ({left: 0, top: 0, width: 600, height: 240}),
+  };
+  const container = {querySelector: selector => selector === "svg" ? svg : tooltip, clientWidth: 600, clientHeight: 240};
+  f.review.bindStatsChartHover(container);
+  listeners.pointermove({clientX: 357});
+  assert.equal(tooltip.hidden, false);
+  assert.match(tooltip.innerHTML, /2026-10-14/);
+  assert.match(tooltip.innerHTML, /总 Token/);
+  assert.match(tooltip.innerHTML, />0</);
+  assert.match(tooltip.innerHTML, /积分/);
+  assert.equal(cross.attributes.visibility, "visible");
+  assert.equal(dots[0].attributes.visibility, "visible");
+  listeners.pointerleave();
+  assert.equal(tooltip.hidden, true);
+  assert.equal(cross.attributes.visibility, "hidden");
+  audit("鼠标十字线与逐系列读数通过", {crosshair: true, tooltip: true});
+});
+
+test("两张统计图共享绘图区、日期刻度和四项汇总读数，含窄屏与双轴量级差异", () => {
+  for (const width of [260, 380, 900, 1800]) {
+    const f = fixture();
+    f.element("usageChart").clientWidth = width;
+    f.element("latencyChart").clientWidth = width;
+    f.review.renderStats(statsPayload());
+    const usage = chartModel(f.element("usageChart").innerHTML);
+    const latency = chartModel(f.element("latencyChart").innerHTML);
+    assert.equal(usage.width, latency.width);
+    assert.equal(usage.left, latency.left);
+    assert.equal(usage.plotW, latency.plotW);
+    assert(usage.plotW >= 98, "small screens retain a usable plot");
+    assert.deepEqual(usage.buckets.map(r => r.x), latency.buckets.map(r => r.x));
+    for (let i = 0; i < usage.buckets.length; i++) {
+      const row = usage.buckets[i];
+      assert.deepEqual(row.readout.map(v => v.label), ["总 Token", "积分", "平均总耗时", "平均首Token"]);
+      assert.deepEqual(row.readout, latency.buckets[i].readout);
+    }
+    assert.deepEqual(usage.buckets[0].readout.map(r => r.display), ["300", "1.25", "1.20 s", "0.30 s"]);
+    const xLabels = html => [...html.matchAll(/<text class="chart-label" text-anchor="[^"]+" x="([^"]+)" y="[^"]+">([^<]+)<\/text>/g)]
+      .filter(m => /10-1[34]/.test(m[2])).map(m => [m[1], m[2]]);
+    assert.deepEqual(xLabels(f.element("usageChart").innerHTML), xLabels(f.element("latencyChart").innerHTML));
+  }
+  audit("两图共享时间轴和四项读数通过", {responsive_widths: 4, aligned: true, readout_count: 4});
+});
+
+test("共享四项读数区分空闲桶和缺失usage，不更改原始统计", () => {
+  const f = fixture(), payload = statsPayload();
+  payload.buckets.push(statsBucket("2026-10-15", {requests: 1, avgLatencyMs: 900}));
+  const original = JSON.stringify(payload);
+  f.review.renderStats(payload);
+  const buckets = chartModel(f.element("usageChart").innerHTML).buckets;
+  assert.deepEqual(buckets[1].readout.map(r => r.display), ["0", "0", "—", "—"]);
+  assert.deepEqual(buckets[2].readout.map(r => r.display), ["—", "—", "0.90 s", "—"]);
+  assert.equal(JSON.stringify(payload), original);
+  audit("共享读数空样本口径通过", {idle_zero: true, unknown_usage_preserved: true});
+});
+
+test("未来时间桶不补零、不画点线柱；保留过去零值和两图对齐并使用服务端时间", () => {
+  const f = fixture(), now = Date.parse("2026-10-24T11:30:00+08:00");
+  const payload = statsPayload({serverTime: now});
+  payload.buckets = ["2026-10-24T09:00:00+08:00", "2026-10-24T10:00:00+08:00",
+    "2026-10-24T11:00:00+08:00", "2026-10-24T12:00:00+08:00", "2026-10-25T00:00:00+08:00"]
+    .map((at, i) => statsBucket(at, {start: Date.parse(at), ...(i === 0 || i >= 3
+      ? {tokens: i ? 1e12 : 300, tokenSamples: 1, credits: i ? 1e9 : 2, creditSamples: 1}
+      : {})}));
+  payload.modelLatency = [{model: "synthetic-model", avgLatencyMs: [1000, null, 1200, 1e12, 1e12],
+    avgTtftMs: [100, null, 120, 1e12, 1e12]}];
+  const before = JSON.stringify(payload);
+  f.review.renderStats(payload);
+  const usage = chartModel(f.element("usageChart").innerHTML);
+  const latency = chartModel(f.element("latencyChart").innerHTML);
+  assert.deepEqual(usage.buckets.map(b => b.x), latency.buckets.map(b => b.x));
+  assert.equal(usage.buckets.length, 5, "future buckets must not be filtered out and shift model indices");
+  assert.deepEqual(usage.buckets.map(b => b.lines[0].value), [300, 0, 0, null, null]);
+  assert.deepEqual(latency.buckets.map(b => b.lines[0].value), [1000, null, 1200, null, null]);
+  for (const model of [usage, latency]) {
+    assert.deepEqual(model.buckets.map(b => b.future), [false, false, false, true, true]);
+    assert(model.buckets.slice(3).every(b => b.lines.concat(b.bars).every(v => v.value === null && v.y === null)));
+    assert(model.buckets.slice(3).every(b => b.readout.length === 4 && b.readout.every(r => r.display === "—")));
+  }
+  assert.equal((f.element("usageChart").innerHTML.match(/<circle class="series-token"/g) || []).length, 3);
+  assert.equal((f.element("usageChart").innerHTML.match(/class="chart-bar series-credit"/g) || []).length, 1);
+  assert(!f.element("usageChart").innerHTML.includes("1000000.00M"), "future values must not inflate the scale");
+  f.element("statsCharts").getBoundingClientRect = () => ({left: 0, top: 0, width: 900, height: 700});
+  const usageHover = hoverChart(f, "usageChart", {left: 0, top: 0, width: 900, height: 280});
+  usageHover.move(3);
+  assert.match(usageHover.tooltip.innerHTML, /未到该时间/);
+  assert.equal((usageHover.tooltip.innerHTML.match(/class="chart-tooltip-row"/g) || []).length, 4);
+  assert.equal(usageHover.dots[0].attributes.visibility, "hidden");
+  assert.equal(JSON.stringify(payload), before);
+  audit("未来时间桶留白通过", {server_clock: true, future_buckets: 2, past_zero_connected: true, aligned: true});
+});
+
+test("未来时间判定按绝对时间支持所有粒度，当前桶开始边界仍绘制", () => {
+  const f = fixture(), now = Date.parse("2030-01-01T00:00:00+08:00");
+  for (const period of ["hour", "day", "week", "month"]) {
+    const buckets = [now - 1, now, now + 1].map(start => statsBucket(period, {start, tokens: 7, credits: 3}));
+    const html = f.review.statsComboChart(buckets, {
+      nowMs: now, lines: [{label: "Token", color: "token", connectZero: true, value: b => b.tokens}],
+      bars: [{label: "积分", color: "credit", value: b => b.credits}], rightFormat: String
+    });
+    const rows = chartModel(html).buckets;
+    assert.deepEqual(rows.map(b => b.future), [false, false, true]);
+    assert.deepEqual(rows.map(b => b.lines[0].value), [7, 7, null]);
+    assert.deepEqual(rows.map(b => b.bars[0].value), [3, 3, null]);
+  }
+  const empty = f.review.statsComboChart([statsBucket("future", {start: now + 1})], {
+    nowMs: now, lines: [{label: "Token", connectZero: true, value: () => null}]
+  });
+  assert.match(empty, /所选时间范围尚未开始/);
+  assert(!empty.includes("<svg"), "all-future range must not masquerade as measured zero");
+  audit("未来时间桶边界通过", {granularities: 4, current_bucket_included: true, all_future_empty: true});
+});
+
+test("旧统计接口缺少serverTime时回退本机时间，无效桶时间不影响旧数据展示", () => {
+  const f = fixture(), now = Date.now();
+  const html = f.review.statsComboChart([
+    statsBucket("old", {start: 0}), statsBucket("invalid", {start: "invalid"}),
+    statsBucket("future", {start: now + 86400000})
+  ], {lines: [{label: "Token", connectZero: true, value: () => null}]});
+  assert.deepEqual(chartModel(html).buckets.map(b => b.lines[0].value), [0, 0, null]);
+  audit("旧接口兼容通过", {fallback_clock: true, invalid_time_safe: true});
+});
+
+test("悬停任一图都显示四项读数，虚线跨卡片间隔且只记录一次交互起止", () => {
+  const calls = [];
+  const f = fixture(async (route, options) => { calls.push({route, options}); return response(204, {}); });
+  f.review.state.apiKey = "synthetic-private-hover-key";
+  f.element("usageChart").clientWidth = 900;
+  f.element("latencyChart").clientWidth = 900;
+  f.review.renderStats(statsPayload());
+  const groupEvents = {}, group = f.element("statsCharts"), guide = f.element("statsChartsCrosshair");
+  group.getBoundingClientRect = () => ({left: 20, top: 100, width: 900, height: 750});
+  group.addEventListener = (name, callback) => { groupEvents[name] = callback; };
+  const usage = hoverChart(f, "usageChart", {left: 20, top: 130, width: 900, height: 280});
+  const latency = hoverChart(f, "latencyChart", {left: 20, top: 520, width: 900, height: 280});
+  usage.move(0);
+  assert.equal(guide.hidden, false);
+  assert.equal((usage.tooltip.innerHTML.match(/class="chart-tooltip-row"/g) || []).length, 4);
+  assert.match(usage.tooltip.innerHTML, /平均总耗时/);
+  assert.match(usage.tooltip.innerHTML, /平均首Token/);
+  assert.equal(usage.cross.attributes.visibility, "hidden", "one guide should span both cards");
+  assert.equal(latency.dots[0].attributes.visibility, "visible", "other chart highlights same bucket");
+  assert(Number.parseFloat(guide.style.height) > 390, "guide spans both plots and the inter-card gap");
+  const position = usage.tooltip.style.transform;
+  usage.move(0, 170);
+  assert.notEqual(usage.tooltip.style.transform, position, "tooltip follows pointer even within the same bucket");
+  usage.listeners.pointerleave();
+  assert.equal(guide.hidden, false, "crossing the gap must not break the guide");
+  latency.move(0);
+  assert.equal(usage.tooltip.hidden, true, "only the active pane has a tooltip");
+  assert.equal(latency.tooltip.hidden, false);
+  assert.equal((latency.tooltip.innerHTML.match(/class="chart-tooltip-row"/g) || []).length, 4);
+  assert.equal(calls.length, 1, "mousemove must not spam audit requests");
+  groupEvents.pointerleave();
+  assert.equal(guide.hidden, true);
+  assert.equal(latency.tooltip.hidden, true);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls.map(c => JSON.parse(c.options.body).event), ["stats_chart_hover_started", "stats_chart_hover_ended"]);
+  assert.equal(calls[0].options.headers["X-Trace-ID"], calls[1].options.headers["X-Trace-ID"]);
+  assert(calls.every(c => !c.options.body.includes("synthetic-private-hover-key") && !c.options.body.includes("300")));
+  audit("跨图游标联动与落盘审计通过", {spans_gap: true, one_tooltip: true, trace_reused: true});
+});
+
+test("快速移动合并为每帧一次；同桶只移动浮层、不重建内容或重复测量", () => {
+  const calls = [], f = fixture(async (route, options) => { calls.push({route, options}); return response(204, {}); });
+  const clock = animationClock(f);
+  f.review.state.apiKey = "synthetic-performance-key";
+  f.review.renderStats(statsPayload());
+  let groupReads = 0;
+  f.element("statsCharts").getBoundingClientRect = () => {
+    groupReads++;
+    return {left: 20, top: 100, width: 900, height: 750};
+  };
+  const usage = hoverChart(f, "usageChart", {left: 20, top: 130, width: 900, height: 280});
+  const latency = hoverChart(f, "latencyChart", {left: 20, top: 520, width: 900, height: 280});
+  for (let i = 0; i < 1000; i++) usage.move(i % 2, 80 + i % 80);
+  assert.equal(clock.pending, 1);
+  assert.equal(usage.metrics.rectReads, 0);
+  assert.equal(usage.metrics.tooltipWrites, 0);
+  clock.flush();
+  assert.equal(usage.metrics.rectReads, 1);
+  assert.equal(latency.metrics.rectReads, 1);
+  assert.equal(groupReads, 1);
+  assert.equal(usage.metrics.tooltipWrites, 1);
+  assert.equal(usage.metrics.sizeReads, 2);
+  assert.equal(latency.metrics.tooltipWrites, 0);
+  assert.equal(latency.metrics.sizeReads, 0, "inactive pane never measures its hidden tooltip");
+  assert.match(usage.tooltip.innerHTML, /2026-10-14/, "newest pointer wins");
+  const before = {...usage.metrics}, otherBefore = {...latency.metrics}, position = usage.tooltip.style.transform;
+  for (let i = 0; i < 500; i++) usage.move(1, 190);
+  clock.flush();
+  assert.equal(usage.metrics.tooltipWrites, before.tooltipWrites);
+  assert.equal(usage.metrics.sizeReads, before.sizeReads);
+  assert.equal(usage.metrics.attributeWrites, before.attributeWrites);
+  assert.equal(latency.metrics.attributeWrites, otherBefore.attributeWrites);
+  assert.notEqual(usage.tooltip.style.transform, position);
+  assert.equal(calls.length, 1, "audit still records one start, not 1500 pointer events");
+  usage.move(0);
+  latency.move(1);
+  assert.equal(clock.pending, 1, "both panes share a single animation queue");
+  clock.flush();
+  assert.equal(usage.tooltip.hidden, true);
+  assert.equal(latency.tooltip.hidden, false, "latest pane wins too");
+  assert.match(latency.tooltip.innerHTML, /2026-10-14/);
+  latency.listeners.pointercancel();
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].options.headers["X-Trace-ID"], calls[1].options.headers["X-Trace-ID"]);
+  audit("悬浮按帧合并与缓存通过", {pointer_events: 1500, painted_frames: 2, same_bucket_dom_rebuilds: 0,
+    inactive_tooltip_reads: 0, shared_queue: true, audit_events: 2});
+});
+
+test("双图区父级覆盖横轴、标题、卡片留白和两图间隙，仍只每帧读取一次布局", () => {
+  const f = fixture(), clock = animationClock(f);
+  f.review.renderStats(statsPayload());
+  const group = f.element("statsCharts");
+  let groupReads = 0;
+  group.getBoundingClientRect = () => { groupReads++; return {left: 20, top: 100, width: 900, height: 750}; };
+  const usage = hoverChart(f, "usageChart", {left: 20, top: 130, width: 900, height: 280});
+  const latency = hoverChart(f, "latencyChart", {left: 20, top: 520, width: 900, height: 280});
+  for (const [region, y, active] of [
+    ["upper-title", 105, usage], ["upper-axis", 400, usage], ["upper-padding", 420, usage],
+    ["gap-near-upper", 450, usage], ["gap-near-lower", 490, latency],
+    ["lower-title", 510, latency], ["lower-axis", 790, latency], ["lower-padding", 820, latency]
+  ]) {
+    const before = {usage: usage.metrics.rectReads, latency: latency.metrics.rectReads, group: groupReads};
+    for (let i = 0; i < 60; i++) {
+      group.testHoverListeners.pointermove({clientX: 20 + usage.model.buckets[i % 2].x, clientY: y,
+        target: {tagName: "DIV", textContent: region}});
+    }
+    assert.equal(clock.pending, 1, region);
+    assert.equal(usage.metrics.rectReads, before.usage, "physical event handler must not read layout");
+    clock.flush();
+    assert.equal(usage.metrics.rectReads - before.usage, 1, region);
+    assert.equal(latency.metrics.rectReads - before.latency, 1, region);
+    assert.equal(groupReads - before.group, 1, region);
+    assert.equal(active.tooltip.hidden, false, region);
+    assert.equal((active === usage ? latency : usage).tooltip.hidden, true, region);
+    assert.match(active.tooltip.innerHTML, /2026-10-14/, region);
+    assert.equal(f.element("statsChartsCrosshair").hidden, false, region);
+  }
+  // The shared group listener stays single even after rebinding the second pane.
+  assert.deepEqual(Object.keys(group.testHoverListeners).sort(), ["pointercancel", "pointerleave", "pointermove"]);
+  group.testHoverListeners.pointerleave();
+  assert.equal(usage.tooltip.hidden, true);
+  assert.equal(latency.tooltip.hidden, true);
+  audit("录屏边缘路径覆盖通过", {regions: 8, events_per_region: 60, layout_reads_per_pane_per_frame: 1,
+    nearest_pane_tooltip: true, no_interaction_dead_zones: true});
+});
+
+test("离开图表、取消、重绘或锁定页面后，已排队的悬浮不会复活", () => {
+  for (const cancellable of [true, false]) {
+    for (const action of ["leave", "cancel", "render", "lock", "tab"]) {
+      const calls = [], f = fixture(async (route, options) => { calls.push({route, options}); return response(204, {}); });
+      const clock = animationClock(f, cancellable);
+      f.review.state.apiKey = "synthetic-cancel-key";
+      f.review.renderStats(statsPayload());
+      const groupEvents = {};
+      f.element("statsCharts").addEventListener = (event, fn) => { groupEvents[event] = fn; };
+      f.element("statsCharts").getBoundingClientRect = () => ({left: 0, top: 0, width: 900, height: 700});
+      const usage = hoverChart(f, "usageChart", {left: 0, top: 0, width: 900, height: 280});
+      usage.move(0);
+      if (action === "leave") groupEvents.pointerleave();
+      if (action === "cancel") usage.listeners.pointercancel();
+      if (action === "render") f.review.renderStats(statsPayload());
+      if (action === "lock") f.review.lockDashboard();
+      if (action === "tab") f.review.setTab("accounts");
+      clock.flush();
+      assert.equal(usage.tooltip.hidden, true, `${action}: stale callback must not restore tooltip`);
+      assert.equal(usage.metrics.tooltipWrites, 0);
+      assert.equal(f.element("statsChartsCrosshair").hidden, true);
+      assert(!calls.some(c => JSON.parse(c.options.body || "{}").event === "stats_chart_hover_started"));
+    }
+  }
+  audit("悬浮待绘制帧取消通过", {lifecycle_actions: 5, cancel_api_optional: true, stale_hover_rejected: true});
+});
+
+test("旧帧未能物理取消时，重绘后仍只处理新图的新位置", () => {
+  const f = fixture(), clock = animationClock(f, false);
+  f.review.renderStats(statsPayload());
+  f.element("statsCharts").getBoundingClientRect = () => ({left: 0, top: 0, width: 900, height: 700});
+  const oldChart = hoverChart(f, "usageChart", {left: 0, top: 0, width: 900, height: 280});
+  oldChart.move(0);
+  // Replacing innerHTML removes the old SVG in a browser; mirror that in the
+  // stub so the redraw cannot accidentally rebind the detached test element.
+  f.element("usageChart").querySelector = () => null;
+  f.review.renderStats(statsPayload());
+  const chart = hoverChart(f, "usageChart", {left: 0, top: 0, width: 900, height: 280});
+  chart.move(1);
+  assert.equal(clock.pending, 2);
+  clock.flush();
+  assert.equal(oldChart.metrics.tooltipWrites, 0);
+  assert.equal(chart.metrics.tooltipWrites, 1);
+  assert.match(chart.tooltip.innerHTML, /2026-10-14/);
+  assert.equal(chart.tooltip.hidden, false);
+  audit("重绘后旧帧不干扰新帧通过", {generation_guard: true, latest_position_preserved: true});
+});
+
+test("独立图表悬浮也按帧合并，并在离开或取消后清除未绘制事件", () => {
+  const f = fixture(), clock = animationClock(f);
+  f.element("standaloneChart").innerHTML = f.review.statsComboChart(statsPayload().buckets, {
+    lines: [{label: "Token", color: "token", connectZero: true, value: b => b.tokens}]
+  });
+  const chart = hoverChart(f, "standaloneChart", {left: 0, top: 0, width: 900, height: 280});
+  chart.move(0);
+  chart.listeners.pointerleave();
+  clock.flush();
+  assert.equal(chart.tooltip.hidden, true);
+  chart.move(1);
+  clock.flush();
+  assert.equal(chart.tooltip.hidden, false);
+  assert.match(chart.tooltip.innerHTML, /2026-10-14/);
+  assert.equal(chart.cross.attributes.visibility, "visible");
+  chart.move(0);
+  chart.listeners.pointercancel();
+  clock.flush();
+  assert.equal(chart.tooltip.hidden, true);
+  assert.equal(chart.cross.attributes.visibility, "hidden");
+  audit("独立图表按帧交互通过", {cancel_on_leave: true, cancel_on_pointercancel: true});
 });
 
 test("柱形与折线对齐：柱组中心落在同桶折线点的时间位置", () => {

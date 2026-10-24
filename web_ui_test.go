@@ -67,6 +67,48 @@ func TestListFilterAuditIsAuthenticatedBooleanOnlyAndDoesNotChangePolicies(t *te
 	}
 }
 
+func TestStatsChartHoverAuditOnlyAcceptsFixedMetadata(t *testing.T) {
+	isolateAdminFeatures(t)
+	handler := newWebUIHandler()
+	before, err := os.ReadFile(runtimeConfigFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range []string{"stats_chart_hover_started", "stats_chart_hover_ended"} {
+		body := `{"event":"` + event + `","route":"/admin/api/stats","status":0}`
+		w := adminRequest(handler, "POST", "/admin/api/client-events", "feature-admin-key", body)
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("hover audit status=%d", w.Code)
+		}
+	}
+	for _, body := range []string{
+		`{"event":"stats_chart_hover_started","route":"/admin/api/config","status":0}`,
+		`{"event":"stats_chart_hover_started","route":"/admin/api/stats","status":200}`,
+		`{"event":"stats_chart_hover_ended","route":"/admin/api/stats","status":0,"enabled":true}`,
+		`{"event":"stats_chart_hover_started","route":"/admin/api/stats","status":0,"coordinates":[1,2]}`,
+	} {
+		if w := adminRequest(handler, "POST", "/admin/api/client-events", "feature-admin-key", body); w.Code != http.StatusBadRequest {
+			t.Fatalf("unsafe hover event accepted: %d", w.Code)
+		}
+	}
+	if w := adminRequest(handler, "POST", "/admin/api/client-events", "", `{"event":"stats_chart_hover_started","route":"/admin/api/stats","status":0}`); w.Code != http.StatusUnauthorized {
+		t.Fatal("hover audit bypassed authentication")
+	}
+	after, _ := os.ReadFile(runtimeConfigFile)
+	if !bytes.Equal(before, after) {
+		t.Fatal("hover audit changed configuration")
+	}
+	entries, _ := filepath.Glob(filepath.Join(logDir, "gateway-*.log"))
+	var logs string
+	for _, p := range entries {
+		raw, _ := os.ReadFile(p)
+		logs += string(raw)
+	}
+	if !strings.Contains(logs, "stats_chart_hover_started") || !strings.Contains(logs, "stats_chart_hover_ended") {
+		t.Fatal("hover audit was not persisted")
+	}
+}
+
 func TestWebUIBrandNeutralLabelsAndBothListFilters(t *testing.T) {
 	html, err := webFS.ReadFile("web/index.html")
 	if err != nil {
