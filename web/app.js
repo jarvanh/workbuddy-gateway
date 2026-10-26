@@ -140,7 +140,6 @@
     if ($("latencyLegend")) $("latencyLegend").textContent = "";
     $("statsAccount").innerHTML = '<option value="">全局 · 全部账号</option>';
     $("statsTable").querySelector("tbody").innerHTML = "";
-    $("statsStorage").textContent = "等待统计";
     state.accountAlertsGeneration++;
     state.accountAlertsLastPoll = 0;
     state.lastAccountAlerts = null;
@@ -153,6 +152,8 @@
     $("poolHealthStatus").textContent = "等待账号状态";
     $("accountAlertsInfo").textContent = "登录后读取账号异常日志。";
     $("accountAlerts").innerHTML = '<p class="stats-empty">等待日志</p>';
+    $("accountAlerts")._alertSourceHTML = null;
+    if ($("accountAlertTooltip")) $("accountAlertTooltip").hidden = true;
     ["meta", "gatewayInfo", "logBox", "configBox", "tasksInfo"].forEach(function (id) {
       $(id).textContent = "";
     });
@@ -247,14 +248,75 @@
     if (data.missingLogCount) notes.push("部分异常暂未找到对应日志，可能等待下一次扫描");
     if (data.scanTruncated || data.listTruncated) notes.push("已达到读取上限，仅显示扫描范围内记录");
     $("accountAlertsInfo").textContent = notes.length ? notes.join("；") + "。" : "";
-    $("accountAlerts").innerHTML = alerts.length ? alerts.map(function (a) {
+    var html = alerts.length ? alerts.map(function (a) {
       var level = labels[a.severity] ? a.severity : "notice";
-      return '<article class="account-alert alert-' + level + '"><div class="account-alert-head">' +
+      var detail = labels[level] + " · " + a.label + " · " + a.account +
+        (a.at ? " · " + fmtTime(a.at) : "") + (a.message ? "\n" + a.message : "");
+      return '<article class="account-alert alert-' + level + '" tabindex="0" data-alert-detail="' +
+        esc(detail) + '" aria-label="' + esc(detail) + '"><div class="account-alert-head">' +
         '<span class="alert-priority">' + esc(labels[level]) + '</span><strong>' + esc(a.label) +
         '</strong><span class="account-alert-file">' + esc(a.account) + '</span><time>' + esc(fmtTime(a.at)) +
-        '</time></div><p>' + esc(a.message) + '</p></article>';
+        '</time></div></article>';
     }).join("") : '<p class="stats-empty">' + (data.missingLogCount ? "当前存在异常，但扫描范围内暂未找到对应日志" :
       data.stale ? "暂无日志记录，账号状态待确认" : "未发现当前账号异常日志") + '</p>';
+    // Unchanged polling must not replace a hovered/focused row or dismiss its details.
+    if ($("accountAlerts")._alertSourceHTML !== html) {
+      if ($("accountAlertTooltip")) $("accountAlertTooltip").hidden = true;
+      $("accountAlerts").innerHTML = html;
+      $("accountAlerts")._alertSourceHTML = html;
+    }
+  }
+
+  function bindAccountAlertTooltip() {
+    var list = $("accountAlerts"), tip = $("accountAlertTooltip");
+    if (!list || !tip || !list.addEventListener) return;
+    var pinned = null;
+    var hide = function () {
+      pinned = null;
+      tip.hidden = true;
+    };
+    var show = function (target, x, y) {
+      if (!target) return;
+      var detail = target.getAttribute("data-alert-detail") || "";
+      if (!detail) return;
+      tip.textContent = detail;
+      tip.hidden = false;
+      var width = tip.offsetWidth || 260, height = tip.offsetHeight || 80;
+      var left = Math.max(8, Math.min(x + 14, window.innerWidth - width - 8));
+      var top = y + 14;
+      if (top + height > window.innerHeight - 8) top = y - height - 14;
+      tip.style.left = left + "px";
+      tip.style.top = Math.max(8, top) + "px";
+    };
+    list.addEventListener("pointermove", function (event) {
+      if (event.pointerType === "touch") return;
+      var target = event.target && event.target.closest ? event.target.closest(".account-alert") : null;
+      if (!target) { hide(); return; }
+      show(target, event.clientX, event.clientY);
+    });
+    // Touch emits pointerleave after every tap; it is not a hover exit.
+    list.addEventListener("pointerleave", function (event) {
+      if (event.pointerType !== "touch") hide();
+    });
+    list.addEventListener("pointercancel", hide);
+    list.addEventListener("scroll", hide, {passive: true});
+    list.addEventListener("focusin", function (event) {
+      var target = event.target && event.target.closest ? event.target.closest(".account-alert") : null;
+      if (!target) return;
+      var rect = target.getBoundingClientRect ? target.getBoundingClientRect() : {left: 0, bottom: 0};
+      show(target, rect.left, rect.bottom);
+    });
+    list.addEventListener("focusout", hide);
+    list.addEventListener("click", function (event) {
+      var target = event.target && event.target.closest ? event.target.closest(".account-alert") : null;
+      if (!target) return;
+      var rect = target.getBoundingClientRect ? target.getBoundingClientRect() : {left: 0, bottom: 0};
+      // Focus/hover can already have shown the tooltip before click fires.
+      // Track explicit clicks separately, so a first tap never immediately hides it.
+      if (pinned === target && !tip.hidden) hide();
+      else { pinned = target; show(target, rect.left, rect.bottom); }
+    });
+    window.addEventListener("blur", hide);
   }
 
   function loadAccountAlerts() {
@@ -733,9 +795,6 @@
     var s = data.summary || {}, rows = data.buckets || [], store = data.storage || {};
     var currentTTFT = data.ttftMetric === "first_token_v2";
     var tokenTime = function (row) { return currentTTFT ? row.avgTtftMs : null; };
-    $("statsStorage").textContent = store.mode === "file" ? "stats.json · 已落盘" :
-      (store.mode === "memory" ? "仅内存 · 未落盘" : "等待首次落盘");
-    $("statsStorage").className = "badge " + (store.mode === "memory" ? "warn" : "");
     $("statsInfo").textContent = store.message || "";
     $("statsStart").value = data.start;
     $("statsEnd").value = data.end;
@@ -1244,6 +1303,29 @@
     });
   }
 
+  function checkinCell(a) {
+    var c = a.checkin || {}, now = Date.now();
+    var today = new Date(now + 8 * 3600000).toISOString().slice(0, 10);
+    var status = c.status || "pending", message = c.message || "";
+    if (status === "unsupported") {
+      return '<span class="badge" title="企业账号不参与个人签到">—</span>';
+    }
+    if (c.date !== today) {
+      var hour = new Date(now + 8 * 3600000).getUTCHours();
+      var minute = new Date(now + 8 * 3600000).getUTCMinutes();
+      status = hour * 60 + minute >= 570 ? "missed" : "pending";
+      message = status === "missed" ? "今日窗口已过，不补签" : "等待北京时间今天的随机计划";
+    }
+    var labels = {pending: "待签", running: "待签", success: "已签", failed: "失败", missed: "未签", unknown: "未知"};
+    var styles = {success: "ok", failed: "danger", unknown: "warn"};
+    var detail = "北京时间 " + today + " · " + message;
+    if (c.date === today && c.nextAt) {
+      detail += " · 计划 " + new Date(c.nextAt * 1000).toLocaleString("zh-CN", {timeZone: "Asia/Shanghai", hour12: false});
+    }
+    return '<span class="badge ' + (styles[status] || "") + '" title="' + esc(detail) + '">' +
+      (labels[status] || "未知") + '</span>';
+  }
+
   function renderAccounts(list) {
     var onlyUsable = $("onlyUsableAccounts").checked;
     if (onlyUsable) {
@@ -1278,7 +1360,7 @@
         "<td>" + esc(quotaAmount(a, "used")) + "</td>" +
         "<td>" + esc(quotaAmount(a, "remaining")) + "</td>" +
         "<td>" + esc((a.planLabel || "-") + (a.planStale ? "（待刷新）" : "")) + "</td>" +
-        "<td>" + esc(count(a.freeModels)) + "</td>" +
+        "<td>" + checkinCell(a) + "</td>" +
         "<td>" + esc(count(a.modelCooldowns)) + "</td>" +
         "<td>" + esc(fmtTime(a.lastRefreshTime)) + "</td>" +
         "<td>" + esc(count(a.refreshFailCount)) + "</td>" +
@@ -1513,7 +1595,9 @@
       }
       var box = $("logBox");
       if (data.error) { box.textContent = "\u8bfb\u53d6\u65e5\u5fd7\u5931\u8d25: " + data.error; return; }
-      box.textContent = (data.lines && data.lines.length) ? data.lines.join("\n") : "\u8be5\u6587\u4ef6\u6682\u65e0\u65e5\u5fd7\u3002";
+      var lines = (data.lines || []).slice().reverse();
+      box.textContent = lines.length ? lines.join("\n") : "\u8be5\u6587\u4ef6\u6682\u65e0\u65e5\u5fd7\u3002";
+      box.scrollTop = 0;
       if (data.truncated) showAlert("\u65e5\u5fd7\u8fbe\u5230\u672c\u6b21\u8bfb\u53d6\u9884\u7b97\uff0c\u53ea\u5c55\u793a\u90e8\u5206\u884c\uff1b\u539f\u65e5\u5fd7\u6587\u4ef6\u672a\u4fee\u6539\u3002");
     }).catch(function () {
       if (!initial && file) return loadLogs(true);
@@ -1637,7 +1721,7 @@
       reportUIEvent("config_edit_cancelled", "/admin/api/config-edit", 0, trace);
       return Promise.resolve();
     }
-    if (!window.confirm("确认将整份配置写入服务器 config.json？\n密钥、规则和提示词等立即生效，端口修改需重启。日志保留规则可能触发不可撤销的删除。" +
+    if (!window.confirm("确认将整份配置写入服务器 config.json？\n密钥、规则、提示词和监听端口都会立即热切换；已有连接与流式请求继续完成。日志保留规则可能触发不可撤销的删除。" +
         (adminKeyChanged ? "\n管理 Key 已修改，保存后需要重新登录，请先妥善保存新 Key。" : ""))) {
       reportUIEvent("config_edit_cancelled", "/admin/api/config-edit", 0, trace);
       return Promise.resolve();
@@ -1650,8 +1734,9 @@
       body: {content: content, revision: state.configRevision, acknowledged: true, confirmAdminKeyRemoval: removal}
     }).then(function (data) {
       if (version !== state.configVersion) return;
-      var message = "配置已保存，热配置已生效。" +
-        (data.settings && data.settings.restartRequired ? " 监听端口变更需重启服务。" : " 当前监听端口未改变。") +
+      var message = (data.settings && data.settings.restartRequired ?
+        "配置已保存，但监听端口尚未热切换，请检查服务器日志。" :
+        "配置已保存，全部配置项已热生效，监听端口已同步。") +
         (data.settings && data.settings.apiPortOverridden ? " API 端口受 -port 启动参数覆盖。" : "");
       resetConfigEditor();
       $("configResult").textContent = message;
@@ -1793,6 +1878,7 @@
   function setTab(name) {
     if (name !== "config" && state.configMode !== "preview" && !exitConfigEdit()) return;
     if (name !== "overview") hideAllStatsChartHover();
+    if (name !== "overview" && $("accountAlertTooltip")) $("accountAlertTooltip").hidden = true;
     if (name === "tasks") state.tasksLastPoll = 0;
     state.activeTab = name;
     Array.prototype.forEach.call(document.querySelectorAll(".tab"), function (t) {
@@ -1816,9 +1902,9 @@
     $("webPortValue").textContent = data.webPort;
     $("configuredApiPort").value = data.configuredApiPort || data.apiPort;
     $("configuredWebPort").value = data.configuredWebPort || data.webPort;
-    $("portSettingsStatus").textContent = (data.restartRequired ? "端口配置已保存，待重启生效。 " :
-      "配置端口与实际监听一致。 ") + (data.apiPortOverridden ? "API 端口被启动参数 -port 覆盖，需调整该参数才能按配置启动。 " : "") +
-      "修改并保存后需重启网关，不会立即中断页面或请求。";
+    $("portSettingsStatus").textContent = (data.restartRequired ? "端口配置尚未切换，请检查服务器日志。 " :
+      "配置端口与实际监听一致。 ") + (data.apiPortOverridden ? "API 端口被启动参数 -port 覆盖，配置值不会改变实际监听。 " : "") +
+      "修改并保存后立即热切换监听；已有连接和流式请求继续完成，请用新端口重新打开控制台。";
   }
 
   function loadSettings() {
@@ -1865,7 +1951,7 @@
     return api("/admin/api/settings", {method: "POST", body: {apiPort: apiPort, webPort: webPort}})
       .then(function (data) {
         renderSettings(data);
-        showAlert("端口已写入 config.json，重启网关后生效；当前监听端口未改变。", true);
+        showAlert("端口已写入 config.json 并热切换；已有连接继续完成，请用新端口重新打开控制台。", true);
       }).catch(function () {}).then(function () { setSettingsBusy(false); });
   }
 
@@ -1974,6 +2060,7 @@
     $("initializeAdmin").addEventListener("click", initializeAdmin);
     $("saveAPISettings").addEventListener("click", saveAPISettings);
     $("savePortSettings").addEventListener("click", savePortSettings);
+    bindAccountAlertTooltip();
     $("editConfig").addEventListener("click", showConfigWarning);
     $("acknowledgeConfigEdit").addEventListener("click", loadConfigEditor);
     $("cancelConfigWarning").addEventListener("click", exitConfigEdit);

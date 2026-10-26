@@ -17,7 +17,7 @@ function audit(event, fields = {}) {
 function response(status, body) {
   return {status, ok: status >= 200 && status < 300, json: async () => body};
 }
-function fixture(fetchImpl = async () => response(200, {}), cookies = new Map()) {
+function fixture(fetchImpl = async () => response(200, {}), cookies = new Map(), clock) {
   const elements = new Map(), session = new Map(), local = new Map(), alerts = [];
   const cookieWrites = [];
   function element(id) {
@@ -47,6 +47,12 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map())
     window: {alert: message => alerts.push(message), confirm: () => true, addEventListener() {}, location: {protocol: "http:", reload() {}}},
     TextEncoder, fetch: fetchImpl, setInterval: () => 1,
   };
+  if (typeof clock === "number") {
+    context.Date = class extends Date {
+      constructor(...args) { super(...(args.length ? args : [clock])); }
+      static now() { return clock; }
+    };
+  }
   Object.defineProperty(context.document, "cookie", {
     configurable: true,
     get() { return [...cookies].map(([name, value]) => name + "=" + value).join("; "); },
@@ -60,12 +66,12 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map())
   let source = fs.readFileSync(path.join(projectRoot, "web", "app.js"), "utf8");
   source = source.replace(/\}\)\(\);\s*$/, `globalThis.review = {
     state, api, renderAccounts, renderModels, renderStatus, refreshActive,
-    renderPoolHealth, renderAccountAlerts, loadAccountAlerts, lockDashboard,
+    renderPoolHealth, renderAccountAlerts, bindAccountAlertTooltip, loadAccountAlerts, lockDashboard,
     saveKey, saveAPISettings, initializeAdmin, discoverSetup,
     showConfigWarning, loadConfigEditor, saveConfigEditor, exitConfigEdit, setTab, lockDashboard,
     initListFilters, changeListFilter, reportRestoredListFilters,
     rateCell, rateKey, rateDetailHTML, ensureRateDetails, toggleRateDetail, restoreRateDetails
-    , renderStats, loadStats, changeStatsFilter, statsLineChart, statsComboChart, statsDuration, statsNumber, statsCredit
+    , renderStats, loadStats, changeStatsFilter, loadLogs, statsLineChart, statsComboChart, statsDuration, statsNumber, statsCredit
     , openAddAccount, startAddAccount, pollAddAccount, closeAddAccount, accountRowActions
     , initStatsFilter, writeStatsFilterCookie, readStatsFilterCookie, bindStatsChartHover
   };})();`);
@@ -97,6 +103,40 @@ test("运行状态只展示健康度，无账号和过旧快照不能显示100%"
   assert(!html.includes('id="siteSummary"'));
   assert(html.includes('id="accountsTable"'), "账号池详细状态不能删掉");
   audit("账号池健康度通过", {unknown_not_100: true, count_cards_removed: true});
+});
+test("告警详情首次点击不被focus关闭，重复点击可关闭，不变轮询不清空详情", () => {
+  const f = fixture();
+  const handlers = {};
+  const list = f.element("accountAlerts"), tip = f.element("accountAlertTooltip");
+  list.addEventListener = (name, handler) => { handlers[name] = handler; };
+  const row = {
+    closest: () => row,
+    getAttribute: () => "账号停用\n完整原因",
+    getBoundingClientRect: () => ({left: 30, bottom: 40}),
+  };
+  f.window.innerWidth = 1920;
+  f.window.innerHeight = 1080;
+  f.review.bindAccountAlertTooltip();
+  handlers.focusin({target: row});
+  handlers.click({target: row});
+  assert.equal(tip.hidden, false, "focus先显示不应导致首次点击立即关闭");
+  assert.match(tip.textContent, /完整原因/);
+  handlers.pointerleave({pointerType: "touch"});
+  assert.equal(tip.hidden, false, "手指抬起的pointerleave不能关闭已打开的详情");
+  handlers.click({target: row});
+  assert.equal(tip.hidden, true);
+  handlers.pointermove({target: row, pointerType: "mouse", clientX: 30, clientY: 40});
+  handlers.click({target: row});
+  assert.equal(tip.hidden, false, "鼠标先悬浮再点击也不应关闭");
+  const data = {alerts: [{account: "synthetic.json", severity: "notice",
+    label: "账号停用", message: '完整原因 "quotation" <tag>'}]};
+  f.review.renderAccountAlerts(data);
+  tip.hidden = false;
+  f.review.renderAccountAlerts(data);
+  assert.equal(tip.hidden, false, "相同告警轮询不应关闭悬浮详情");
+  f.review.renderAccountAlerts({alerts: []});
+  assert.equal(tip.hidden, true, "已恢复的告警不能留着旧详情");
+  audit("告警详情交互回归通过", {first_tap_visible: true, polling_preserves_details: true});
 });
 test("总览最上面是运行状态（健康度与告警），用量与性能在其后", () => {
   const html = fs.readFileSync(path.join(projectRoot, "web/index.html"), "utf8");
@@ -144,6 +184,46 @@ test("账号日志告警分级、脱敏文本转义、已恢复记录剔除和�
   audit("账号告警展示通过", {recovered_removed: true, escaped: true, logout_cleared: true});
 });
 
+test("告警行只保留紧凑标题，完整内容写入悬浮数据且使用告警详情标签", () => {
+  const f = fixture();
+  f.review.state.lastStatus = {accounts: [{path: "paused.json", state: "active", schedulingEnabled: false}]};
+  f.review.renderAccountAlerts({alerts: [{account: "paused.json", state: "paused", severity: "notice",
+    label: "账号停用", message: "该账号被全局调度规则停用；这不是授权失效，可在账号池恢复。", at: 1791980005}]});
+  const html = f.element("accountAlerts").innerHTML;
+  assert.match(html, /account-alert alert-notice/);
+  assert.match(html, /data-alert-detail="[^"]*该账号被全局调度规则停用/);
+  assert(!/<p>该账号被全局调度规则停用/.test(html), "告警正文不应常驻占高");
+  const page = fs.readFileSync(path.join(projectRoot, "web/index.html"), "utf8");
+  assert(page.includes('<span class="badge">告警详情</span>'));
+  assert(!page.includes("只读日志"));
+  audit("告警紧凑悬浮通过", {compact_row: true, full_detail_in_data_attribute: true, badge_updated: true});
+});
+
+test("运行日志展示为最新行在最上方", async () => {
+  const f = fixture(async url => {
+    assert(url.startsWith("/admin/api/logs?lines="));
+    return response(200, {lines: ["oldest", "middle", "newest"], files: [], file: "gateway.log"});
+  });
+  f.review.state.apiKey = "synthetic-admin";
+  f.element("logLines").value = "200";
+  await f.review.loadLogs(true);
+  assert.equal(f.element("logBox").textContent, "newest\nmiddle\noldest");
+  assert.equal(f.element("logBox").scrollTop, 0);
+  audit("运行日志倒序通过", {newest_first: true});
+});
+
+test("页面移除统计落盘徽标和摘要卡四分之一圆装饰，选项卡按屏幕自适应", () => {
+  const page = fs.readFileSync(path.join(projectRoot, "web/index.html"), "utf8");
+  const css = fs.readFileSync(path.join(projectRoot, "web/style.css"), "utf8");
+  assert(!page.includes('id="statsStorage"'));
+  assert(!/\.usage-metric::after\s*\{/.test(css), "摘要卡的圆形装饰必须删除");
+  assert(/\.tabs\s*\{[\s\S]*width:\s*min\(83\.3333vw,\s*3200px\)/.test(css));
+  assert(/\.tabs\s*\{[\s\S]*grid-template-columns:\s*repeat\(7,\s*minmax\(0,\s*1fr\)\)/.test(css));
+  assert(/\.health-layout\s*\{[^}]*height:\s*196px/.test(css));
+  assert(/\.account-alert\s*\{[^}]*padding:\s*3px 10px/.test(css));
+  audit("布局精简与自适应通过", {stats_badge_removed: true, quarter_circle_removed: true, tabs_5_of_6_capped_4k: true});
+});
+
 test("新状态快照恢复后立即剔除旧告警，无需等待再次扫描日志", () => {
   const f = fixture();
   const payload = {alerts: [
@@ -187,7 +267,8 @@ test("已知零值显示0，未知额度仍显示横线", () => {
   const f = fixture();
   f.review.renderAccounts([{path: "fixture.json", state: "active", quotaKnown: true}]);
   let row = cells(f.element("accountsTable").innerHTML);
-  for (const i of [7, 8, 9, 11, 12, 14]) assert.equal(row[i], "0");
+  for (const i of [7, 8, 9, 12, 14]) assert.equal(row[i], "0");
+  assert.match(row[11], /待签|未签/, "签到列不应再显示免费模型数量");
   assert.equal(row.length, 16, "账号表应为 16 列（已去掉刷新令牌到期）");
   const accountsPage = fs.readFileSync(path.join(projectRoot, "web/index.html"), "utf8");
   assert(!accountsPage.includes("刷新令牌到期"), "表头不应保留已删除的列");
@@ -212,6 +293,41 @@ test("企业不限量显示不限，已用保留小数；未知和有限额度�
   row = cells(f.element("accountsTable").innerHTML);
   for (const i of [7, 8, 9]) assert.equal(row[i], "-");
   audit("企业额度展示通过", {unlimited_distinct_from_unknown: true, fractional_used_preserved: true});
+});
+
+test("账号池签到列展示北京时间当天状态，移除免费模型列并转义错误提示", () => {
+  const clock = Date.parse("2026-10-25T08:20:00+08:00");
+  const f = fixture(undefined, new Map(), clock);
+  const account = {path: "synthetic.json", state: "active", freeModels: 987654};
+  for (const [status, text] of [["pending", "待签"], ["running", "待签"], ["success", "已签"],
+    ["failed", "失败"], ["missed", "未签"], ["unknown", "未知"]]) {
+    f.review.renderAccounts([{...account, checkin: {date: "2026-10-25", status,
+      message: '<img src=x onerror="bad">', nextAt: Date.parse("2026-10-25T09:45:00+08:00") / 1000}}]);
+    const row = cells(f.element("accountsTable").innerHTML);
+    assert.match(row[11], new RegExp(text));
+    assert(!f.element("accountsTable").innerHTML.includes("987654"));
+    assert(row[11].includes("&lt;img") && !row[11].includes("<img"));
+    assert(row[11].includes("北京时间 2026-10-25"));
+  }
+  f.review.renderAccounts([{...account, edition: "intl", checkin: {date: "2026-10-25", status: "pending"}}]);
+  assert.match(cells(f.element("accountsTable").innerHTML)[11], />—</);
+  f.review.renderAccounts([{...account, checkin: {date: "2026-10-25", status: "unsupported"}}]);
+  assert.match(cells(f.element("accountsTable").innerHTML)[11], />—</);
+  const html = fs.readFileSync(path.join(projectRoot, "web/index.html"), "utf8");
+  assert(html.includes("<th>签到</th>") && !html.includes("<th>免费模型</th>"));
+  audit("账号池签到列通过", {beijing_day: true, statuses: 6, private_errors_escaped: true, free_model_column_removed: true});
+});
+
+test("北京时间跨日后不沿用昨日已签；错过今日窗口显示未签而非已签或失败", () => {
+  for (const [clock, text] of [["2026-10-25T00:01:00+08:00", "待签"], ["2026-10-25T09:31:00+08:00", "未签"]]) {
+    const f = fixture(undefined, new Map(), Date.parse(clock));
+    f.review.renderAccounts([{path: "synthetic.json", state: "active",
+      checkin: {date: "2026-10-24", status: "success", nextAt: 1900000000}}]);
+    const cell = cells(f.element("accountsTable").innerHTML)[11];
+    assert.match(cell, new RegExp(text));
+    assert(!cell.includes("已签") && !cell.includes(" · 计划 "));
+  }
+  audit("签到北京时间跨日通过", {old_success_cleared: true, missed_window_not_a_failure: true});
 });
 
 test("快照503保留上次内容，不生成零账号", async () => {
@@ -405,7 +521,7 @@ test("离开配置页先确认丢弃修改，并清除所有编辑原文", async
   audit("离开页面清除编辑原文通过");
 });
 
-test("保存成功回到脱敏预览，端口待重启提示保留", async () => {
+test("保存成功回到脱敏预览，端口热切换失败提示保留", async () => {
   const f = configFixture(async (route, options) => route === "/admin/api/config-edit" && options.method === "POST" ?
     response(200, {saved: true, adminKeyChanged: false, settings: {restartRequired: true}}) : null);
   await openConfigEditor(f);
@@ -413,13 +529,13 @@ test("保存成功回到脱敏预览，端口待重启提示保留", async () =>
   assert.equal(f.element("configEditor").value, "");
   assert.equal(f.review.state.configOriginal, "");
   assert.equal(f.review.state.configMode, "preview");
-  assert.match(f.element("configResult").textContent, /需重启/);
+  assert.match(f.element("configResult").textContent, /监听端口尚未热切换/);
   const post = f.calls.find(c => c.route === "/admin/api/config-edit" && c.options.method === "POST");
   const body = JSON.parse(post.options.body);
   assert.equal(body.content, configContent);
   assert.equal(body.revision, "original-revision");
   assert.equal(body.acknowledged, true);
-  audit("保存与端口重启提示通过");
+  audit("保存与端口热切换提示通过");
 });
 
 test("管理Key修改后清除编辑原文和旧会话，要求重新登录", async () => {
@@ -889,14 +1005,13 @@ test("TTFT新旧口径隔离：旧快照不伪装成首Token，明确显示排�
   audit("首Token新旧样本隔离通过",{legacy_samples_excluded:true});
 });
 
-test("统计摘要区分未知与零值，并显示落盘状态", () => {
+test("统计摘要区分未知与零值，落盘徽标已移除但仍提示内存异常", () => {
   const f = fixture();
   f.review.renderStats(statsPayload());
   const cards = f.element("usageSummary").innerHTML;
   assert.match(cards, /总消耗 Token/);
   assert.match(cards, /1\.25/, "积分必须按实际 usage.credit 展示");
   assert.match(cards, /1\/2 请求有积分/, "必须暴露积分样本覆盖数");
-  assert.equal(f.element("statsStorage").textContent, "stats.json · 已落盘");
   // 无样本时显示未知，而不是 0。
   f.review.renderStats(statsPayload({summary: {requests: 1, success: 1, failed: 0, tokenSamples: 0,
     creditSamples: 0, ttftSamples: 0, avgLatencyMs: 900, avgTtftMs: null}}));
@@ -905,8 +1020,7 @@ test("统计摘要区分未知与零值，并显示落盘状态", () => {
   assert.match(unknown, /总消耗积分<\/div><div class="usage-value">—</, "无积分样本不得显示为 0");
   // 仅内存模式必须给出明确提示，避免被当成已持久化。
   f.review.renderStats(statsPayload({storage: {mode: "memory", message: "统计暂时无法写入，仍在内存统计"}}));
-  assert.equal(f.element("statsStorage").textContent, "仅内存 · 未落盘");
-  assert.match(f.element("statsStorage").className, /warn/);
+  assert.equal(f.element("statsStorage").textContent, "", "统计落盘徽标块已删除");
   assert.match(f.element("statsInfo").textContent, /统计暂时无法写入/);
   audit("统计摘要与落盘状态展示通过", {unknown_not_zero: true, memory_mode_flagged: true});
 });

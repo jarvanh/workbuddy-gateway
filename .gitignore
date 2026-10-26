@@ -10,6 +10,8 @@ wb-models-cache.json
 wb-models-cache.json.tmp
 config.json
 stats.json
+checkin-state.json
+.checkin-state-*.tmp
 .env
 .env.*
 !.env.example

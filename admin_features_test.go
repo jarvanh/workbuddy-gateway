@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -144,32 +146,49 @@ func TestCredentialEditorRestoresInvalidFileAndResetsNewIdentity(t *testing.T) {
 	}
 }
 
-func TestPortSettingsSaveAndPendingRestart(t *testing.T) {
+func TestPortSettingsSaveHotSwitchesAndValidates(t *testing.T) {
 	isolateAdminFeatures(t)
-	actualAPI, actualWeb := cfg.Port, cfg.WebPort
+	actualAPI, actualWeb := freeLoopbackPort(t), freeLoopbackPort(t)
+	nextAPI, nextWeb := freeLoopbackPort(t), freeLoopbackPort(t)
+	cfg.Addr, cfg.WebUI, cfg.PortExplicit = "127.0.0.1", true, false
+	cfg.Port, cfg.WebPort = actualAPI, actualWeb
+	servers, listeners, err := prepareGatewayServers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gatewayServers.register(servers, listeners)
+	gatewayServers.start(make(chan error, 2))
+	t.Cleanup(func() { gatewayServers.shutdown(context.Background()) })
 	handler := newWebUIHandler()
-	w := adminRequest(handler, "POST", "/admin/api/settings", "feature-admin-key", `{"apiPort":9317,"webPort":9316}`)
+	body := fmt.Sprintf(`{"apiPort":%d,"webPort":%d}`, nextAPI, nextWeb)
+	w := adminRequest(handler, "POST", "/admin/api/settings", "feature-admin-key", body)
 	if w.Code != 200 {
 		t.Fatalf("%d %s", w.Code, w.Body.String())
 	}
 	var view map[string]any
 	_ = json.Unmarshal(w.Body.Bytes(), &view)
-	if cfg.Port != actualAPI || cfg.WebPort != actualWeb || view["configuredApiPort"] != float64(9317) || view["restartRequired"] != true {
-		t.Fatal("保存端口改变了实际监听或未标明需重启")
+	if cfg.Port != nextAPI || cfg.WebPort != nextWeb || view["configuredApiPort"] != float64(nextAPI) ||
+		view["restartRequired"] != false || view["livePortSwitching"] != true {
+		t.Fatal("保存端口未热切换")
 	}
+	response, err := http.Get("http://127.0.0.1:" + strconv.Itoa(nextAPI) + "/health")
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("new API listener unavailable: %v", err)
+	}
+	response.Body.Close()
 	raw, _ := os.ReadFile(runtimeConfigFile)
 	var c runtimeFileConfig
 	_ = json.Unmarshal(raw, &c)
-	if c.Gateway.APIPort != 9317 || c.Gateway.WebPort != 9316 || c.SystemPrompt.Force != "visible prompt text" || currentAPIKey() != "feature-api-key" {
+	if c.Gateway.APIPort != nextAPI || c.Gateway.WebPort != nextWeb || c.SystemPrompt.Force != "visible prompt text" || currentAPIKey() != "feature-api-key" {
 		t.Fatal("端口未保存或改变了其他配置")
 	}
-	for _, body := range []string{`{"apiPort":70000}`, `{"apiPort":9316}`, `{"webPort":-1}`, `{"webPort":1.5}`} {
+	for _, body := range []string{`{"apiPort":70000}`, fmt.Sprintf(`{"apiPort":%d}`, nextWeb), `{"webPort":-1}`, `{"webPort":1.5}`} {
 		if w := adminRequest(handler, "POST", "/admin/api/settings", "feature-admin-key", body); w.Code != 400 {
 			t.Fatalf("非法端口被接受: %s %d", body, w.Code)
 		}
 	}
 	cfg.PortExplicit = true
-	if w := adminRequest(handler, "POST", "/admin/api/settings", "feature-admin-key", `{"webPort":8317}`); w.Code != 400 {
+	if w := adminRequest(handler, "POST", "/admin/api/settings", "feature-admin-key", fmt.Sprintf(`{"webPort":%d}`, cfg.Port)); w.Code != 400 {
 		t.Fatal("-port 覆盖导致的端口冲突未被拒绝")
 	}
 	w = adminRequest(handler, "GET", "/admin/api/config", "feature-admin-key", "")

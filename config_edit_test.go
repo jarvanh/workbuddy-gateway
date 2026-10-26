@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -86,6 +88,17 @@ func TestConfigEditorRequiresAdminAndWarningAcknowledgement(t *testing.T) {
 
 func TestConfigEditorSavesHotSettingsPortsAndSecretSafeAudit(t *testing.T) {
 	isolateAdminFeatures(t)
+	actualAPI, actualWeb := freeLoopbackPort(t), freeLoopbackPort(t)
+	nextAPI, nextWeb := freeLoopbackPort(t), freeLoopbackPort(t)
+	cfg.Addr, cfg.WebUI, cfg.PortExplicit = "127.0.0.1", true, false
+	cfg.Port, cfg.WebPort = actualAPI, actualWeb
+	servers, listeners, err := prepareGatewayServers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gatewayServers.register(servers, listeners)
+	gatewayServers.start(make(chan error, 2))
+	t.Cleanup(func() { gatewayServers.shutdown(context.Background()) })
 	handler := newWebUIHandler()
 	old, _ := os.ReadFile(runtimeConfigFile)
 	oldWriter := log.Writer()
@@ -94,7 +107,7 @@ func TestConfigEditorSavesHotSettingsPortsAndSecretSafeAudit(t *testing.T) {
 	t.Cleanup(func() { log.SetOutput(oldWriter) })
 	const prompt = "synthetic-private-editor-prompt"
 	const newAPIKey = "synthetic-new-editor-api-key"
-	content := `{"gateway":{"adminKey":"feature-admin-key","apiKeyEnabled":true,"apiKey":"` + newAPIKey + `","apiPort":18317,"webPort":18316},"systemPrompt":{"force":"` + prompt + `","fallback":"fallback"},"models":{"blocklist":["off"],"accounts":{"all":{"blocklist":["paused.json"]}}},"logs":{"retentionDays":5},"upstream":{"idleTimeoutSeconds":77,"transientRetries":0},"debug":{"enabled":false}}`
+	content := fmt.Sprintf(`{"gateway":{"adminKey":"feature-admin-key","apiKeyEnabled":true,"apiKey":"%s","apiPort":%d,"webPort":%d},"systemPrompt":{"force":"%s","fallback":"fallback"},"models":{"blocklist":["off"],"accounts":{"all":{"blocklist":["paused.json"]}}},"logs":{"retentionDays":5},"upstream":{"idleTimeoutSeconds":77,"transientRetries":0},"debug":{"enabled":false}}`, newAPIKey, nextAPI, nextWeb, prompt)
 	w := adminRequest(handler, "POST", "/admin/api/config-edit", "feature-admin-key", editorRequestBody(t, configRevision(old), content, false))
 	if w.Code != http.StatusOK {
 		t.Fatalf("保存失败: %d %s", w.Code, w.Body.String())
@@ -108,12 +121,12 @@ func TestConfigEditorSavesHotSettingsPortsAndSecretSafeAudit(t *testing.T) {
 		t.Fatal(err)
 	}
 	saved, _ := os.ReadFile(runtimeConfigFile)
-	if response.Revision != configRevision(saved) || !response.Settings.RestartRequired || response.AdminKeyChanged {
-		t.Fatal("保存状态、版本或待重启状态错误")
+	if response.Revision != configRevision(saved) || response.Settings.RestartRequired || response.AdminKeyChanged {
+		t.Fatal("保存状态、版本或端口热切换状态错误")
 	}
-	if cfg.Port != defaultAPIPort || cfg.WebPort != defaultWebPort || currentAPIKey() != newAPIKey ||
+	if cfg.Port != nextAPI || cfg.WebPort != nextWeb || currentAPIKey() != newAPIKey ||
 		configuredSystemPrompts().force != prompt || logRetentionDays.Load() != 5 {
-		t.Fatal("热配置未生效或监听端口被错误地热切换")
+		t.Fatal("热配置未生效或监听端口未热切换")
 	}
 	if disabled, _ := modelDisabled("off"); !disabled {
 		t.Fatal("模型名单未生效")

@@ -572,13 +572,13 @@ func TestIsAlreadyCheckedIn(t *testing.T) {
 
 func TestNextDailyCheckinUTC8(t *testing.T) {
 	loc := time.FixedZone("test", 8*60*60)
-	before := time.Date(2026, 9, 15, 8, 59, 0, 0, loc)
-	if got := nextDailyCheckin(before); !got.Equal(time.Date(2026, 9, 15, 9, 0, 0, 0, time.FixedZone("UTC+8", 8*60*60))) {
-		t.Fatalf("before 09:00 got %v", got)
+	before := time.Date(2026, 9, 15, 7, 59, 0, 0, loc)
+	if got := nextDailyCheckin(before); !got.Equal(time.Date(2026, 9, 15, 8, 0, 0, 0, checkinZone)) {
+		t.Fatalf("before first window got %v", got)
 	}
 	after := time.Date(2026, 9, 15, 9, 1, 0, 0, loc)
-	if got := nextDailyCheckin(after); !got.Equal(time.Date(2026, 9, 16, 9, 0, 0, 0, time.FixedZone("UTC+8", 8*60*60))) {
-		t.Fatalf("after 09:00 got %v", got)
+	if got := nextDailyCheckin(after); !got.Equal(time.Date(2026, 9, 16, 8, 0, 0, 0, checkinZone)) {
+		t.Fatalf("without a pending account plan got %v", got)
 	}
 }
 
@@ -1091,10 +1091,13 @@ func TestRenderAccountTableUsesFullYearAndNoEmoji(t *testing.T) {
 		FreeModels:     1,
 		ModelCooldowns: 2,
 	}})
-	for _, want := range []string{"凭据文件", "workbuddy4.json", "国际站", "付费耗尽", wantExpiry, "总额度", "已用", "剩余", "套餐", "免费模型", "模型冷却", "1100", "免费"} {
+	for _, want := range []string{"凭据文件", "workbuddy4.json", "国际站", "付费耗尽", wantExpiry, "总额度", "已用", "剩余", "套餐", "签到", "模型冷却", "1100"} {
 		if !strings.Contains(table, want) {
 			t.Fatalf("table missing %q:\n%s", want, table)
 		}
+	}
+	if strings.Contains(table, "免费模型") {
+		t.Fatal("removed free-model column remains")
 	}
 	if strings.Contains(table, "说明") {
 		t.Fatalf("table should not contain removed description column:\n%s", table)
@@ -1364,6 +1367,87 @@ func TestRenderAccountTableRowsHaveEqualDisplayWidth(t *testing.T) {
 		if got := displayWidth(line); got != want {
 			t.Fatalf("line %d display width=%d want=%d:\n%s", i, got, want, table)
 		}
+	}
+}
+
+func TestRenderAccountTableUsesContentWidthsWithoutLosingColumns(t *testing.T) {
+	table := renderAccountTable([]accountSnapshot{
+		{Path: "a.json", Nickname: "u", Edition: "cn", State: "active", Checkin: checkinStatusSnapshot{Status: "success"},
+			QuotaKnown: true, QuotaTotal: 1, QuotaUsed: 0, QuotaRemaining: 1, PlanLabel: "免费"},
+	})
+	lines := strings.Split(table, "\n")
+	width := displayWidth(lines[0])
+	if width > 135 {
+		t.Fatalf("short account table still uses %d columns:\n%s", width, table)
+	}
+	if strings.Contains(table, "  |   |") {
+		t.Fatalf("empty fixed-width gaps remain:\n%s", table)
+	}
+	for _, header := range []string{"账号", "站点", "状态", "套餐", "签到", "模型冷却"} {
+		if !strings.Contains(table, header) {
+			t.Fatalf("missing column %s", header)
+		}
+	}
+	long := renderAccountTable([]accountSnapshot{
+		{Path: strings.Repeat("very-long-file-", 4) + ".json", Nickname: strings.Repeat("long-account-", 6), Edition: "cn", State: "active"},
+	})
+	longLines := strings.Split(long, "\n")
+	want := displayWidth(longLines[0])
+	for i, line := range longLines {
+		if got := displayWidth(line); got != want {
+			t.Fatalf("long row %d width=%d want=%d", i, got, want)
+		}
+	}
+	if !strings.Contains(long, "...") {
+		t.Fatal("long account/file should be truncated instead of expanding without bound")
+	}
+}
+
+func TestRenderAccountTableCompactAcceptance(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rows []accountSnapshot
+	}{
+		{"empty", nil},
+		{"mixed Chinese and ASCII", []accountSnapshot{
+			{Path: "workbuddy1.json", Nickname: "测试账号甲", Edition: "cn", State: "active",
+				TokenExpiresAt: 1900000000, QuotaKnown: true, QuotaTotal: 2000, QuotaUsed: 69.99,
+				QuotaRemaining: 1930.01, PlanLabel: "体验版",
+				Checkin: checkinStatusSnapshot{Date: checkinDay(time.Now()), Status: "success"}},
+			{Path: "a.json", Nickname: "synthetic-user", Edition: "intl", State: "cooldown",
+				ModelCooldowns: 12},
+		}},
+		{"bounded long cells", []accountSnapshot{
+			{Path: strings.Repeat("very-long-", 20) + ".json", Nickname: strings.Repeat("合成测试账号", 30),
+				Edition: "cn", State: "expired", PlanLabel: strings.Repeat("套餐", 40), QuotaKnown: true},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			table := renderAccountTable(tc.rows)
+			lines := strings.Split(table, "\n")
+			width := displayWidth(lines[0])
+			if width > 216 {
+				t.Fatalf("table exceeds the combined column caps: %d", width)
+			}
+			for _, line := range lines {
+				if strings.HasPrefix(line, "+") || strings.HasPrefix(line, "|") {
+					if displayWidth(line) != width {
+						t.Fatalf("unaligned row: %q", line)
+					}
+				}
+				if strings.HasPrefix(line, "|") && strings.Count(line, "|") != 13 {
+					t.Fatalf("expected all 12 columns, got: %q", line)
+				}
+			}
+			if len(tc.rows) == 2 {
+				for _, value := range []string{"测试账号甲", "synthetic-user", "1930.01", "已签", "12"} {
+					if !strings.Contains(table, value) {
+						t.Fatalf("compaction lost actual content %q", value)
+					}
+				}
+			}
+			t.Logf("合成账号验收：场景=%s 列数=12 实际终端列宽=%d\n%s", tc.name, width, table)
+		})
 	}
 }
 

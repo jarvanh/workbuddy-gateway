@@ -59,17 +59,17 @@
         <p class="hint health-footnote">账号级健康度，不代表每个模型都可调用。</p>
       </section>
       <section class="card account-alert-card" aria-labelledby="accountAlertsTitle">
-        <div class="card-title"><h3 id="accountAlertsTitle">账号日志告警</h3><span class="badge">只读日志</span></div>
+        <div class="card-title"><h3 id="accountAlertsTitle">账号日志告警</h3><span class="badge">告警详情</span></div>
         <p id="accountAlertsInfo" class="hint" role="status" aria-live="polite">登录后读取账号异常日志。</p>
         <div id="accountAlerts" class="account-alert-list" tabindex="0" aria-label="账号异常告警列表">
           <p class="stats-empty">等待日志</p>
         </div>
+        <div id="accountAlertTooltip" class="account-alert-tooltip" role="tooltip" hidden></div>
       </section>
     </div>
     <section class="usage-section" aria-labelledby="usageTitle">
       <div class="usage-heading">
         <div><h2 id="usageTitle">用量与性能</h2></div>
-        <span id="statsStorage" class="badge" role="status">等待统计</span>
       </div>
       <div class="stats-controls">
         <label>统计粒度<select id="statsPeriod"><option value="hour">小时</option><option value="day" selected>日</option><option value="week">周</option><option value="month">月</option></select></label>
@@ -154,7 +154,7 @@
             <tr>
               <th>#</th><th>全局调度</th><th>凭据文件</th><th>账号</th><th>站点</th><th>状态</th>
               <th>Token 有效期</th><th>总额度</th><th>已用</th><th>剩余</th>
-              <th>套餐</th><th>免费模型</th><th>模型冷却</th>
+              <th>套餐</th><th>签到</th><th>模型冷却</th>
               <th>上次续期</th><th>续期失败</th><th>操作</th>
             </tr>
           </thead>
@@ -231,7 +231,7 @@
         <h2 id="configWarningTitle">编辑前请确认风险</h2>
         <ul>
           <li>这是整份服务器配置，不是副本。编辑器会显示真实管理 Key 和 API Key，请勿分享截图或在公共设备上编辑；仅通过可信网络、HTTPS 或 SSH 转发访问，建议先自行备份。</li>
-          <li>保存后，密钥、模型/账号规则、提示词等立即生效。端口修改需重启服务；API 端口仍可能受启动参数 <code>-port</code> 覆盖。</li>
+          <li>保存后，密钥、模型/账号规则、提示词和监听端口都立即热切换；已有连接与流式请求不会被主动中断。API 端口仍可能受启动参数 <code>-port</code> 覆盖。</li>
           <li>修改管理 Key 会要求重新登录；清空它将使管理登录不可用，需在服务器本机重新设置。</li>
           <li>改变日志保留天数可能触发过期日志删除，删除不可撤销。错误的配置会被拒绝，不写入文件。</li>
         </ul>
@@ -289,7 +289,7 @@
           <div class="settings-row"><label for="configuredApiPort">配置 API 端口</label><input id="configuredApiPort" type="number" min="1" max="65535" step="1"></div>
           <div class="settings-row"><label for="configuredWebPort">配置 Web 端口</label><input id="configuredWebPort" type="number" min="1" max="65535" step="1"></div>
         </div>
-        <p id="portSettingsStatus" class="hint" role="status">保存等效于修改 config.json 的 gateway.apiPort / gateway.webPort，重启网关后改变监听；不会中断当前页面和流式请求。</p>
+        <p id="portSettingsStatus" class="hint" role="status">保存等效于修改 config.json 的 gateway.apiPort / gateway.webPort；校验通过后立即切换监听，已有连接和流式请求继续完成。</p>
         <button id="savePortSettings" type="button">保存端口配置</button>
       </div>
     </div>

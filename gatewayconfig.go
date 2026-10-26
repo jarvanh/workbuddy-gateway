@@ -173,12 +173,49 @@ func persistGatewayConfigLocked(doc map[string]json.RawMessage, g gatewayFileCon
 		log.Printf("[管理配置] traceId=%s 阶段=写入配置 结果=失败 原因=%v 业务影响=运行时配置未切换", trace, err)
 		return err
 	}
+	if err := applyGatewayListenerPortsLocked(g, trace); err != nil {
+		if restoreErr := writeConfigPreservingFile(old, append(data, '\n')); restoreErr != nil {
+			return fmt.Errorf("监听端口切换失败: %v；恢复原配置也失败，请检查服务器日志: %w", err, restoreErr)
+		}
+		return err
+	}
 	gatewaySettings = g
 	setGatewayKeysLocked(g)
 	// 本函数只应用 gateway 段；强制下轮完整重载其他外部编辑的配置。
 	runtimeHasAppliedHash = false
-	log.Printf("[管理配置] traceId=%s 结果=保存成功 API鉴权启用=%t 说明=后续请求使用新鉴权状态，管理鉴权始终独立启用，监听端口不热切换", trace, g.APIKeyEnabled)
+	log.Printf("[管理配置] traceId=%s 结果=保存成功 API鉴权启用=%t 实际API端口=%d 实际Web端口=%d 说明=后续请求使用新鉴权状态，管理鉴权始终独立启用；监听端口已热切换，旧连接保留", trace, g.APIKeyEnabled, cfg.Port, cfg.WebPort)
 	return nil
+}
+
+// Called with gatewayConfigMu held. New listeners bind before old ones retire.
+func applyGatewayListenerPortsLocked(g gatewayFileConfig, trace string, beforeCommit ...func() error) error {
+	apiPort := g.APIPort
+	if cfg.PortExplicit {
+		apiPort = cfg.Port
+	}
+	var prepare func() error
+	if len(beforeCommit) > 0 {
+		prepare = beforeCommit[0]
+	}
+	actualAPI, actualWeb, err := gatewayServers.applyWith(g, apiPort, cfg.WebUI, prepare)
+	if err != nil {
+		log.Printf("[监听热切换] traceId=%s 目标API端口=%d 目标Web端口=%d 结果=失败 原因=%v 业务影响=原监听继续服务", trace, apiPort, g.WebPort, err)
+		return gatewayValidationError(err.Error())
+	}
+	if actualAPI > 0 {
+		cfg.Port = actualAPI
+	}
+	if actualWeb > 0 {
+		cfg.WebPort = actualWeb
+	}
+	return nil
+}
+
+func currentGatewayPorts() (int, int) {
+	gatewayConfigMu.RLock()
+	defer gatewayConfigMu.RUnlock()
+	api, web, _ := gatewayServers.ports()
+	return api, web
 }
 
 func initializeAdminKey(trace string) (string, error) {
@@ -248,7 +285,7 @@ func saveGatewaySettings(enabled *bool, key string, apiPort, webPort *int, trace
 	if cfg.WebUI && effectiveAPIPort == g.WebPort {
 		return gatewayValidationError("Web 端口不能与实际 API 端口冲突（含 -port 命令行覆盖）")
 	}
-	log.Printf("[管理端口设置] traceId=%s 配置API端口=%d 配置Web端口=%d 当前API端口=%d 当前Web端口=%d 说明=保存等效于编辑gateway配置，监听端口重启后改变",
+	log.Printf("[管理端口设置] traceId=%s 配置API端口=%d 配置Web端口=%d 当前API端口=%d 当前Web端口=%d 说明=保存等效于编辑gateway配置，监听端口将在校验后热切换",
 		trace, g.APIPort, g.WebPort, cfg.Port, cfg.WebPort)
 	registerSecrets(g.APIKey)
 	return persistGatewayConfigLocked(doc, g, old, trace)
@@ -257,15 +294,20 @@ func saveGatewaySettings(enabled *bool, key string, apiPort, webPort *int, trace
 func gatewaySettingsView() map[string]any {
 	gatewayConfigMu.RLock()
 	defer gatewayConfigMu.RUnlock()
+	actualAPI, actualWeb, live := gatewayServers.ports()
+	if !live {
+		actualAPI, actualWeb = cfg.Port, cfg.WebPort
+	}
 	return map[string]any{
 		"apiKeyEnabled":      cfg.APIKey != "",
 		"apiKeyConfigured":   gatewaySettings.APIKey != "",
 		"adminKeyConfigured": cfg.AdminKey != "",
-		"apiPort":            cfg.Port, "webPort": cfg.WebPort,
+		"apiPort":            actualAPI, "webPort": actualWeb,
 		"configuredApiPort": gatewaySettings.APIPort,
 		"configuredWebPort": gatewaySettings.WebPort,
 		"apiPortOverridden": cfg.PortExplicit,
-		"restartRequired":   gatewaySettings.WebPort != cfg.WebPort || !cfg.PortExplicit && gatewaySettings.APIPort != cfg.Port,
+		"restartRequired":   gatewaySettings.WebPort != actualWeb || !cfg.PortExplicit && gatewaySettings.APIPort != actualAPI,
+		"livePortSwitching": live,
 	}
 }
 

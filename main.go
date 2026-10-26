@@ -39,7 +39,7 @@ import (
 // version 是网关版本号：默认取开发值，发布流水线会通过
 // -ldflags "-X main.version=<tag>" 注入 tag 版本（因此必须是 var 而非 const）。
 //
-// ⚠️ 上游把这里改成了 const 形态（截至 v1.14.35 仍如此），fork 不同步这一改动：
+// ⚠️ 上游把这里改成了 const 形态（截至 v1.14.38 仍如此），fork 不同步这一改动：
 // const 会让 release 流水线的 -ldflags 注入失效（Go 不允许对 const 做 linker 注入），
 // 发版产物会永远显示源码里的开发版本号。保留 var 形态。
 var version = "1.13.1"
@@ -696,8 +696,6 @@ var (
 	rrIndex   int        // 轮询游标
 
 	quotaScanTrigger = make(chan struct{}, 1)
-	checkinTrigger   = make(chan struct{}, 1)
-	dailyCheckinMu   sync.Mutex
 )
 
 // -----------------------------------------------------------------------------
@@ -1488,7 +1486,6 @@ func accountReloaderLoop() {
 		if changed {
 			writeStatusSnapshot() // 立即刷新 monitor 状态文件
 			requestQuotaScan()
-			requestCheckin()
 			// 目录刷新成功后会自动触发价格探测；这里再直接触发一次，
 			// 保证「原本没有某站点账号、后来加入」时也能立刻对该站点模型探测。
 			requestModelsScan()
@@ -3203,214 +3200,10 @@ func isAlreadyCheckedIn(status int, message string) bool {
 		strings.Contains(message, "已签到") || strings.Contains(low, "already checked in")
 }
 
-// checkinAccount 执行单账号每日签到：国内站与国际站均支持，国内站签到成功后
-// 按配置自动派 Buddy 旅行。是否执行由 config.json 的 checkin 段控制（默认开启）。
+// checkinAccount is the single-attempt transport. Only the persisted scheduler
+// calls it automatically; credential events never invoke it directly.
 func checkinAccount(ctx context.Context, acc *Account) (string, error) {
-	if acc == nil {
-		return "skipped", nil
-	}
-	acc.lock.Lock()
-	defer acc.lock.Unlock()
-
-	accountMu.Lock()
-	if acc.Disabled || acc.Auth == nil || acc.Auth.Auth.AccessToken == "" {
-		accountMu.Unlock()
-		return "skipped", nil
-	}
-	isCN := acc.Profile().Key == profileCN.Key
-	if (isCN && !cnCheckinEnabled) || (!isCN && !intlCheckinEnabled) {
-		accountMu.Unlock()
-		return "global_skipped", nil
-	}
-	if strings.TrimSpace(acc.Auth.Account.EnterpriseID) != "" {
-		accountPath := acc.Path
-		accountMu.Unlock()
-		log.Printf("[Checkin] traceId=%s 账号 %s 是企业版，不发起个人签到请求；额度仍由企业分配额度接口更新", newTraceID(), accountPath)
-		return "enterprise_skipped", nil
-	}
-	auth := *acc.Auth
-	path := acc.Path
-	prof := acc.Profile()
-	accountMu.Unlock()
-	// 实现与超时按站点分流：
-	//   国内站 —— daily-checkin 接口，一个请求就完事，保持短超时；
-	//   国际站 —— 该接口上游并不认（旧实现只会拿到「已签到」文案，被 isAlreadyCheckedIn
-	//             误判为幂等成功，实测 5 天 0 次真签到）。真正算数的是网页端跑完一次
-	//             agent 会话（ACP）：建会话 → 取沙箱 → SSE → JSON-RPC → 轮询 completed，
-	//             链路长得多，超时必须放宽。
-	var result string
-	var checkinErr error
-
-	if isCN {
-		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-
-		log.Printf("[Checkin] 账号 %s 开始每日签到，站点=%s，接口=%s", path, prof.Label, prof.dailyCheckinURL())
-		headers := func(r *http.Request) {
-			commonHeaders(r, prof)
-			r.Header.Set("Authorization", "Bearer "+auth.Auth.AccessToken)
-			r.Header.Set("X-Client-Platform", "web")
-			if auth.Account.UID != "" {
-				r.Header.Set("X-User-Id", auth.Account.UID)
-			}
-			if auth.Account.EnterpriseID != "" {
-				r.Header.Set("X-Enterprise-Id", auth.Account.EnterpriseID)
-				r.Header.Set("X-Tenant-Id", auth.Account.EnterpriseID)
-			}
-			if auth.Auth.Domain != "" {
-				r.Header.Set("X-Domain", auth.Auth.Domain)
-			}
-		}
-		_, status, err := doJSONContext(ctx, cfg.HttpClient, http.MethodPost, prof.dailyCheckinURL(), headers, strings.NewReader("{}"))
-		result = "failed"
-		switch {
-		case err == nil:
-			log.Printf("[Checkin] 账号 %s 每日签到成功", path)
-			result = "ok"
-		case isAlreadyCheckedIn(status, err.Error()):
-			log.Printf("[Checkin] 账号 %s 今天已经签到，本次按幂等成功处理", path)
-			result = "already"
-		default:
-			log.Printf("[Checkin] 账号 %s 每日签到失败，HTTP=%d，原因=%v；不改变账号调度状态", path, status, err)
-			checkinErr = err
-		}
-	} else {
-		// 当日已成功跑过就跳过：国际站活跃按次扣额度，网关每次启动都会重跑一轮，
-		// 而上游只回「今日已签」的幂等文案、不会叫停，重复跑纯属白烧额度。
-		if intlCheckinAlreadyDone(path) {
-			log.Printf("[Checkin] 账号 %s 国际站今日已活跃，跳过重复执行（去重，不消耗额度）", path)
-			return "already", nil
-		}
-
-		ctx, cancel := context.WithTimeout(ctx, acpTurnTimeout+30*time.Second)
-		defer cancel()
-
-		log.Printf("[Checkin] 账号 %s 开始国际站每日活跃（ACP 会话），模型=%s", path, acpDailyChatModel)
-		turn := runIntlDailyChat(ctx, &auth, prof)
-		switch {
-		case turn.OK:
-			log.Printf("[Checkin] 账号 %s 国际站每日活跃完成：%d 段输出 / %d 次更新，耗时 %dms",
-				path, turn.Chunks, turn.Updates, turn.ElapsedMS)
-			markIntlCheckinDone(path)
-			result = "ok"
-		default:
-			log.Printf("[Checkin] 账号 %s 国际站每日活跃失败：%s；不改变账号调度状态", path, turn.Error)
-			result = "failed"
-			checkinErr = errors.New(turn.Error)
-		}
-	}
-
-	// 国内站签到后派 Buddy 旅行：旅行是独立活动，签到成功或今日已签都尝试执行；
-	// 结果只记录日志，不影响签到本身的返回值。
-	if isCN && cnTravelEnabled && (result == "ok" || result == "already") {
-		travelResult, travelErr := performBuddyTravel(ctx, acc)
-		switch {
-		case travelErr != nil:
-			log.Printf("[Travel] 账号 %s Buddy 旅行失败: %v", path, travelErr)
-		case travelResult == "ok":
-			log.Printf("[Travel] 账号 %s Buddy 旅行流程完成", path)
-		}
-	}
-
-	// 国内站成长任务：接取 → 事件上报点亮 → 进度落账 → 领奖。
-	// 独立于签到结果（今日已签也应继续推进），失败不影响签到返回值。
-	// 超时必须独立于签到那个 30s：任务多时整轮可达数分钟。
-	if isCN && cnGrowthEnabled {
-		gctx, gcancel := context.WithTimeout(context.Background(), growthTimeout)
-		gr := runGrowthTasks(gctx, &auth, prof, path)
-		gcancel()
-		if gr.EarnedCredit > 0 {
-			log.Printf("[Growth] 账号 %s 成长任务累计到账 +%d 积分", path, gr.EarnedCredit)
-		}
-	}
-	return result, checkinErr
-}
-
-func checkinAllAccounts(ctx context.Context) {
-	if !dailyCheckinMu.TryLock() {
-		log.Printf("[Checkin] 已有一轮签到正在执行，本次重复触发已跳过")
-		return
-	}
-	defer dailyCheckinMu.Unlock()
-	next := nextDailyCheckin(time.Now())
-	trace, started := startScheduledTask("daily_checkin", next)
-
-	accountMu.Lock()
-	accs := append([]*Account(nil), accounts...)
-	accountMu.Unlock()
-	log.Printf("[Checkin] 开始每日签到，账号总数=%d（国内站签到+Buddy旅行、国际站签到，均可在 config.json checkin 段关闭）", len(accs))
-	ok, already, failed, skipped := 0, 0, 0, 0
-	for _, acc := range accs {
-		if err := ctx.Err(); err != nil {
-			log.Printf("[Checkin] 本轮签到被取消，未处理账号等待下一次触发: %v", err)
-			break
-		}
-		result, err := checkinAccount(ctx, acc)
-		switch result {
-		case "ok":
-			ok++
-		case "already":
-			already++
-		case "failed":
-			failed++
-			_ = err
-		default:
-			skipped++
-		}
-	}
-	log.Printf("[Checkin] 本轮签到完成，总数=%d，成功=%d，今日已签=%d，失败=%d，跳过=%d", len(accs), ok, already, failed, skipped)
-	status := "success"
-	if ctx.Err() != nil {
-		status = "cancelled"
-	} else if failed > 0 && ok+already == 0 {
-		status = "failed"
-	} else if failed > 0 {
-		status = "partial"
-	} else if ok+already == 0 {
-		status = "skipped"
-	}
-	logScheduledTask("daily_checkin", "completed", status, trace, started, next, fmt.Sprintf("成功=%d，今日已签=%d，失败=%d，跳过=%d", ok, already, failed, skipped))
-	requestQuotaScan()
-}
-
-func nextDailyCheckin(now time.Time) time.Time {
-	loc := time.FixedZone("UTC+8", 8*60*60)
-	localNow := now.In(loc)
-	next := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 9, 0, 0, 0, loc)
-	if !next.After(localNow) {
-		next = next.Add(24 * time.Hour)
-	}
-	return next
-}
-
-func requestCheckin() {
-	select {
-	case checkinTrigger <- struct{}{}:
-	default:
-	}
-}
-
-func backgroundDailyCheckin() {
-	go checkinAllAccounts(context.Background())
-	for {
-		next := nextDailyCheckin(time.Now())
-		logScheduledTask("daily_checkin", "scheduled", "", newTraceID(), time.Time{}, next, "固定北京时间09:00；账号池变化可能提前触发")
-		log.Printf("[Checkin] 下一次定时签到时间=%s", next.In(displayLoc).Format("2006-01-02 15:04:05 MST"))
-		timer := time.NewTimer(time.Until(next))
-		select {
-		case <-timer.C:
-			go checkinAllAccounts(context.Background())
-		case <-checkinTrigger:
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			log.Printf("[Checkin] 凭据池发生变化，立即触发一轮签到")
-			go checkinAllAccounts(context.Background())
-		}
-	}
+	return checkinAccountWithTrace(ctx, acc, newTraceID())
 }
 
 // -----------------------------------------------------------------------------
@@ -3425,6 +3218,7 @@ func formatAccountStatus(acc *Account, idx int, now time.Time) string {
 	sb.WriteString(fmt.Sprintf("凭据文件:     %s\n", acc.Path))
 	prof := acc.Profile()
 	sb.WriteString(fmt.Sprintf("站点:         %s (%s)\n", prof.Label, strings.TrimPrefix(prof.Base, "https://")))
+	sb.WriteString(fmt.Sprintf("签到:         %s（北京时间 %s）\n", checkinDisplay(dailyCheckins.view(checkinTargetLocked(acc), now), prof.Key, now), checkinDay(now)))
 
 	if acc.Disabled {
 		// 失效账号（Auth 可能为 nil：凭据文件已删除，信息来自失效标记）
@@ -3568,8 +3362,9 @@ type accountSnapshot struct {
 	QuotaExhausted   bool                          `json:"quotaExhausted,omitempty"`
 	QuotaUnlimited   bool                          `json:"quotaUnlimited,omitempty"`
 	ModelStates      map[string]modelStateSnapshot `json:"modelStates,omitempty"`
-	FreeModels       int                           `json:"freeModels,omitempty"` // 展示值：所属站点模型统计中 0.00x 的模型数，不参与调度
+	FreeModels       int                           `json:"freeModels,omitempty"` // 旧版快照兼容字段；账号表不再显示，不参与调度
 	ModelCooldowns   int                           `json:"modelCooldowns,omitempty"`
+	Checkin          checkinStatusSnapshot         `json:"checkin"`
 }
 
 type modelStateSnapshot struct {
@@ -3600,6 +3395,7 @@ func writeStatusSnapshot() error {
 	now := time.Now()
 	for _, acc := range accounts {
 		as := accountSnapshot{Path: acc.Path, Edition: acc.Profile().Key}
+		as.Checkin = dailyCheckins.view(checkinTargetLocked(acc), now)
 		as.QuotaTotal = acc.QuotaTotal
 		as.QuotaUsed = acc.QuotaUsed
 		as.QuotaRemaining = acc.QuotaRemaining
@@ -3695,7 +3491,7 @@ func writeStatusSnapshot() error {
 	if !lastFreeModelDisplay.initialized || lastFreeModelDisplay.cn != cnFree || lastFreeModelDisplay.intl != intlFree {
 		lastFreeModelDisplay.initialized = true
 		lastFreeModelDisplay.cn, lastFreeModelDisplay.intl = cnFree, intlFree
-		log.Printf("[免费模型展示] traceId=%s 来源=模型统计站点倍率 国内=%d 国际=%d 模型行数=%d 规则=只计0.00x 业务影响=仅更新账号表展示，不改实测账本、调度或计费判断",
+		log.Printf("[兼容统计] traceId=%s 来源=模型统计站点倍率 国内=%d 国际=%d 模型行数=%d 规则=只计0.00x 业务影响=仅保留旧快照兼容字段，账号表不展示，不改实测账本、调度或计费判断",
 			newTraceID(), cnFree, intlFree, len(snap.Models))
 	}
 	accountMu.Unlock()
@@ -3759,11 +3555,50 @@ func fitCell(s string, width int) string {
 }
 
 func renderAccountTable(accs []accountSnapshot) string {
-	widths := []int{4, 20, 24, 8, 10, 19, 10, 10, 10, 10, 10, 10}
-	for _, a := range accs {
-		widths[9] = min(36, max(widths[9], displayWidth(planDisplayLabel(a.PlanLabel, a.PlanStale))))
+	now := time.Now()
+	headers := []string{"序号", "凭据文件", "账号", "站点", "状态", "Token 有效期", "总额度", "已用", "剩余", "套餐", "签到", "模型冷却"}
+	// 列宽随当前数据收紧，只保留必要的表头与内容宽度。长账号/文件名仍有
+	// 上限，避免一个异常值把整张表撑得过宽。
+	caps := []int{4, 28, 36, 8, 10, 19, 12, 12, 12, 24, 6, 8}
+	rows := make([][]string, 0, len(accs))
+	for i, a := range accs {
+		status := "可用"
+		expires := "-"
+		total, used, remaining, plan := "-", "-", "-", "-"
+		if a.QuotaKnown {
+			total = formatQuotaAmount(a.QuotaUnlimited, "total", a.QuotaTotal)
+			used = formatQuotaAmount(a.QuotaUnlimited, "used", a.QuotaUsed)
+			remaining = formatQuotaAmount(a.QuotaUnlimited, "remaining", a.QuotaRemaining)
+			plan = planDisplayLabel(a.PlanLabel, a.PlanStale)
+		}
+		if a.TokenExpiresAt > 0 {
+			expires = time.Unix(a.TokenExpiresAt, 0).Format("2006-01-02 15:04:05")
+		}
+		switch a.State {
+		case "cooldown":
+			status = "冷却"
+		case "expired":
+			status = "已过期"
+		case "quota_exhausted", "paid_exhausted":
+			status = "付费耗尽"
+		case "disabled":
+			status = "失效"
+		}
+		rows = append(rows, []string{
+			strconv.Itoa(i + 1), filepath.Base(a.Path), ifEmpty(a.Nickname, "-"),
+			profileForEdition(a.Edition).Label, status, expires, total, used, remaining, plan,
+			checkinDisplay(a.Checkin, a.Edition, now), strconv.Itoa(a.ModelCooldowns),
+		})
 	}
-	headers := []string{"序号", "凭据文件", "账号", "站点", "状态", "Token 有效期", "总额度", "已用", "剩余", "套餐", "免费模型", "模型冷却"}
+	widths := make([]int, len(headers))
+	for i, header := range headers {
+		widths[i] = displayWidth(header)
+	}
+	for _, cells := range rows {
+		for i, cell := range cells {
+			widths[i] = max(widths[i], min(caps[i], displayWidth(cell)))
+		}
+	}
 	border := func() string {
 		var b strings.Builder
 		b.WriteByte('+')
@@ -3788,34 +3623,8 @@ func renderAccountTable(accs []accountSnapshot) string {
 	b.WriteString(border() + "\n")
 	b.WriteString(row(headers) + "\n")
 	b.WriteString(border() + "\n")
-	for i, a := range accs {
-		status := "可用"
-		expires := "-"
-		total, used, remaining, plan := "-", "-", "-", "-"
-		if a.QuotaKnown {
-			total = formatQuotaAmount(a.QuotaUnlimited, "total", a.QuotaTotal)
-			used = formatQuotaAmount(a.QuotaUnlimited, "used", a.QuotaUsed)
-			remaining = formatQuotaAmount(a.QuotaUnlimited, "remaining", a.QuotaRemaining)
-			plan = planDisplayLabel(a.PlanLabel, a.PlanStale)
-		}
-		if a.TokenExpiresAt > 0 {
-			expires = formatDisplayTime(time.Unix(a.TokenExpiresAt, 0))
-		}
-		switch a.State {
-		case "cooldown":
-			status = "冷却"
-		case "expired":
-			status = "已过期"
-		case "quota_exhausted", "paid_exhausted":
-			status = "付费耗尽"
-		case "disabled":
-			status = "失效"
-		}
-		b.WriteString(row([]string{
-			strconv.Itoa(i + 1), filepath.Base(a.Path), ifEmpty(a.Nickname, "-"),
-			profileForEdition(a.Edition).Label, status, expires, total, used, remaining, plan,
-			strconv.Itoa(a.FreeModels), strconv.Itoa(a.ModelCooldowns),
-		}) + "\n")
+	for _, cells := range rows {
+		b.WriteString(row(cells) + "\n")
 	}
 	b.WriteString(border())
 	for _, a := range accs {
@@ -3824,7 +3633,6 @@ func renderAccountTable(accs []accountSnapshot) string {
 			break
 		}
 	}
-	now := time.Now()
 	for _, a := range accs {
 		if a.RefreshExpiresAt <= 0 {
 			continue
@@ -4056,11 +3864,7 @@ func runServe() {
 		fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)
 		os.Exit(1)
 	}
-	defer func() {
-		for _, listener := range listeners {
-			_ = listener.Close()
-		}
-	}()
+	gatewayServers.register(servers, listeners)
 	configCtx, stopConfigReload := context.WithCancel(context.Background())
 	defer stopConfigReload()
 	loadModelsCache()
@@ -4087,7 +3891,16 @@ func runServe() {
 	// 主动续期（保活）：到点刷新全部账号登录凭据，不等访问令牌临近过期
 	go keepaliveLoop()
 	go backgroundQuotaRefresher()
-	go backgroundDailyCheckin()
+	checkinCtx, stopCheckin := context.WithCancel(configCtx)
+	checkinDone := make(chan struct{})
+	go func() {
+		defer close(checkinDone)
+		backgroundDailyCheckin(checkinCtx)
+	}()
+	defer func() {
+		stopCheckin()
+		<-checkinDone
+	}()
 	if cfg.ModelsRefresh > 0 {
 		go modelsRefreshLoop(time.Duration(cfg.ModelsRefresh) * time.Minute)
 	} else {
@@ -4176,7 +3989,7 @@ func runServe() {
 			rc.DefaultPolicy, rc.MaxPrice, rc.MinBalanceGuard)
 	}
 	fmt.Printf("   模型账号名单:  %d 个模型配置了凭据文件规则（%s）\n", modelAccountRuleCount(), runtimeConfigFile)
-	fmt.Println("   配置热生效:    每 1s 扫描 config.json；端口变更需重启")
+	fmt.Println("   配置热生效:    每 1s 扫描 config.json；监听端口可热切换，已有连接和流不受影响")
 
 	// 启动时展示所有账号状态（与 status 命令一致）
 	accountMu.Lock()
@@ -4219,30 +4032,17 @@ func runServe() {
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(stopChan)
 	serveErrors := make(chan error, len(servers))
-	for i := range servers {
-		go func(i int) {
-			if err := servers[i].Serve(listeners[i]); err != nil && err != http.ErrServerClosed {
-				serveErrors <- err
-			}
-		}(i)
-	}
+	gatewayServers.start(serveErrors)
 	select {
 	case <-stopChan:
 	case err := <-serveErrors:
 		log.Printf("[服务异常] traceId=%s 原因=%v 说明=同时关闭API与管理监听，避免半可用状态", newTraceID(), err)
 	}
 	fmt.Println("\n正在关闭网关服务...")
+	stopCheckin() // Stop scheduled writes before draining the HTTP listeners.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	var shutdown sync.WaitGroup
-	for _, server := range servers {
-		shutdown.Go(func() {
-			if err := server.Shutdown(ctx); err != nil {
-				_ = server.Close()
-			}
-		})
-	}
-	shutdown.Wait()
+	gatewayServers.shutdown(ctx)
 	fmt.Println("网关已安全停止。")
 }
 

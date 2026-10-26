@@ -158,7 +158,7 @@ func handleWebUIConfigEdit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	settings := gatewaySettingsView()
-	log.Printf("[配置编辑] traceId=%s 结果=保存成功 管理Key变化=%t 管理Key清空=%t 需重启=%t 说明=后续请求使用新配置；当前监听端口及已有请求不变，原文未记录", trace, adminKeyChanged, c.Gateway.AdminKey == "", settings["restartRequired"])
+	log.Printf("[配置编辑] traceId=%s 结果=保存成功 管理Key变化=%t 管理Key清空=%t 监听未切换=%t 说明=后续请求使用完整新配置；新监听绑定成功后旧连接仍可完成，原文未记录", trace, adminKeyChanged, c.Gateway.AdminKey == "", settings["restartRequired"])
 	writeJSON(w, http.StatusOK, map[string]any{
 		"saved": true, "revision": hex.EncodeToString(runtimeAppliedHash[:]),
 		"adminKeyChanged": adminKeyChanged, "adminKeyCleared": c.Gateway.AdminKey == "",

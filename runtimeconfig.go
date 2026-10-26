@@ -225,18 +225,21 @@ func loadRuntimeConfig(path string) error {
 	return nil
 }
 
-// 调用前已完整校验。热加载不修改监听端口，不中断正在输出的流。
+// 调用前已完整校验。先准备可失败的资源，再热切换；不打断已有连接/流。
 func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 	profile, err := normalizeRequestProfile(c.Upstream.RequestProfile)
 	if err != nil {
 		return err
 	}
 	if hot {
-		if err := switchDebugLogging(c.Debug.Enabled); err != nil {
-			return err // 日志文件不可写时，整份配置仍保留上一版本。
-		}
 		g, _ := normalizeGatewayConfig(c.Gateway)
 		gatewayConfigMu.Lock()
+		if err := applyGatewayListenerPortsLocked(g, trace, func() error {
+			return switchDebugLogging(c.Debug.Enabled)
+		}); err != nil {
+			gatewayConfigMu.Unlock()
+			return err
+		}
 		gatewaySettings = g
 		setGatewayKeysLocked(g)
 		gatewayConfigMu.Unlock()
@@ -347,8 +350,8 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 		intlCheckinDedupe = *c.Checkin.Intl.Dedupe
 	}
 	if hot {
-		log.Printf("[配置热加载] traceId=%s 结果=成功 模型黑名单=%d 模型白名单=%d 账号规则=%d 调试日志=%t 日志保留天数=%d 响应头超时=%v 流空闲超时=%v 重试次数=%d 流心跳=%v 首字节重放=%t 说明=后续请求使用新配置，凭据及历史账本保留，端口变更需重启",
-			trace, len(c.Models.Blocklist), len(c.Models.Allowlist), len(c.Models.Accounts), c.Debug.Enabled, c.Logs.RetentionDays, header, idle, retries, keepalive, firstByteRetry)
+		log.Printf("[配置热加载] traceId=%s 结果=成功 模型黑名单=%d 模型白名单=%d 账号规则=%d 调试日志=%t 日志保留天数=%d 响应头超时=%v 流空闲超时=%v 重试次数=%d 流心跳=%v 首字节重放=%t 实际API端口=%d 实际Web端口=%d 说明=后续请求使用新配置，凭据及历史账本保留；监听端口已热切换",
+			trace, len(c.Models.Blocklist), len(c.Models.Allowlist), len(c.Models.Accounts), c.Debug.Enabled, c.Logs.RetentionDays, header, idle, retries, keepalive, firstByteRetry, cfg.Port, cfg.WebPort)
 	}
 	return nil
 }
