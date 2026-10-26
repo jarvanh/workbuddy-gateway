@@ -3572,7 +3572,7 @@ func renderAccountTable(accs []accountSnapshot) string {
 			plan = planDisplayLabel(a.PlanLabel, a.PlanStale)
 		}
 		if a.TokenExpiresAt > 0 {
-			expires = time.Unix(a.TokenExpiresAt, 0).Format("2006-01-02 15:04:05")
+			expires = formatDisplayTime(time.Unix(a.TokenExpiresAt, 0))
 		}
 		switch a.State {
 		case "cooldown":
