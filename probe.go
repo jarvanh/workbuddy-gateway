@@ -282,6 +282,14 @@ func probeAccountModel(ctx context.Context, acc *Account, model string) probeRes
 	}
 	result.Credit = credit
 	result.Tokens = tokens
+	// 首发复验（闭环）：受限窗口已过期的账号此刻真实成功 = 上游确实解封。
+	// 恢复通知由 clearAccountRestricted 统一发送，这里只记日志留痕。
+	accountMu.Lock()
+	expiredRestricted := !acc.RestrictedUntil.IsZero() && !acc.RestrictedUntil.After(time.Now())
+	accountMu.Unlock()
+	if expiredRestricted {
+		probeVerifyNotify(acc.Path, true, "受限窗口到期后探测请求真实成功，上游已解封")
+	}
 	clearAccountRestricted(acc, "probe 请求真实成功")
 
 	if credit > 0 {

@@ -60,11 +60,15 @@ type notifyConfig struct {
 }
 
 type notifyEvent struct {
-	Kind  string // 事件类型（用于 Events 过滤）
-	Key   string // 限流键（同 Key 在间隔内只发一次）
-	Level string
-	Title string
-	Body  string
+	Kind string // 事件类型（用于 Events 过滤）
+	Key  string // 限流键（同 Key 在间隔内只发一次）
+	// Fingerprint 非空时启用内容级去重：同 Key 且指纹未变 → 一条都不再发；
+	// 指纹变化（状态升级/解除）→ 立刻发送，不受最小间隔约束。空指纹回退
+	// 旧行为（Key + 最小间隔）。指纹里不要放时间戳，否则永远「有变化」。
+	Fingerprint string
+	Level       string
+	Title       string
+	Body        string
 	// HTML 是 Telegram 用的完整 HTML 正文（含标题/分隔线/树形条目）。
 	// 与全库通知版式同源（.github/scripts/telegram/tg_notify.sh 与
 	// docs/telegram-notify.md），故 Telegram 通道优先发它；webhook 通道仍发
@@ -78,6 +82,7 @@ var (
 	notifyCurrent notifyConfig
 	notifyCh      = make(chan notifyEvent, 128)
 	notifyLast    = map[string]time.Time{}
+	notifyLastFP  = map[string]string{}
 	notifyClient  = &http.Client{
 		Timeout:   15 * time.Second,
 		Transport: &http.Transport{Proxy: http.ProxyFromEnvironment},
@@ -142,12 +147,21 @@ func dispatchNotify(ev notifyEvent) {
 		return
 	}
 	notifyMu.Lock()
-	if last, ok := notifyLast[ev.Key]; ok &&
+	if fp := strings.TrimSpace(ev.Fingerprint); fp != "" {
+		// 内容级去重：状态没变就永远不发；变了则立刻穿透（不等最小间隔）。
+		if notifyLastFP[ev.Key] == fp {
+			notifyMu.Unlock()
+			return
+		}
+	} else if last, ok := notifyLast[ev.Key]; ok &&
 		ev.Time.Sub(last) < time.Duration(cfg.MinIntervalSeconds)*time.Second {
 		notifyMu.Unlock()
 		return
 	}
 	notifyLast[ev.Key] = ev.Time
+	if fp := strings.TrimSpace(ev.Fingerprint); fp != "" {
+		notifyLastFP[ev.Key] = fp
+	}
 	notifyMu.Unlock()
 
 	var err error

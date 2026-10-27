@@ -28,6 +28,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -107,6 +108,7 @@ func markAccountRestricted(acc *Account, msg string) time.Time {
 	now := time.Now()
 	until := now.Add(restrictedDefaultWindow)
 	accountMu.Lock()
+	priorRestricted, priorUntil := !acc.RestrictedUntil.IsZero(), acc.RestrictedUntil
 	site := accSiteLocked(acc)
 	if acc.RestrictedUntil.After(until) {
 		until = acc.RestrictedUntil // 已在受限中：保留更晚的原解除时刻
@@ -120,6 +122,11 @@ func markAccountRestricted(acc *Account, msg string) time.Time {
 
 	log.Printf("[Restricted] 账号 %s 被上游风控限制，站点=%s，解除时间=%s (提示: %s)",
 		filepath.Base(path), site, formatDisplayTime(until), truncate(msg, 200))
+	// 首发复验（闭环）：原受限窗口已过期后的第一发真实请求再次命中 = 上游未解封。
+	// 此处只记日志；下方账号级告警已按最小间隔通知，不重复推送。
+	if priorRestricted && !priorUntil.After(now) {
+		probeVerifyNotify(path, false, "受限窗口到期后首发真实请求再次命中 11140，上游未解封")
+	}
 
 	holdArmed, holdSite := recordSiteRestrictedWave(site)
 	saveRestrictedState()
@@ -142,6 +149,7 @@ func markAccountRestricted(acc *Account, msg string) time.Time {
 			Title: fmt.Sprintf("🛑 workbuddy 站点熔断：%s 短时停发（风控连坐防护）", holdSite),
 			Body: fmt.Sprintf("站点: %s\n窗口 %s 内 %d 个账号被风控限制，触发整池熔断 %s\n处理: 熔断期间该站点一个上游请求都不发；请检查是否有任务在反复重试，并尽快申诉",
 				holdSite, restrictedWaveWindow, restrictedWaveMin, restrictedHoldDuration),
+			HTML: restrictedHoldNotifyHTML(holdSite),
 		})
 	}
 	return until
@@ -200,18 +208,119 @@ func restrictedHoldSnapshot() (string, time.Time) {
 }
 
 // clearAccountRestricted 清除账号的受限标记（仅真实成功或手动确认时调用）。
+// 清除即发送「恢复」通知（restricted 事件，Key 带路径走最小间隔去重），
+// 闭环 2026-10-27 夜间事件暴露的不对称问题：命中必告警、解除静默，
+// 导致「到底解封没有」只能靠猜。
 func clearAccountRestricted(acc *Account, reason string) bool {
 	accountMu.Lock()
-	if !acc.RestrictedUntil.After(time.Now()) {
+	// 有记录就清除并通知：窗口已到期但记录仍在（真实成功=首发复验通过）同样要发
+	// 恢复通知——那正是「上游确实解封了」的关键确认信号（2026-10-28 加固）。
+	if acc.RestrictedUntil.IsZero() {
 		accountMu.Unlock()
 		return false
 	}
+	site := accSiteLocked(acc)
 	path := acc.Path
 	acc.RestrictedUntil, acc.RestrictedAt, acc.RestrictedMsg = time.Time{}, time.Time{}, ""
 	accountMu.Unlock()
 	log.Printf("[Restricted] 账号 %s 风控限制解除（%s），恢复正常调度", filepath.Base(path), reason)
 	saveRestrictedState()
+	sendNotify(notifyEvent{
+		Kind:  notifyEventRestricted,
+		Key:   "restricted_recover|" + path,
+		Level: "success",
+		// 每次解除都是独立状态事件：指纹用时刻戳，避免被内容级去重误吞。
+		Fingerprint: "recover@" + strconv.FormatInt(time.Now().Unix(), 10),
+		Title:       fmt.Sprintf("✅ workbuddy 账号解封恢复：%s", filepath.Base(path)),
+		Body: fmt.Sprintf("账号: %s\n站点: %s\n原因: %s\n账号池: %s\n处理: 该账号已恢复调度；若其余账号仍受限，会继续按各自解除时刻评估",
+			filepath.Base(path), site, truncate(reason, 200), restrictedPoolLine()),
+		HTML: restrictedRecoverNotifyHTML(path, site, reason),
+	})
 	return true
+}
+
+// restrictedRecoverNotifyHTML 解封恢复的 Telegram HTML 正文（与受限告警同版式）。
+func restrictedRecoverNotifyHTML(path, site, reason string) string {
+	var b strings.Builder
+	b.WriteString(tgTitle("✅ workbuddy 账号解封恢复"))
+	b.WriteString(tgPath("账号", filepath.Base(path)))
+	b.WriteString(tgKV("站点", site))
+	b.WriteString(tgKV("原因", truncate(reason, 200)))
+	b.WriteString(tgKV("账号池", restrictedPoolLine()))
+	if items := collectRestrictedItems(); len(items) > 0 {
+		entries := make([]string, 0, len(items))
+		for _, it := range items {
+			entries = append(entries, "<code>"+escapeHTML(it.path)+"</code> · "+
+				escapeHTML(formatDisplayTime(it.until)))
+		}
+		tgSection(&b, fmt.Sprintf("🔒 仍受限中 · %d", len(items)))
+		b.WriteString(treeLines(entries) + "\n")
+	}
+	return b.String()
+}
+
+// probeVerifyNotify 受限窗口到期后的首发复验结果（闭环通知）：
+// 未恢复 → 已由 markAccountRestricted 重新告警（此处只记日志）；
+// 已恢复 → clearAccountRestricted 已发恢复通知（此处只记日志）。
+// 本函数只做日志留痕，不重复发通知，避免同一状态双条打扰。
+func probeVerifyNotify(path string, recovered bool, detail string) {
+	if recovered {
+		log.Printf("[Restricted] 首发复验通过: 账号=%s（%s）", filepath.Base(path), truncate(detail, 120))
+		return
+	}
+	log.Printf("[Restricted] 首发复验失败: 账号=%s 仍受限（%s）", filepath.Base(path), truncate(detail, 120))
+}
+
+// restrictedHoldNotifyHTML 整池熔断告警的 Telegram HTML 正文（与其他通知同版式）。
+func restrictedHoldNotifyHTML(site string) string {
+	var b strings.Builder
+	b.WriteString(tgTitle("🛑 workbuddy 站点熔断（风控连坐防护）"))
+	b.WriteString(tgPath("站点", site))
+	_, holdUntil := restrictedHoldSnapshot()
+	if holdUntil.After(time.Now()) {
+		b.WriteString(tgKV("停发至", formatDisplayTime(holdUntil)))
+		b.WriteString(tgKV("剩余", formatCooldownRemaining(time.Now(), holdUntil)))
+	}
+	b.WriteString(tgKV("触发", fmt.Sprintf("窗口 %s 内 %d 个账号被风控限制", restrictedWaveWindow, restrictedWaveMin)))
+	b.WriteString(tgKV("账号池", restrictedPoolLine()))
+	b.WriteString(tgKV("处理", "熔断期间不发任何上游请求；解封后首发真实成功自动恢复；请尽快在官方端申诉"))
+	return b.String()
+}
+
+// setRetryAfter 在 until 在未来时设置标准 Retry-After 响应头（秒）；过期则静默。
+// 2026-10-27 夜间事件加固：标准客户端（omniroute 等）按此头退避，从源头
+// 减少无效重试风暴（此前全库 0 处）。
+func setRetryAfter(w http.ResponseWriter, until time.Time) {
+	d := time.Until(until)
+	if d <= 0 {
+		return
+	}
+	w.Header().Set("Retry-After", strconv.FormatInt(int64(d.Seconds())+1, 10))
+}
+
+// earliestRecoveryHint 当前本地状态下最早可恢复时刻（零值=无），供 Retry-After 提示：
+// 账号风控受限 / 站点熔断 / 账号冷却 / 模型冷却取最小。只统计未来时刻，过期的不拉低提示。
+func earliestRecoveryHint() time.Time {
+	now := time.Now()
+	var minT time.Time
+	consider := func(t time.Time) {
+		if t.After(now) && (minT.IsZero() || t.Before(minT)) {
+			minT = t
+		}
+	}
+	accountMu.Lock()
+	for _, acc := range accounts {
+		consider(acc.RestrictedUntil)
+		consider(acc.CooldownUntil)
+		for _, st := range acc.ModelStates {
+			consider(st.CooldownUntil)
+		}
+	}
+	accountMu.Unlock()
+	restrictedWave.Lock()
+	consider(restrictedWave.holdUntil)
+	restrictedWave.Unlock()
+	return minT
 }
 
 // restrictedPoolLine 账号池概览（含受限计数），供通知正文使用。

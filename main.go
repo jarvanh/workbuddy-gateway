@@ -1741,8 +1741,10 @@ func nextAccountForModel(model string, attempted map[*Account]bool, reqID uint64
 		}
 	}
 	msg := fmt.Sprintf("当前模型 %s 暂无可用账号：账号名单排除=%d，授权失效=%d，风控限制=%d，账号冷却=%d，模型冷却=%d，额度阻断=%d，等待探测=%d", model, policyBlocked, disabled, restricted, accountCooling, modelCooling, quotaBlocked, probeWaiting)
+	holdFlag := "none"
 	if site, holdUntil := restrictedHoldSnapshot(); site != "" && holdUntil.After(time.Now()) {
 		msg += fmt.Sprintf("；站点 %s 因风控连坐熔断，停发至 %s", site, formatDisplayTime(holdUntil))
+		holdFlag = fmt.Sprintf("%s@%d", site, holdUntil.Unix())
 	}
 	if !earliest.IsZero() {
 		msg += "，最早恢复=" + formatDisplayTime(earliest)
@@ -1760,9 +1762,12 @@ func nextAccountForModel(model string, attempted map[*Account]bool, reqID uint64
 		Kind:  notifyEventNoAccount,
 		Key:   "no_account|" + model,
 		Level: "error",
-		Title: "🚫 workbuddy 无可用账号（请求将被 503 拒绝）",
-		Body:  msg,
-		HTML:  hb.String(),
+		// 内容级去重（2026-10-28 加固）：原因构成（受限/冷却/熔断/最早恢复分钟）未变
+		// 就一条不再发；变了（故障升级/降级）立刻穿透最小间隔告警。
+		Fingerprint: fmt.Sprintf("r%d,ac%d,mc%d,qb%d,pw%d,hold=%s,earliest=%d", restricted, accountCooling, modelCooling, quotaBlocked, probeWaiting, holdFlag, earliest.Unix()/60),
+		Title:       "🚫 workbuddy 无可用账号（请求将被 503 拒绝）",
+		Body:        msg,
+		HTML:        hb.String(),
 	})
 	return nil, "", fmt.Errorf("%s", msg)
 }
@@ -4336,6 +4341,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 				"business_impact": "未调用上游模型",
 			})
 			recordModelFailure(modelName, "无可用账号")
+			setRetryAfter(w, earliestRecoveryHint())
 			writeUpstreamError(w, r, http.StatusServiceUnavailable, "no_available_account", msg)
 			return nil, nil, nil, false
 		}
@@ -4469,6 +4475,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 					msg := fmt.Sprintf("当前模型 %s 在余额耗尽账号 %s 的受控探测中触发模型级限流，本次不再探测其他耗尽账号", modelName, acc.Path)
 					recordModelFailure(modelName, modelStatusFromError(resp.StatusCode, errStr))
 					releasePendingInFlight(pendingRelease, reqID)
+					setRetryAfter(w, until)
 					writeUpstreamError(w, r, http.StatusServiceUnavailable, "model_rate_limited", msg)
 					return nil, nil, nil, false
 				}
@@ -4480,13 +4487,14 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 				// 上游风控限制（11140「账号存在异常行为」）：账号被上游处置，与限流/鉴权/内容审核
 				// 都不同，凭据本身仍有效。处置照搬社区方案（workbuddy2api-hub / magpie）：
 				// 默认命中即停——绝不把同一请求再打给其他账号（换号重试=送连坐证据，整池会被逐个打死）。
-				markAccountRestricted(acc, errStr)
+				restrictedUntil := markAccountRestricted(acc, errStr)
 				recordModelFailure(modelName, modelStatusFromError(resp.StatusCode, errStr))
 				releasePendingInFlight(pendingRelease, reqID)
 				if rotate := restricted403RotateMaxSnapshot(); rotate > 0 && len(attempted) < rotate {
 					lastRateErr = "HTTP 403 (上游风控限制): " + truncate(errStr, 200)
 					continue
 				}
+				setRetryAfter(w, restrictedUntil)
 				writeUpstreamError(w, r, http.StatusTooManyRequests, "account_restricted",
 					fmt.Sprintf("账号 %s 被上游风控限制（11140 request illegal）；请在上游官方端提交反馈申诉（SUBMIT_FEEDBACK）。凭据本身仍有效，换号/重试只会扩大封禁",
 						filepath.Base(acc.Path)))
@@ -4582,6 +4590,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 		"reason":          "all_accounts_cooldown",
 		"business_impact": "未调用上游模型",
 	})
+	setRetryAfter(w, earliestRecoveryHint())
 	writeUpstreamError(w, r, http.StatusTooManyRequests, "all_accounts_cooldown", "所有账号均处于冷却状态")
 	return nil, nil, nil, false
 }

@@ -4,8 +4,11 @@ package main
 // 对应 2026-10-26 国际站 5 账号事故：旧逻辑 60s 冷却 + 换号重试持续送连坐证据。
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -191,5 +194,84 @@ func TestPickProbeAccountSkipsRestricted(t *testing.T) {
 	accountMu.Unlock()
 	if got := pickProbeAccountForModel("cn", "m"); got != nil {
 		t.Fatalf("受限账号不应被 warmup/探测选中")
+	}
+}
+
+// 恢复通知 + 首发复验闭环：真实成功清除（含窗口已到期但记录仍在）必须发
+// restricted 恢复通知；记录清零后的重复清除不再发。
+func TestRecoverNotifyOnActualSuccess(t *testing.T) {
+	chdirTemp(t)
+	resetRestrictedTestState(t)
+	resetNotifyState()
+	ch := make(chan map[string]any, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var m map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&m)
+		ch <- m
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	setNotify(notifyConfig{Enabled: true, Type: "webhook", Webhook: srv.URL,
+		Events: []string{notifyEventRestricted}, MinIntervalSeconds: 0})
+	defer setNotify(notifyConfig{})
+
+	acc := retryAccount("a.json", "token-a")
+	setupRetryAccounts(t, acc)
+	// 窗口已到期、记录仍在：此刻真实成功=「上游确实解封」的复验信号，必须通知。
+	accountMu.Lock()
+	acc.RestrictedUntil = time.Now().Add(-time.Minute)
+	acc.RestrictedAt = time.Now().Add(-2 * time.Hour)
+	accountMu.Unlock()
+	if !clearAccountRestricted(acc, "chat 请求真实成功") {
+		t.Fatalf("到期未清的记录应在真实成功时清除并通知")
+	}
+	select {
+	case m := <-ch:
+		title, _ := m["title"].(string)
+		if !strings.Contains(title, "解封") || m["kind"] != notifyEventRestricted {
+			t.Fatalf("恢复通知字段不符: %v", m)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("恢复通知未发出")
+	}
+	if clearAccountRestricted(acc, "重复清除") {
+		t.Fatal("记录已清零时清除应返回 false")
+	}
+}
+
+// Retry-After 加固：本地拒绝的 503/429 应带退避倒计时头（标准客户端可据此退避，
+// 从源头减少无效重试风暴）。
+func TestRetryAfterHeaders(t *testing.T) {
+	chdirTemp(t)
+	resetRestrictedTestState(t)
+
+	// 场景1：唯一账号受限 → 503 no_available_account + Retry-After ≈2h
+	acc := retryAccount("a.json", "token-a")
+	setupRetryAccounts(t, acc)
+	markAccountRestricted(acc, restricted11140Body)
+	setupRetryUpstream(t, func(w http.ResponseWriter, r *http.Request) { retryWriteSSE(t, w) })
+	rec := retryPostChat(t)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("期望 503，实际 %d body=%s", rec.Code, rec.Body.String())
+	}
+	ra := rec.Header().Get("Retry-After")
+	if n, err := strconv.Atoi(ra); err != nil || n < 7000 || n > 7201 {
+		t.Fatalf("503 的 Retry-After 应≈7200s，实际 %q", ra)
+	}
+
+	// 场景2：上游直接返回 11140 → 429 account_restricted + Retry-After
+	setupRetryUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, restricted11140Body)
+	})
+	accountMu.Lock()
+	acc.RestrictedUntil, acc.RestrictedAt, acc.RestrictedMsg = time.Time{}, time.Time{}, ""
+	accountMu.Unlock()
+	rec2 := retryPostChat(t)
+	if rec2.Code != http.StatusTooManyRequests {
+		t.Fatalf("期望 429，实际 %d body=%s", rec2.Code, rec2.Body.String())
+	}
+	if rec2.Header().Get("Retry-After") == "" {
+		t.Fatal("429 account_restricted 应带 Retry-After")
 	}
 }
