@@ -297,7 +297,7 @@ workbuddy-gateway serve -models-refresh 0
 - 旅行接口固定走官方活动域名 `www.workbuddy.cn`，与对话上游不同源。
 - 账号尚未领取 Buddy（猫猫）时不自动领取（首次领取涉及官方新手任务与协议确认），日志会提示到 [官方成长中心](https://www.workbuddy.cn/profile/growth-center) 手动领取，之后即可全自动派遣。
 - 旅行中 / 今日派遣达上限时自动跳过，不做重复操作。
-- 断登自动补签用成长中心补登卡补当月零分断点：待补日期只信服务端日历（`heatmap.today` + `score==0`，已补登记录不算待办），每轮最多 1 张（官方补登卡上限 4 张，留余量给真实断登），补登请求不自动重试；无卡、日历结构异常或上游返回「无需补登」时只记日志，不影响签到与旅行结果。
+- 断登自动补签用成长中心补登卡补当月零分断点：待补日期只信服务端日历（`heatmap.today` + `score==0`，已补登记录不算待办），每轮最多 1 张（官方补登卡上限 4 张，留余量给真实断登），补登请求不自动重试；无卡、日历结构异常或上游返回「无需补登」时不出卡，本轮结论随签到通知推送（`checkin` 事件，见「事件告警」）。
 
 ---
 
@@ -799,7 +799,7 @@ workbuddy-gateway serve -auth-dir ./auths
 
 ## 事件告警（notify）
 
-网关内的**账号冷却 / 模型冷却 / 无可用账号（503）** 事件可即时推送到 Telegram 或任意 webhook（默认关闭，不影响现有行为）。
+网关内的**每日签到结果（含旅行/成长/补签摘要）、账号冷却 / 模型冷却 / 无可用账号（503）** 事件可即时推送到 Telegram 或任意 webhook（默认关闭，不影响现有行为）。
 
 ```json
 {
@@ -807,7 +807,7 @@ workbuddy-gateway serve -auth-dir ./auths
     "enabled": true,
     "type": "telegram",
     "minIntervalSeconds": 60,
-    "events": ["cooldown", "model_cooldown", "no_account"],
+    "events": ["checkin", "cooldown", "model_cooldown", "no_account"],
     "botTokenEnv": "TELEGRAM_BOT_TOKEN",
     "chatIdEnv": "TELEGRAM_CHAT_ID"
   }

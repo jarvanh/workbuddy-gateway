@@ -33,10 +33,11 @@ func TestMain(m *testing.M) {
 	// 测试内存样本写进生产 ledger（2026-10-15/16 两次污染事故根因）。
 	// routing 测试已有用例级 isolateLedgerMirror，这里兜底覆盖所有测试路径。
 	priceLedgerMirrorDir = dir
-	// 测试二进制默认关闭国内站附加自动化（成长任务/断登补签）：挂载点在
+	// 测试二进制默认关闭国内站附加自动化（旅行/成长任务/断登补签）：挂载点在
 	// 签到成功分支上，任何走到成功路径的用例都会带着合成令牌向真实上游
-	// copilot.tencent.com 发请求。需要验证开关语义的用例自行保存/恢复
-	//（acp_test.go / makeup_test.go）。
+	// copilot.tencent.com / workbuddy.cn 发请求。需要验证开关语义的用例自行保存/恢复
+	//（acp_test.go / makeup_test.go / travel_test.go）。
+	cnTravelEnabled = false
 	cnGrowthEnabled = false
 	cnMakeupEnabled = false
 	code := m.Run()

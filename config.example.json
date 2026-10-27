@@ -90,6 +90,7 @@
     "chatIdEnv": "TELEGRAM_CHAT_ID",
     "minIntervalSeconds": 60,
     "events": [
+      "checkin",
       "cooldown",
       "model_cooldown",
       "no_account"

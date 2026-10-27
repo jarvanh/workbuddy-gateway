@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -105,10 +106,10 @@ func makeupParseData(t *testing.T, envelope string) json.RawMessage {
 	return env.Data
 }
 
-func makeupRun(t *testing.T) {
+func makeupRun(t *testing.T) string {
 	t.Helper()
 	auth := &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "test-access"}, Account: StoredAccount{UID: "u1"}}
-	runMakeupCards(context.Background(), auth, &profileCN, "makeup-test.json")
+	return runMakeupCards(context.Background(), auth, &profileCN, "makeup-test.json")
 }
 
 // 正常路径：零分断点里排除已补登/上月/活动前/今天的日期，最近的断点先补，每轮 1 张。
@@ -125,10 +126,13 @@ func TestMakeupHappyPath(t *testing.T) {
 	fake.useBody = `{"code":0,"msg":"OK","data":{"makeup_cards":{"balance":1}}}`
 	fake.install(t)
 
-	makeupRun(t)
+	sum := makeupRun(t)
 
 	if fake.useHits != 1 {
 		t.Fatalf("每轮最多补 1 张，实际 use 调用 %d 次", fake.useHits)
+	}
+	if !strings.Contains(sum, "补登 2026-10-10 成功") {
+		t.Fatalf("摘要应包含补登成功结论: %q", sum)
 	}
 	if len(fake.useDates) != 1 || fake.useDates[0] != "2026-10-10" {
 		t.Fatalf("应补最近断点 2026-10-10，实际 %v", fake.useDates)
@@ -221,10 +225,13 @@ func TestMakeupBenignConflict(t *testing.T) {
 	fake.useBody = `{"code":400,"msg":"date is not broken, no makeup needed"}`
 	fake.install(t)
 
-	makeupRun(t)
+	sum := makeupRun(t)
 
 	if fake.useHits != 1 {
 		t.Fatalf("良性竞争应有且仅有一次提交，实际 %d", fake.useHits)
+	}
+	if !strings.Contains(sum, "无需再次补签") {
+		t.Fatalf("摘要应包含良性竞争结论: %q", sum)
 	}
 }
 

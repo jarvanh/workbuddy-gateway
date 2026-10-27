@@ -35,6 +35,9 @@ const (
 	// notifyEventProbe 模型价格探测的结果汇总（默认关闭，probe.schedule.notify 开启）。
 	// 探测是周期性任务（收敛前 2 分钟一轮），故按「每天一条」汇总推送，不逐轮打扰。
 	notifyEventProbe = "probe"
+	// notifyEventCheckin 每日签到结果（每账号每次尝试一条，含旅行/成长/补签跟进摘要）：
+	// 成功/已签/失败都推，结果直接进通知，免去人工翻日志核对。
+	notifyEventCheckin = "checkin"
 )
 
 // notifyConfig 告警配置（config.json 的 notify 段）。

@@ -229,57 +229,60 @@ func makeupQueryOK(env growthEnvelope, status int, err error) bool {
 // 主流程
 // -----------------------------------------------------------------------------
 
-// runMakeupCards 为单个国内站账号执行断登自动补签。结果只记日志；
-// 由签到成功后的国内站附加动作调用，调用方需已持有该账号的凭据快照。
-func runMakeupCards(ctx context.Context, auth *StoredAuth, prof *upstreamProfile, path string) {
+// runMakeupCards 为单个国内站账号执行断登自动补签。过程记日志并返回一行最终摘要
+// （供签到通知整合推送）；由签到成功后的国内站附加动作调用，调用方需已持有该账号的凭据快照。
+func runMakeupCards(ctx context.Context, auth *StoredAuth, prof *upstreamProfile, path string) string {
 	ctx, cancel := context.WithTimeout(ctx, makeupTimeout)
 	defer cancel()
-	add := func(format string, args ...any) {
-		log.Printf("[Makeup] 账号 %s %s", path, fmt.Sprintf(format, args...))
+	// say 同时记日志并更新摘要：摘要取本轮补签的最终结论，随签到通知推送。
+	sum := ""
+	say := func(format string, args ...any) {
+		sum = fmt.Sprintf(format, args...)
+		log.Printf("[Makeup] 账号 %s %s", path, sum)
 	}
 
 	// 1. 查连登状态：拿卡余额与已补登记录。
 	env, status, err := growthRequest(ctx, http.MethodGet, prof.Base+makeupStreakPath,
 		growthHeaders(prof, auth), nil)
 	if !makeupQueryOK(env, status, err) {
-		add("查连登状态失败，本轮不补签: %s", makeupDescribe(status, err, env))
-		return
+		say("查连登状态失败，本轮不补签: %s", makeupDescribe(status, err, env))
+		return sum
 	}
 	var streak makeupStreakData
 	if err := json.Unmarshal(env.Data, &streak); err != nil {
-		add("连登状态结构异常，本轮不补签: %v", err)
-		return
+		say("连登状态结构异常，本轮不补签: %v", err)
+		return sum
 	}
 	cards, err := makeupCardBalance(streak.MakeupCards)
 	if err != nil {
-		add("%v，本轮不补签", err)
-		return
+		say("%v，本轮不补签", err)
+		return sum
 	}
 	if cards <= 0 {
-		add("无补登卡，跳过")
-		return
+		say("无补登卡，跳过")
+		return sum
 	}
 
 	// 2. 有卡才查日历，从 heatmap 选断点。
 	henv, hstatus, herr := growthRequest(ctx, http.MethodGet, prof.Base+makeupHeatmapPath,
 		growthHeaders(prof, auth), nil)
 	if !makeupQueryOK(henv, hstatus, herr) {
-		add("查补登日历失败，本轮不补签（不消耗卡）: %s", makeupDescribe(hstatus, herr, henv))
-		return
+		say("查补登日历失败，本轮不补签（不消耗卡）: %s", makeupDescribe(hstatus, herr, henv))
+		return sum
 	}
 	var heat makeupHeatmapData
 	if err := json.Unmarshal(henv.Data, &heat); err != nil {
-		add("补登日历结构异常，本轮不补签（不消耗卡）: %v", err)
-		return
+		say("补登日历结构异常，本轮不补签（不消耗卡）: %v", err)
+		return sum
 	}
 	dates, err := makeupCandidates(streak, heat)
 	if err != nil {
-		add("%v，本轮不补签（不消耗卡）", err)
-		return
+		say("%v，本轮不补签（不消耗卡）", err)
+		return sum
 	}
 	if len(dates) == 0 {
-		add("无断登日期需要补签（卡余额 %d）", cards)
-		return
+		say("无断登日期需要补签（卡余额 %d）", cards)
+		return sum
 	}
 
 	// 3. 补登：每轮最多 1 张卡；写失败即停，不重试不换日期。
@@ -309,7 +312,7 @@ func runMakeupCards(ctx context.Context, auth *StoredAuth, prof *upstreamProfile
 					remaining = left
 				}
 			}
-			add("补登 %s 成功（剩 %d 张卡）", d, remaining)
+			say("补登 %s 成功（剩 %d 张卡）", d, remaining)
 			continue
 		}
 		detail := strings.TrimSpace(uenv.Msg)
@@ -317,13 +320,16 @@ func runMakeupCards(ctx context.Context, auth *StoredAuth, prof *upstreamProfile
 			detail = uerr.Error()
 		}
 		if ustatus == http.StatusBadRequest && strings.Contains(strings.ToLower(detail), makeupBenignMark) {
-			add("%s 已活跃或已被补登，无需再次补签", d)
-			return
+			say("%s 已活跃或已被补登，无需再次补签", d)
+			return sum
 		}
-		add("补登 %s 失败: %s", d, makeupDescribe(ustatus, uerr, uenv))
-		return
+		say("补登 %s 失败: %s", d, makeupDescribe(ustatus, uerr, uenv))
+		return sum
 	}
 	if successes > 0 && len(dates) > successes && remaining > 0 {
-		add("另有 %d 天可补、剩 %d 张卡，下轮继续", len(dates)-successes, remaining)
+		extra := fmt.Sprintf("另有 %d 天可补、剩 %d 张卡，下轮继续", len(dates)-successes, remaining)
+		log.Printf("[Makeup] 账号 %s %s", path, extra)
+		sum += "；" + extra
 	}
+	return sum
 }

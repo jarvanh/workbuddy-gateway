@@ -747,6 +747,8 @@ func checkinAccountWithTrace(ctx context.Context, acc *Account, trace string) (s
 		}
 	}
 	// 国内站签到成功后派 Buddy 旅行、跑成长任务；独立于签到结果，失败不影响返回值。
+	// 各步结论收进 follow，随签到结果一起推送，不再需要人工翻日志核对。
+	var follow []string
 	if result == "ok" || result == "already" {
 		if cnTravelEnabled {
 			acc.lock.Lock()
@@ -755,8 +757,12 @@ func checkinAccountWithTrace(ctx context.Context, acc *Account, trace string) (s
 			switch {
 			case travelErr != nil:
 				log.Printf("[Travel] 账号 %s Buddy 旅行失败: %v", path, travelErr)
+				follow = append(follow, "旅行失败："+travelErr.Error())
 			case travelResult == "ok":
 				log.Printf("[Travel] 账号 %s Buddy 旅行流程完成", path)
+				follow = append(follow, "旅行：已派遣新地点")
+			case travelResult == "skipped":
+				follow = append(follow, "旅行：本轮无需派遣（进行中/已达上限/未领取）")
 			}
 		}
 		if cnGrowthEnabled {
@@ -765,15 +771,74 @@ func checkinAccountWithTrace(ctx context.Context, acc *Account, trace string) (s
 			gcancel()
 			if gr.EarnedCredit > 0 {
 				log.Printf("[Growth] 账号 %s 成长任务累计到账 +%d 积分", path, gr.EarnedCredit)
+				follow = append(follow, fmt.Sprintf("成长任务：到账 +%d 积分", gr.EarnedCredit))
 			}
 		}
 		if cnMakeupEnabled {
 			mctx, mcancel := context.WithTimeout(context.Background(), makeupTimeout)
-			runMakeupCards(mctx, &auth, &prof, path)
+			if sum := runMakeupCards(mctx, &auth, &prof, path); sum != "" {
+				follow = append(follow, "补签："+sum)
+			}
 			mcancel()
 		}
 	}
+	sendCheckinNotify("国内站", path, trace, result, resultErr, follow)
 	return result, resultErr
+}
+
+// sendCheckinNotify 推送单账号每日签到结果（notify.events 订阅 "checkin" 才发送）。
+// follow 是签到后附加动作（旅行/成长/补签）的结论行，直接进通知正文；
+// skipped/global_skipped/enterprise_skipped 未发起上游请求，不打扰。
+// Key 用 traceId（每次尝试唯一），失败重试的结果不会被限流窗口吞并。
+func sendCheckinNotify(site, path, trace, result string, resultErr error, follow []string) {
+	name := shortAccountName(path)
+	title, level := "", "info"
+	resultText := "今日已签"
+	reason := ""
+	switch result {
+	case "ok":
+		title, resultText = "✅ 每日签到成功（"+site+"）· "+name, "签到成功"
+	case "already":
+		title = "✅ 每日签到：今日已签（" + site + "）· " + name
+	case "failed":
+		title, level, resultText = "⚠️ 每日签到失败（"+site+"）· "+name, "warn", "签到失败"
+		reason = safeCheckinFailure(resultErr)
+		if resultErr != nil && reason == "签到请求失败；详见对应 TraceID 日志" {
+			reason = resultErr.Error()
+		}
+	default:
+		return
+	}
+	lines := []string{"结果：" + resultText}
+	if reason != "" {
+		lines = append(lines, "原因："+reason)
+	}
+	lines = append(lines, follow...)
+	var sb strings.Builder
+	sb.WriteString(tgTitle(title))
+	sb.WriteString(tgKV("账号", name))
+	if reason != "" {
+		sb.WriteString(tgKV("原因", reason))
+	} else {
+		sb.WriteString(tgKV("结果", resultText))
+	}
+	if level == "warn" {
+		// 失败时正文里说「详见 TraceID 日志」，必须同时给出这个 ID。
+		lines = append(lines, "TraceID："+trace)
+		sb.WriteString(tgPath("TraceID", trace))
+	}
+	if len(follow) > 0 {
+		tgSection(&sb, "签到后跟进")
+		sb.WriteString(treeLines(follow) + "\n")
+	}
+	sendNotify(notifyEvent{
+		Kind:  notifyEventCheckin,
+		Key:   "checkin|" + trace,
+		Level: level,
+		Title: title,
+		Body:  strings.Join(lines, "\n"),
+		HTML:  sb.String(),
+	})
 }
 
 func checkinIntlWithTrace(ctx context.Context, auth *StoredAuth, prof *upstreamProfile, path, targetKey, trace string) (string, error) {
@@ -791,8 +856,10 @@ func checkinIntlWithTrace(ctx context.Context, auth *StoredAuth, prof *upstreamP
 	if turn.OK {
 		markIntlCheckinDone(path)
 		log.Printf("[每日签到] traceId=%s 阶段=国际站活跃 结果=成功 输出=%d段/%d次更新 耗时=%dms", trace, turn.Chunks, turn.Updates, turn.ElapsedMS)
+		sendCheckinNotify("国际站", path, trace, "ok", nil, nil)
 		return "ok", nil
 	}
 	log.Printf("[每日签到] traceId=%s 阶段=国际站活跃 结果=失败 原因=%s", trace, turn.Error)
+	sendCheckinNotify("国际站", path, trace, "failed", errors.New(turn.Error), nil)
 	return "failed", errors.New(turn.Error)
 }
