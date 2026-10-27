@@ -681,12 +681,12 @@ systemctl restart workbuddy-gateway
 
 ```bash
 workbuddy-gateway restricted                     # 查看受限账号与站点熔断状态
-workbuddy-gateway restricted --clear all         # 申诉通过后手动解除（或指定凭据文件名）
+workbuddy-gateway restricted clear all          # 申诉通过后手动解除（或指定凭据文件名）
 curl -H "Authorization: Bearer <apiKey>" http://127.0.0.1:8318/admin/restricted                    # 管理接口查看
 curl -X POST -H "Authorization: Bearer <apiKey>" -d '{"clear":"all"}' http://127.0.0.1:8318/admin/restricted
 ```
 
-> 误用 `--clear` 只会提前把受限账号放回池子；解除的正道是官方申诉通过后让网关真实成功一次。
+> 误用 `clear` 只会提前把受限账号放回池子；解除的正道是官方申诉通过后让网关真实成功一次。
 
 ---
 

@@ -17,7 +17,7 @@ package main
 //      Token 续期都不会把受限账号放回池子；只有真实成功一次（chat/probe 200）才清除。
 //   4. 整池熔断：同站点 15 分钟内 ≥2 个账号被限 → 该站点停发 30 分钟，期间一个上游请求都不发。
 //   5. 后台任务（warmup/探测/保活/签到）跳过受限账号与熔断站点；
-//      解除靠「真实成功一次」或 `restricted --clear` / 管理接口手动确认，绝不自动探测。
+//      解除靠「真实成功一次」或 `restricted clear` / 管理接口手动确认，绝不自动探测。
 
 import (
 	"encoding/json"
@@ -379,10 +379,12 @@ func restrictedAccountNames() []string {
 	return out
 }
 
-// runRestricted CLI 入口：restricted [list] / restricted --clear <文件名|all>。
+// runRestricted CLI 入口：restricted [list] / restricted clear <文件名|all>。
 // 手动解除仅用于「已在官方端申诉通过」的场景；误用只会提前把受限账号放回池子。
 func runRestricted(args []string) {
-	if len(args) > 0 && args[0] == "--clear" {
+	if len(args) > 0 && args[0] == "clear" {
+		// 子命令风格（与 warmup on|off 同）：main() 的 flag.Parse 遇到未知旗标
+		// 会直接退出，所以不能用 --clear 这种旗标形式。
 		target := "all"
 		if len(args) > 1 {
 			target = strings.TrimSpace(args[1])
@@ -416,7 +418,7 @@ func runRestricted(args []string) {
 		fmt.Println("当前没有账号处于上游风控限制（11140）中。")
 		return
 	}
-	fmt.Printf("当前受限账号 %d 个（解除途径：官方申诉 → 真实成功一次自动恢复；或 restricted --clear 手动确认）:\n", len(items))
+	fmt.Printf("当前受限账号 %d 个（解除途径：官方申诉 → 真实成功一次自动恢复；或 restricted clear 手动确认）:\n", len(items))
 	for _, it := range items {
 		fmt.Printf("  %s · 解除 %s\n", it.path, formatDisplayTime(it.until))
 	}

@@ -900,7 +900,7 @@ func printHelp() {
   probe       主动探测账号对指定模型的免费/收费属性（需 serve 正在运行）
   warmup      5 小时窗口主动触发：开关 / 时刻 / 价格上限 / 指定模型（需 serve 正在运行）
   reset       清空除登录凭据外的全部本地数据（状态/缓存/日志/失效标记），并重新拉取模型与倍率
-  restricted  查看/解除上游风控限制（11140）账号：restricted [list] | restricted --clear <文件名|all>
+  restricted  查看/解除上游风控限制（11140）账号：restricted [list] | restricted clear <文件名|all>
   version     查看版本信息
   help        查看帮助说明
 
@@ -3279,7 +3279,7 @@ func formatAccountStatus(acc *Account, idx int, now time.Time) string {
 		sb.WriteString("账号状态:     上游风控限制（11140，禁止调度）\n")
 		sb.WriteString(fmt.Sprintf("解除时间:     %s\n", formatDisplayTime(acc.RestrictedUntil)))
 		sb.WriteString(fmt.Sprintf("限制原因:     %s\n", truncate(acc.RestrictedMsg, 200)))
-		sb.WriteString("处理建议:     在上游官方端提交反馈申诉（SUBMIT_FEEDBACK）；解除途径=申诉通过后真实成功一次，或 restricted --clear 手动确认\n")
+		sb.WriteString("处理建议:     在上游官方端提交反馈申诉（SUBMIT_FEEDBACK）；解除途径=申诉通过后真实成功一次，或 restricted clear 手动确认\n")
 		return sb.String()
 	}
 
