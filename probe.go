@@ -95,7 +95,7 @@ func handleAdminProbe(w http.ResponseWriter, r *http.Request) {
 
 	targets := make([]*Account, 0, len(candidates))
 	for _, acc := range candidates {
-		if acc.Disabled {
+		if acc.Disabled || accountRestrictedLocked(acc) {
 			continue
 		}
 		if req.Auth != "" && !probeAuthMatches(acc, req.Auth) {
@@ -246,6 +246,10 @@ func probeAccountModel(ctx context.Context, acc *Account, model string) probeRes
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		errStr := string(errBody)
 		switch {
+		case isRestrictedAccount(resp.StatusCode, errStr):
+			markAccountRestricted(acc, errStr)
+			result.Status = "restricted"
+			result.Detail = "上游风控限制（11140），账号停止调度；请在官方端提交反馈申诉"
 		case isQuotaExhausted(resp.StatusCode, errStr):
 			markModelQuotaBlocked(acc, model, errStr)
 			result.Status = "quota"
@@ -278,6 +282,7 @@ func probeAccountModel(ctx context.Context, acc *Account, model string) probeRes
 	}
 	result.Credit = credit
 	result.Tokens = tokens
+	clearAccountRestricted(acc, "probe 请求真实成功")
 
 	if credit > 0 {
 		observeModelCredit(acc, model, usage, 0)

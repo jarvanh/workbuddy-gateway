@@ -969,11 +969,11 @@
   }
 
   var STATE_TEXT = {
-    active: "可用", cooldown: "冷却", paid_exhausted: "付费耗尽",
+    active: "可用", cooldown: "冷却", restricted: "风控限制", paid_exhausted: "付费耗尽",
     quota_exhausted: "付费耗尽", expired: "已过期", disabled: "失效"
   };
   var STATE_CLASS = {
-    active: "ok", cooldown: "warn", paid_exhausted: "warn",
+    active: "ok", cooldown: "warn", restricted: "danger", paid_exhausted: "warn",
     quota_exhausted: "warn", expired: "warn", disabled: "danger"
   };
 

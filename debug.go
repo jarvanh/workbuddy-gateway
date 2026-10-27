@@ -100,6 +100,9 @@ type runtimeFileConfig struct {
 		// EnableFirstByteRetry：是否允许首字节前对瞬时网络中断安全重放一次。
 		// 指针区分「未配置」（默认开启）与显式 false（关闭）。
 		EnableFirstByteRetry *bool `json:"enableFirstByteRetry"`
+		// Restricted403RotateMax：命中上游风控限制（11140）后允许换号重试的最大次数。
+		// 0（默认）= 命中即停：绝不把同一请求再打给其他账号，避免连坐扩大封禁。
+		Restricted403RotateMax *int `json:"restricted403RotateMax"`
 	} `json:"upstream"`
 	// Models 段可选，用于按模型名做黑白名单控制（大小写不敏感）。
 	Models struct {

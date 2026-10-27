@@ -32,6 +32,7 @@
 - [probe](#probe)
 - [warmup（5 小时窗口主动触发）](#warmup5-小时窗口主动触发)
 - [reset](#reset)
+- [restricted（上游风控限制处置）](#restricted上游风控限制处置)
 - [version / help](#version--help)
 - [多账号池](#多账号池)
 - [模型列表与倍率](#模型列表与倍率)
@@ -663,6 +664,29 @@ workbuddy-gateway reset
 ```bash
 systemctl restart workbuddy-gateway
 ```
+
+---
+
+## restricted（上游风控限制处置）
+
+上游 403 `{"code":11140,"msg":"request illegal"}`（「账号存在异常行为，已被限制使用」）是**账号级风控限制**：与 429/6004 频率限制、14018 额度耗尽、12153 凭据失效都不同——凭据仍然有效（额度/套餐等只读接口正常），仅模型请求被策略拒绝，官方解除途径是提交反馈申诉（SUBMIT_FEEDBACK）。
+
+网关处置（照搬 workbuddy2api-hub / magpie 的社区方案，2026-10-26 国际站 5 账号事故后移植）：
+
+1. **独立分类**：`restricted` 状态独立于冷却/失效，告警（notify 事件 `restricted`）与控制台明确写「需申诉」，不再误报为「频率限制」。
+2. **命中即停**：默认（`upstream.restricted403RotateMax: 0`）第一个账号命中后立即停止本请求返回 429 + 申诉指引，绝不换号重试——换号重试会成批送出连坐证据（社区实测一个任务打死整池账号）。
+3. **持久化**（默认 2 小时）：`wb-restricted-state.json` 记录受限账号与站点熔断；重启、凭据热加载、Token 续期都不会把受限账号放回池子；只有**真实成功一次**（chat/probe 返回 200）才自动解除。
+4. **整池熔断**：同站点 15 分钟内 ≥2 个账号被限 → 该站点停发 30 分钟，期间一个上游请求都不发，选号层（含免费/预算轮）直接跳过。
+5. **后台任务跳过**：warmup / 价格探测 / 续期保活 / 每日签到跳过受限账号与熔断站点；warmup 命中后保留 pending（解封后自动恢复），不做自动探测。
+
+```bash
+workbuddy-gateway restricted                     # 查看受限账号与站点熔断状态
+workbuddy-gateway restricted --clear all         # 申诉通过后手动解除（或指定凭据文件名）
+curl -H "Authorization: Bearer <apiKey>" http://127.0.0.1:8318/admin/restricted                    # 管理接口查看
+curl -X POST -H "Authorization: Bearer <apiKey>" -d '{"clear":"all"}' http://127.0.0.1:8318/admin/restricted
+```
+
+> 误用 `--clear` 只会提前把受限账号放回池子；解除的正道是官方申诉通过后让网关真实成功一次。
 
 ---
 

@@ -126,7 +126,7 @@ func checkinTargetLocked(acc *Account) checkinTarget {
 	profileKey := acc.Profile().Key
 	supported := strings.TrimSpace(enterprise) == "" && (profileKey == profileCN.Key || profileKey == "intl")
 	return checkinTarget{key: hex.EncodeToString(digest[:]), account: acc, supported: supported,
-		eligible: supported && !acc.Disabled && acc.Auth != nil && acc.Auth.Auth.AccessToken != ""}
+		eligible: supported && !acc.Disabled && !acc.RestrictedUntil.After(time.Now()) && acc.Auth != nil && acc.Auth.Auth.AccessToken != ""}
 }
 
 func currentCheckinTargets() []checkinTarget {

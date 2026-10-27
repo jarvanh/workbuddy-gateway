@@ -11,6 +11,8 @@ wb-models-cache.json.tmp
 config.json
 stats.json
 checkin-state.json
+wb-restricted-state.json
+wb-restricted-state.json.tmp
 .checkin-state-*.tmp
 .env
 .env.*

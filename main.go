@@ -232,6 +232,11 @@ var (
 	streamKeepalive = streamKeepaliveDefault
 	// enableFirstByteRetry 为生效的首字节前重放开关。
 	enableFirstByteRetry = enableFirstByteRetryDefault
+
+	// restricted403RotateMax 为生效的「命中上游风控限制（11140）后允许换号重试的最大次数」。
+	// 0（默认）= 命中即停：绝不把同一请求再打给其他账号。社区实测（workbuddy2api-hub #422）：
+	// 换号重试会成批送出连坐证据，一个任务就能把整池账号逐个打死。
+	restricted403RotateMax = 0
 )
 
 // isTransientNetworkError 判断错误是否为「瞬时网络故障」，这类错误值得重试。
@@ -603,30 +608,33 @@ type Config struct {
 
 // Account 表示一个 CodeBuddy 账号凭据及其运行时状态。
 type Account struct {
-	Path           string                        // 凭据文件路径
-	Auth           *StoredAuth                   // 凭据内容（失效标记恢复时可能为 nil）
-	CooldownUntil  time.Time                     // 冷却截止时间（429 频率限制后自动屏蔽到该时间）
-	CooldownMsg    string                        // 触发冷却的原因/上游提示
-	Disabled       bool                          // 授权失效（token 过期且无法刷新/已撤销）：禁止调度
-	DisabledReason string                        // 失效原因，用于控制台展示
-	Nickname       string                        // 失效标记持久化字段：昵称（Auth 为 nil 时使用）
-	UID            string                        // 失效标记持久化字段：UID
-	Edition        string                        // 站点标识（cn/intl）：失效标记恢复时 Auth 为 nil 也可见
-	QuotaTotal     float64                       // 最近一次额度查询返回的周期总额度
-	QuotaUsed      float64                       // 最近一次额度查询返回的已用额度
-	QuotaRemaining float64                       // 最近一次额度查询返回的剩余额度
-	IsPaidUser     bool                          // 是否为付费用户（上游 IsPaidUser 原值）
-	PlanLabel      string                        // 官方套餐名称或已知套餐短名称
-	PlanCheckedAt  int64                         // 最近成功校验权益的时间；旧快照为0
-	PlanStale      bool                          // 最近查询失败，展示时标记旧结果
-	QuotaKnown     bool                          // 是否已成功获取过额度
-	QuotaExhausted bool                          // 已确认额度为 0；额度扫描发现恢复后自动解除
-	QuotaUnlimited bool                          // 企业版 limitNum=-1：分配额度不限，禁止按 0 余额阻断
-	ModelStates    map[string]*modelRuntimeState // 按模型隔离的成本、限流和额度阻断状态
-	inFlight       map[uint64]inFlightReserve    // 在途预留：reqID → 预留 credit（运行时，不入盘）
-	reqWindow      map[uint64]bool               // 派发时窗口状态：reqID → 是否窗口内发出（记账分域依据，运行时，不入盘）
-	fingerprint    string                        // 凭据文件变更指纹（mtime+size，凭据热加载用）
-	lock           sync.RWMutex                  // 凭据维护写锁；模型发送共享读锁，并发数由 concurrent 控制
+	Path            string                        // 凭据文件路径
+	Auth            *StoredAuth                   // 凭据内容（失效标记恢复时可能为 nil）
+	CooldownUntil   time.Time                     // 冷却截止时间（429 频率限制后自动屏蔽到该时间）
+	CooldownMsg     string                        // 触发冷却的原因/上游提示
+	RestrictedUntil time.Time                     // 上游风控限制（11140）解除时间；只有真实成功一次才清除
+	RestrictedAt    time.Time                     // 首次命中风控限制的时刻
+	RestrictedMsg   string                        // 命中时的上游提示（截断落盘）
+	Disabled        bool                          // 授权失效（token 过期且无法刷新/已撤销）：禁止调度
+	DisabledReason  string                        // 失效原因，用于控制台展示
+	Nickname        string                        // 失效标记持久化字段：昵称（Auth 为 nil 时使用）
+	UID             string                        // 失效标记持久化字段：UID
+	Edition         string                        // 站点标识（cn/intl）：失效标记恢复时 Auth 为 nil 也可见
+	QuotaTotal      float64                       // 最近一次额度查询返回的周期总额度
+	QuotaUsed       float64                       // 最近一次额度查询返回的已用额度
+	QuotaRemaining  float64                       // 最近一次额度查询返回的剩余额度
+	IsPaidUser      bool                          // 是否为付费用户（上游 IsPaidUser 原值）
+	PlanLabel       string                        // 官方套餐名称或已知套餐短名称
+	PlanCheckedAt   int64                         // 最近成功校验权益的时间；旧快照为0
+	PlanStale       bool                          // 最近查询失败，展示时标记旧结果
+	QuotaKnown      bool                          // 是否已成功获取过额度
+	QuotaExhausted  bool                          // 已确认额度为 0；额度扫描发现恢复后自动解除
+	QuotaUnlimited  bool                          // 企业版 limitNum=-1：分配额度不限，禁止按 0 余额阻断
+	ModelStates     map[string]*modelRuntimeState // 按模型隔离的成本、限流和额度阻断状态
+	inFlight        map[uint64]inFlightReserve    // 在途预留：reqID → 预留 credit（运行时，不入盘）
+	reqWindow       map[uint64]bool               // 派发时窗口状态：reqID → 是否窗口内发出（记账分域依据，运行时，不入盘）
+	fingerprint     string                        // 凭据文件变更指纹（mtime+size，凭据热加载用）
+	lock            sync.RWMutex                  // 凭据维护写锁；模型发送共享读锁，并发数由 concurrent 控制
 	// 续期失败计数（仅内存，重启清零）：单次失败可能是上游抖动，连续失败才判定登录态失效。
 	RefreshFailCount int
 	LastRefreshError string
@@ -841,6 +849,8 @@ func main() {
 		runWarmup()
 	case "reset":
 		runReset()
+	case "restricted":
+		runRestricted(args)
 	case "version", "-v", "--version":
 		fmt.Printf("WorkBuddy Local Gateway v%s\n", version)
 	default:
@@ -890,6 +900,7 @@ func printHelp() {
   probe       主动探测账号对指定模型的免费/收费属性（需 serve 正在运行）
   warmup      5 小时窗口主动触发：开关 / 时刻 / 价格上限 / 指定模型（需 serve 正在运行）
   reset       清空除登录凭据外的全部本地数据（状态/缓存/日志/失效标记），并重新拉取模型与倍率
+  restricted  查看/解除上游风控限制（11140）账号：restricted [list] | restricted --clear <文件名|all>
   version     查看版本信息
   help        查看帮助说明
 
@@ -1283,6 +1294,14 @@ func restoreAccountRuntimeStateLocked() {
 		acc.QuotaKnown = state.QuotaKnown
 		acc.QuotaUnlimited = state.QuotaUnlimited
 		acc.QuotaExhausted = state.QuotaExhausted && !state.QuotaUnlimited
+		// 风控限制（11140）恢复：解封时刻已过则忽略，未过则继续屏蔽（重启不提前放行）。
+		if state.RestrictedUntil > 0 {
+			if until := timeFromUnix(state.RestrictedUntil); until.After(time.Now()) {
+				acc.RestrictedUntil = until
+				acc.RestrictedAt = timeFromUnix(state.RestrictedAt)
+				acc.RestrictedMsg = state.RestrictedMsg
+			}
+		}
 		if len(state.ModelStates) == 0 {
 			continue
 		}
@@ -1435,6 +1454,7 @@ func reloadAccountsResult() (bool, error) {
 		existing.DisabledReason = ""
 		existing.CooldownUntil = time.Time{}
 		existing.CooldownMsg = ""
+		// 风控限制（11140）不因凭据更新而清除：解封只能由真实成功一次或手动确认触发。
 		existing.QuotaKnown = false
 		existing.QuotaExhausted = false
 		existing.QuotaUnlimited = false
@@ -1524,6 +1544,10 @@ func modelStateLocked(acc *Account, model string) *modelRuntimeState {
 
 func usableForModelLocked(acc *Account, model string, now time.Time) (accountSelectionKind, bool) {
 	if acc.Disabled || acc.CooldownUntil.After(now) {
+		return "", false
+	}
+	// 上游风控限制（11140）中的账号不参与任何调度；解封依赖真实成功一次或手动确认。
+	if acc.RestrictedUntil.After(now) {
 		return "", false
 	}
 	model = normalizeModelName(model)
@@ -1616,6 +1640,10 @@ func nextAccountForModel(model string, attempted map[*Account]bool, reqID uint64
 				if st := routingStates[accSiteLocked(acc)]; st == siteForbidden {
 					continue
 				}
+				// 风控连坐熔断中的站点一个上游请求都不发（含免费/预算轮）。
+				if siteRestrictedHold(accSiteLocked(acc)) {
+					continue
+				}
 				kind, ok := usableForModelLocked(acc, model, now)
 				if !ok || kind != wanted {
 					continue
@@ -1672,7 +1700,7 @@ func nextAccountForModel(model string, attempted map[*Account]bool, reqID uint64
 		return acc, kind, nil
 	}
 
-	disabled, accountCooling, modelCooling, quotaBlocked, probeWaiting, policyBlocked := 0, 0, 0, 0, 0, 0
+	disabled, accountCooling, restricted, modelCooling, quotaBlocked, probeWaiting, policyBlocked := 0, 0, 0, 0, 0, 0, 0
 	earliest := time.Time{}
 	for _, acc := range accounts {
 		if ok, _ := modelAccountAllowed(model, acc, accounts); !ok {
@@ -1682,6 +1710,11 @@ func nextAccountForModel(model string, attempted map[*Account]bool, reqID uint64
 		switch {
 		case acc.Disabled:
 			disabled++
+		case acc.RestrictedUntil.After(now):
+			restricted++
+			if earliest.IsZero() || acc.RestrictedUntil.Before(earliest) {
+				earliest = acc.RestrictedUntil
+			}
 		case acc.CooldownUntil.After(now):
 			accountCooling++
 			if earliest.IsZero() || acc.CooldownUntil.Before(earliest) {
@@ -1707,7 +1740,10 @@ func nextAccountForModel(model string, attempted map[*Account]bool, reqID uint64
 			}
 		}
 	}
-	msg := fmt.Sprintf("当前模型 %s 暂无可用账号：账号名单排除=%d，授权失效=%d，账号冷却=%d，模型冷却=%d，额度阻断=%d，等待探测=%d", model, policyBlocked, disabled, accountCooling, modelCooling, quotaBlocked, probeWaiting)
+	msg := fmt.Sprintf("当前模型 %s 暂无可用账号：账号名单排除=%d，授权失效=%d，风控限制=%d，账号冷却=%d，模型冷却=%d，额度阻断=%d，等待探测=%d", model, policyBlocked, disabled, restricted, accountCooling, modelCooling, quotaBlocked, probeWaiting)
+	if site, holdUntil := restrictedHoldSnapshot(); site != "" && holdUntil.After(time.Now()) {
+		msg += fmt.Sprintf("；站点 %s 因风控连坐熔断，停发至 %s", site, formatDisplayTime(holdUntil))
+	}
 	if !earliest.IsZero() {
 		msg += "，最早恢复=" + formatDisplayTime(earliest)
 	}
@@ -1874,11 +1910,13 @@ func cooldownItemMeta(it cooldownEntry, now time.Time) string {
 // （单模型冷却不影响该账号承载别的模型，故仍计入可用）。
 func cooldownPoolLine(now time.Time) string {
 	accountMu.Lock()
-	var avail, cooling, disabled int
+	var avail, cooling, restricted, disabled int
 	for _, acc := range accounts {
 		switch {
 		case acc.Disabled:
 			disabled++
+		case acc.RestrictedUntil.After(now):
+			restricted++
 		case acc.CooldownUntil.After(now):
 			cooling++
 		default:
@@ -1887,7 +1925,7 @@ func cooldownPoolLine(now time.Time) string {
 	}
 	total := len(accounts)
 	accountMu.Unlock()
-	return fmt.Sprintf("可用 %d · 冷却 %d · 失效 %d · 共 %d", avail, cooling, disabled, total)
+	return fmt.Sprintf("可用 %d · 冷却 %d · 受限 %d · 失效 %d · 共 %d", avail, cooling, restricted, disabled, total)
 }
 
 // cooldownSectionHTML 渲染「冷却中」分节（HTML 树形条目）。无冷却项返回空串。
@@ -3236,6 +3274,15 @@ func formatAccountStatus(acc *Account, idx int, now time.Time) string {
 		return sb.String()
 	}
 
+	if acc.RestrictedUntil.After(now) {
+		// 上游风控限制（11140）：凭据仍有效（额度/套餐接口正常），仅模型请求被策略拒绝。
+		sb.WriteString("账号状态:     上游风控限制（11140，禁止调度）\n")
+		sb.WriteString(fmt.Sprintf("解除时间:     %s\n", formatDisplayTime(acc.RestrictedUntil)))
+		sb.WriteString(fmt.Sprintf("限制原因:     %s\n", truncate(acc.RestrictedMsg, 200)))
+		sb.WriteString("处理建议:     在上游官方端提交反馈申诉（SUBMIT_FEEDBACK）；解除途径=申诉通过后真实成功一次，或 restricted --clear 手动确认\n")
+		return sb.String()
+	}
+
 	if acc.Auth == nil {
 		return sb.String()
 	}
@@ -3345,6 +3392,9 @@ type accountSnapshot struct {
 	State             string             `json:"state"` // active | cooldown | paid_exhausted | expired | disabled
 	CooldownUntil     int64              `json:"cooldownUntil,omitempty"`
 	CooldownMsg       string             `json:"cooldownMsg,omitempty"`
+	RestrictedUntil   int64              `json:"restrictedUntil,omitempty"`
+	RestrictedAt      int64              `json:"restrictedAt,omitempty"`
+	RestrictedMsg     string             `json:"restrictedMsg,omitempty"`
 	DisabledReason    string             `json:"disabledReason,omitempty"`
 	TokenExpiresAt    int64              `json:"tokenExpiresAt,omitempty"`
 	QuotaTotal        float64            `json:"quotaTotal,omitempty"`
@@ -3440,6 +3490,16 @@ func writeStatusSnapshot() error {
 			} else {
 				as.Nickname = acc.Nickname
 				as.UID = acc.UID
+			}
+		case acc.RestrictedUntil.After(now):
+			as.State = "restricted"
+			as.RestrictedUntil = acc.RestrictedUntil.Unix()
+			as.RestrictedAt = unixOrZero(acc.RestrictedAt)
+			as.RestrictedMsg = acc.RestrictedMsg
+			if acc.Auth != nil {
+				as.Nickname = acc.Auth.Account.Nickname
+				as.UID = acc.Auth.Account.UID
+				as.TokenExpiresAt = acc.Auth.Auth.ExpiresAt
 			}
 		case acc.CooldownUntil.After(now):
 			as.State = "cooldown"
@@ -3885,6 +3945,8 @@ func runServe() {
 			_ = ensureValidTokenFor(acc)
 		}
 	}
+	// 恢复上游风控限制（11140）状态：重启不会把受限账号放回池子，站点熔断继续生效。
+	loadRestrictedState()
 
 	// 启动后台自动刷新协程
 	go backgroundTokenRefresher()
@@ -4414,6 +4476,22 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 				continue
 			}
 
+			if isRestrictedAccount(resp.StatusCode, errStr) {
+				// 上游风控限制（11140「账号存在异常行为」）：账号被上游处置，与限流/鉴权/内容审核
+				// 都不同，凭据本身仍有效。处置照搬社区方案（workbuddy2api-hub / magpie）：
+				// 默认命中即停——绝不把同一请求再打给其他账号（换号重试=送连坐证据，整池会被逐个打死）。
+				markAccountRestricted(acc, errStr)
+				recordModelFailure(modelName, modelStatusFromError(resp.StatusCode, errStr))
+				releasePendingInFlight(pendingRelease, reqID)
+				if rotate := restricted403RotateMaxSnapshot(); rotate > 0 && len(attempted) < rotate {
+					lastRateErr = "HTTP 403 (上游风控限制): " + truncate(errStr, 200)
+					continue
+				}
+				writeUpstreamError(w, r, http.StatusTooManyRequests, "account_restricted",
+					fmt.Sprintf("账号 %s 被上游风控限制（11140 request illegal）；请在上游官方端提交反馈申诉（SUBMIT_FEEDBACK）。凭据本身仍有效，换号/重试只会扩大封禁",
+						filepath.Base(acc.Path)))
+				return nil, nil, nil, false
+			}
 			if isRateLimited(resp.StatusCode, errStr) {
 				// 429 频率限制：解析重置时间并屏蔽该账号，交由其他账号代偿
 				until, ok := parseResetTime(errStr)
@@ -4460,6 +4538,9 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 			"status_code":   resp.StatusCode,
 		})
 		log.Printf("[外部接口] traceId=%s requestId=%d 上游=%s 状态码=%d 结果=成功 账号=%s", traceID, reqID, prof.chatURL(), resp.StatusCode, acc.Path)
+		// 真实成功一次 = 上游仍在正常处理该账号请求：清除风控限制标记。
+		// 这是受限账号唯一的自动恢复途径（官方申诉通过后自然走这里）。
+		clearAccountRestricted(acc, "chat 请求真实成功")
 		recordModelSuccess(modelName)
 		// 用空闲看门狗包装响应体：持续有数据就永不超时，超过 upstreamIdleTimeout 无数据才中断。
 		// 关闭响应体时会一并取消上游 context，完成清理。

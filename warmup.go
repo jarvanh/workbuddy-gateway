@@ -543,6 +543,9 @@ func warmupCandidateSites(model string, maxPrice float64, ignorePrice bool, now 
 			if st, ok := states[site]; ok && st == siteForbidden {
 				continue
 			}
+			if siteRestrictedHold(site) {
+				continue
+			}
 		}
 		if ignorePrice {
 			out = append(out, site)
@@ -650,6 +653,11 @@ func warmupTriggerModel(model string, rt warmupRuntime, now time.Time, ms *warmu
 				markModelCooldownQuiet(acc, model, out.RetryAt, out.Detail)
 			}
 		}
+		if out.Status == "restricted" {
+			// 风控限制（11140）：该站点账号已被上游处置，立即停止本站点遍历，
+			// 绝不换号重试（连坐风险）；保留 pending，上游解封后补触发窗口自然恢复。
+			break
+		}
 		if out.RetryAt.After(retryAt) {
 			retryAt = out.RetryAt
 		}
@@ -658,6 +666,13 @@ func warmupTriggerModel(model string, rt warmupRuntime, now time.Time, ms *warmu
 	ms.Detail = lastDetail
 	// 授权失效属于账号本身不可用，重试没有意义；
 	// 「无可用账号」可能只是账号冷却中或尚未热加载进来，保留 pending 让补触发窗口内再试。
+	if lastStatus == "restricted" {
+		// 风控限制不是模型问题，是账号问题；重试同样无意义，保留 pending：
+		// 与授权失效不同，上游解封后 warmup 可自然恢复，无需人工介入。
+		ms.Status = "pending"
+		ms.Detail += "（账号被上游风控限制，等待申诉解封后自动恢复）"
+		return
+	}
 	if lastStatus == "auth_failed" {
 		ms.Status = "failed"
 		return

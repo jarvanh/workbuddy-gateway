@@ -328,6 +328,14 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 	upstreamConfigMu.Lock()
 	upstreamEarlyFlushGrace = grace
 	upstreamConfigMu.Unlock()
+	// 上游风控限制（11140）换号上限：默认 0=命中即停（推荐，防止连坐扩大封禁）。
+	rotate := 0
+	if n := c.Upstream.Restricted403RotateMax; n != nil && *n >= 0 {
+		rotate = *n
+	}
+	upstreamConfigMu.Lock()
+	restricted403RotateMax = rotate
+	upstreamConfigMu.Unlock()
 	// 签到 / Buddy 旅行 / 成长任务开关：省略字段恢复默认开启，显式 false 关闭。
 	// 六个开关必须一起重置 —— 漏掉任何一个，配置里省略该字段时都会沿上一次
 	// 加载的残留值，而不是回到默认开启。

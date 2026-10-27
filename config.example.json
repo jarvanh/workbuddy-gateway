@@ -46,7 +46,8 @@
     "transientRetries": 2,
     "earlyFlushGraceSeconds": 30,
     "streamKeepaliveSeconds": 15,
-    "enableFirstByteRetry": true
+    "enableFirstByteRetry": true,
+    "restricted403RotateMax": 0
   },
   "models": {
     "blocklist": [],

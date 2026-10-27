@@ -39,6 +39,7 @@ func runReset() {
 	// 1. 状态快照与模型缓存（含临时文件）
 	for _, f := range []string{
 		statusSnapshotFile, statusSnapshotFile + ".tmp",
+		restrictedStateFile, restrictedStateFile + ".tmp",
 		modelsCacheFile, modelsCacheFile + ".tmp",
 	} {
 		removeIfExists(f, "")

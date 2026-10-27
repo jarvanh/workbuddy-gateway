@@ -27,6 +27,9 @@ const (
 	notifyEventCooldown      = "cooldown"
 	notifyEventModelCooldown = "model_cooldown"
 	notifyEventNoAccount     = "no_account"
+	// notifyEventRestricted 上游风控限制（11140）告警：账号级处置，与冷却不同类，
+	// 独立事件类型便于在 notify.events 里单独订阅（2026-10-26 事故中被误报成「频率限制」）。
+	notifyEventRestricted = "restricted"
 	// notifyEventWarmup 5 小时窗口主动触发的轮次结果（默认关闭，warmup.notify 开启）。
 	notifyEventWarmup = "warmup"
 	// notifyEventProbe 模型价格探测的结果汇总（默认关闭，probe.schedule.notify 开启）。

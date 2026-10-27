@@ -1439,6 +1439,9 @@ func pickProbeAccountForModel(site, model string) *Account {
 		if profileForEdition(acc.Auth.Edition).Key != site {
 			continue
 		}
+		if acc.RestrictedUntil.After(time.Now()) {
+			continue
+		}
 		if allowed, reason := modelAccountAllowed(model, acc, accounts); !allowed {
 			log.Printf("[ModelPrice] 站点=%s 模型=%s 凭据=%s 结果=跳过 原因=账号名单%s", site, model, filepath.Base(acc.Path), reason)
 			continue
@@ -1559,6 +1562,9 @@ func probeModelPriceEx(acc *Account, model string) probeOutcome {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		s := string(body)
 		switch {
+		case isRestrictedAccount(resp.StatusCode, s):
+			markAccountRestricted(acc, s)
+			out.Status, out.Detail = "restricted", "上游风控限制（11140），账号停止调度；请在官方端提交反馈申诉"
 		case isQuotaExhausted(resp.StatusCode, s):
 			out.Status, out.Detail = "quota", "14018 额度耗尽，不覆盖"
 		case isModelRateLimited(s):
@@ -1581,6 +1587,7 @@ func probeModelPriceEx(acc *Account, model string) probeOutcome {
 	}
 	tokens, _ := usageTotalTokens(usage)
 	out.Credit, out.Tokens = credit, tokens
+	clearAccountRestricted(acc, "probe 请求真实成功")
 	out.Status = "ok"
 	if credit > 0 {
 		out.Verdict, out.Detail = "paid", fmt.Sprintf("usage.credit=%s 收费", formatQuota(credit))

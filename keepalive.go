@@ -253,6 +253,11 @@ func runKeepaliveOnce(trigger string, onlyOverdue bool) {
 			log.Printf("[续期保活] 账号=%s 结果=跳过 原因=账号已标记失效，不参与调度", path)
 			continue
 		}
+		if accountRestrictedLocked(acc) {
+			skipped++
+			log.Printf("[续期保活] 账号=%s 结果=跳过 原因=上游风控限制中（11140），保持静默避免加重风控", path)
+			continue
+		}
 		if !hasAuth || !hasRefresh {
 			skipped++
 			log.Printf("[续期保活] 账号=%s 结果=跳过 原因=缺少刷新令牌，无法续期，需要重新登录", path)

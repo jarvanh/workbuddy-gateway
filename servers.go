@@ -26,6 +26,7 @@ func newAPIHandler() http.Handler {
 	mux.HandleFunc("/ping", handleHealth)
 	mux.HandleFunc("/admin/probe", handleAdminProbe)
 	mux.HandleFunc("/admin/warmup", handleAdminWarmup)
+	mux.HandleFunc("/admin/restricted", handleAdminRestricted)
 	mux.HandleFunc("/admin/reload", handleAdminReload)
 	mux.HandleFunc("/", handleIndex)
 	return requestAuditMiddleware(corsMiddleware(authMiddleware(mux)))

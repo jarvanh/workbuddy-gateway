@@ -58,6 +58,7 @@ var accountAlertRules = map[string]accountAlertRule{
 	"expired":        {"账号过期", "important", "访问令牌已过期，请检查自动续期结果或重新登录。"},
 	"paid_exhausted": {"积分用尽", "important", "已确认账号额度耗尽，收费模型暂不可用；等待额度恢复。"},
 	"cooldown":       {"账号冷却", "warning", "账号触发频率限制，冷却期间暂不调度，请等待自动恢复。"},
+	"restricted":     {"风控限制", "urgent", "上游判定账号异常行为（11140），已停止调度；请在上游官方端提交反馈申诉，解封前请勿换号重试。"},
 	"paused":         {"账号停用", "notice", "该账号被全局调度规则停用；这不是授权失效，可在账号池恢复。"},
 }
 
@@ -116,6 +117,8 @@ func parseAccountLogEvent(line, file string) (accountLogEvent, bool) {
 	switch {
 	case strings.HasPrefix(body, "[Cooldown] "):
 		event.State, event.Account = "cooldown", accountBetween(" 触发频率限制")
+	case strings.HasPrefix(body, "[Restricted] "):
+		event.State, event.Account = "restricted", accountBetween(" 被上游风控限制")
 	case strings.HasPrefix(body, "[Quota] "):
 		if strings.Contains(body, "账号已冻结调度") || strings.Contains(body, "分配额度已用完") {
 			event.State = "paid_exhausted"
