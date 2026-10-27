@@ -146,6 +146,8 @@ type runtimeFileConfig struct {
 			Travel *bool `json:"travel"`
 			// Growth：国内站成长任务自动化（接取→上报→领奖，默认开启）。
 			Growth *bool `json:"growth"`
+			// Makeup：断登自动补签（用补登卡补当月零分断点，每轮最多 1 张，默认开启）。
+			Makeup *bool `json:"makeup"`
 		} `json:"cn"`
 		Intl struct {
 			// Enabled：国际站每日自动签到（默认开启）。

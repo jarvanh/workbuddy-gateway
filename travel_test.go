@@ -16,15 +16,16 @@ import (
 func travelSeedFlags(t *testing.T, cn, travel, intl bool) {
 	t.Helper()
 	oldCN, oldTravel, oldIntl := cnCheckinEnabled, cnTravelEnabled, intlCheckinEnabled
-	oldGrowth := cnGrowthEnabled
+	oldGrowth, oldMakeup := cnGrowthEnabled, cnMakeupEnabled
 	cnCheckinEnabled, cnTravelEnabled, intlCheckinEnabled = cn, travel, intl
-	// 成长任务默认开启，国内站签到后会向 copilot.tencent.com 真实上游发请求。
-	// 测试中一律关闭，避免污染真实账号与拖慢用例；
-	// 成长任务的配置加载与事件构造由 acp_test.go 单独覆盖。
+	// 成长任务 / 断登补签默认开启，国内站签到成功后会向 copilot.tencent.com
+	// 真实上游发请求。测试中一律关闭，避免污染真实账号与拖慢用例；
+	// 两者的配置加载与事件构造由 acp_test.go / makeup_test.go 单独覆盖。
 	cnGrowthEnabled = false
+	cnMakeupEnabled = false
 	t.Cleanup(func() {
 		cnCheckinEnabled, cnTravelEnabled, intlCheckinEnabled = oldCN, oldTravel, oldIntl
-		cnGrowthEnabled = oldGrowth
+		cnGrowthEnabled, cnMakeupEnabled = oldGrowth, oldMakeup
 	})
 }
 

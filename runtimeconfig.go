@@ -329,10 +329,11 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 	upstreamEarlyFlushGrace = grace
 	upstreamConfigMu.Unlock()
 	// 签到 / Buddy 旅行 / 成长任务开关：省略字段恢复默认开启，显式 false 关闭。
-	// 五个开关必须一起重置 —— 漏掉任何一个，配置里省略该字段时都会沿上一次
+	// 六个开关必须一起重置 —— 漏掉任何一个，配置里省略该字段时都会沿上一次
 	// 加载的残留值，而不是回到默认开启。
 	cnCheckinEnabled, cnTravelEnabled, intlCheckinEnabled = true, true, true
 	cnGrowthEnabled = true
+	cnMakeupEnabled = true
 	intlCheckinDedupe = true
 	if c.Checkin.CN.Enabled != nil {
 		cnCheckinEnabled = *c.Checkin.CN.Enabled
@@ -342,6 +343,9 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 	}
 	if c.Checkin.CN.Growth != nil {
 		cnGrowthEnabled = *c.Checkin.CN.Growth
+	}
+	if c.Checkin.CN.Makeup != nil {
+		cnMakeupEnabled = *c.Checkin.CN.Makeup
 	}
 	if c.Checkin.Intl.Enabled != nil {
 		intlCheckinEnabled = *c.Checkin.Intl.Enabled

@@ -767,6 +767,11 @@ func checkinAccountWithTrace(ctx context.Context, acc *Account, trace string) (s
 				log.Printf("[Growth] 账号 %s 成长任务累计到账 +%d 积分", path, gr.EarnedCredit)
 			}
 		}
+		if cnMakeupEnabled {
+			mctx, mcancel := context.WithTimeout(context.Background(), makeupTimeout)
+			runMakeupCards(mctx, &auth, &prof, path)
+			mcancel()
+		}
 	}
 	return result, resultErr
 }

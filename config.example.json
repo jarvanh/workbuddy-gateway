@@ -71,7 +71,8 @@
     "cn": {
       "enabled": true,
       "travel": true,
-      "growth": true
+      "growth": true,
+      "makeup": true
     },
     "intl": {
       "enabled": true,
