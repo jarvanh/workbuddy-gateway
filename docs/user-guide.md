@@ -18,6 +18,10 @@
 
 **v1.14.38**：网页运行状态与告警行紧凑展示，完整告警改为悬浮/触摸详情；日志最新行置顶，标签栏等分且在超 4K 屏幕封顶。CLI 账号表按内容收紧列宽。API/Web 端口支持热切换，保留已有连接与流；端口绑定或调试日志准备失败时保留旧运行状态，并修复状态查询与端口更新之间的数据竞态。
 
+**v1.14.39**：网页轮询按稳定键复用账号/模型行，仅更新变化的单元格；相同统计数据复用图表。操作结果改为不挤动页面的浮层，修复深色主题成功提示变红及提示被无关轮询立即清除的问题。
+
+**v1.14.40**：`identity` 默认映射补齐 `workspace root → workspace base` 与 `are paths the user → are paths that the user`。新装生成完整默认配置；旧配置升级只补缺失规则，不覆盖已有自定义值，也不重新启用已关闭的 `identity`。
+
 **v1.14.24**：Chat 流式响应增加首字节前 SSE 心跳与最多一次安全重放；DSH 身份句和 GUI 环境说明扩展覆盖 assistant 历史、后续文本块及配置注入提示词。默认开启，可通过 `upstream` 配置关闭重放。
 
 **v1.14.25**：Responses 的 namespace 子工具、custom 工具（如 `apply_patch`）和 web_search 不再被静默丢弃；恢复 `custom_tool_call` 与 namespace 输出形状。出站头补齐已采集的 WorkBuddy 桌面静态身份；system/developer/assistant 中的 Codex、DeepSeek Harness、Claude Code、ZCode 展示名统一为 `Assistant`。实测 `/v2/responses` 返回 404，上游路径仍为 `/v2/chat/completions`。
@@ -218,12 +222,21 @@ workbuddy-gateway serve -webui -allow-price-probes
 {
   "identity": {
     "enabled": true,
-    "target": "WorkBuddy"
+    "target": "WorkBuddy",
+    "replacements": {
+      "Claude Code": "WorkBuddy",
+      "Claude": "WorkBuddy",
+      "DeepSeek Harness": "WorkBuddy",
+      "Codex": "WorkBuddy",
+      "ZCode": "WorkBuddy",
+      "workspace root": "workspace base",
+      "are paths the user": "are paths that the user"
+    }
   }
 }
 ```
 
-- 省略 `identity` 时默认把已知 Harness 名称替换成 `WorkBuddy`。
+- 省略 `identity` 时默认把已知 Harness 名称替换成 `WorkBuddy`，并补齐 `workspace root → workspace base`、`are paths the user → are paths that the user` 两条等义兼容替换。
 - `target` 可选 `Assistant` 或 `WorkBuddy`；想更接近官方文案可用 `WorkBuddy`。
 - `enabled:false` 关闭替换。
 - 需要逐词控制时加 `replacements`，例如：
@@ -330,6 +343,8 @@ workbuddy-gateway serve -keepalive-hours ""
 }
 ```
 
+- `promptCompatibility` 是可选的独立文本规则，**默认关闭，旧配置升级不自动添加或开启**。只有显式 `enabled:true` 才执行；开启后省略或空映射使用内置词组规则。它与 `identity` 分别控制、均支持热加载；用户、工具定义和工具参数不会被改写。通常只使用 `identity` 即可，不必同时开启两套规则。
+
 | 字段 | 说明 |
 |---|---|
 | `blocklist` | 黑名单，命中即禁用 |
@@ -406,7 +421,7 @@ workbuddy-gateway serve -keepalive-hours ""
 - 热加载范围是 `config.json` 支持的字段，不包括命令行启动参数（如 `-addr`、`-webui`、`-reload-interval`、`-models-refresh`、`-keepalive-hours`）。显式 `-port` 优先级仍高于 `gateway.apiPort`；修改 Web 端口后请使用新端口重新打开控制台。
 - 要恢复默认规则，请保存有效的 `{}` 或将对应列表设为 `[]`，而不是删除运行中的配置文件。
 - 上一版本省略 `all`、`accounts`、`models` 或 `gateway` 的配置仍可读取；`accounts: {}`、`accounts: null`、`all: {}` 和空名单均表示无全局限制。默认示例包含空的 `models.accounts.all.allowlist/blocklist`。
-- 首次启动且没有 `config.json` 时，程序会按内置示例生成完整默认配置。旧配置缺少 `identity` 段时，启动阶段只补充该段，其他字段原样保留；`identity` 为空、`target` 为空或 `replacements` 为空时按默认 WorkBuddy 规则运行，不会阻断启动。用户自定义的 `replacements` 键不限于内置 Harness 名称。
+- 首次启动且没有 `config.json` 时，程序会按内置示例生成完整默认配置。旧配置缺少 `identity` 段时，启动阶段补充完整默认段；已有 `identity` 缺少 `replacements` 时补完整默认映射，已有自定义映射会逐项补齐缺失的默认替换，包括 `workspace root → workspace base` 和 `are paths the user → are paths that the user`，并保留用户自定义键和值。已有 `enabled:false` 不会被改成开启。`target` 为空或 `replacements` 为空时按默认 WorkBuddy 规则运行，不会阻断启动。用户自定义的 `replacements` 键不限于内置词。
 - 如旧配置同时填写了**两种非空模型名单**，请在升级前选择并保留一种；新版本不再接受相互冲突的模型黑白名单。运行中错误配置会保留上次生效状态，启动时则给出明确错误。
 - 旧配置中只有白名单生效时，管理页开关反映白名单；首次网页模型操作会删除 `models.allowlist`，将**当前已知模型**的启停状态转换为 `models.blocklist`。其他已知模型状态不变，之后新增的模型默认开启（黑名单语义）。模型账号规则保持独立。
 - 新版本中的 `all` 是保留键；不要把它当作真实模型 ID。**先升级二进制，再添加 `all`**；旧二进制不识别全局语义，会把它当作名为 `all` 的模型专属规则。
@@ -812,6 +827,7 @@ systemctl restart workbuddy-gateway
 - 网页标题及品牌文案使用「本地网关」，不再显示旧品牌名称；协议 Header、配置格式与数据字段保持兼容，不改写用户配置、日志或账号昵称中的原文。
 - 「账号池」的「只显示可用账号」只保留状态为 `active` 且全局调度未停用的账号；「模型列表」的「只显示可用模型」只保留已启用且可用账号数大于 0 的模型。取消勾选可查看全部，筛选不改变调度、配置或历史统计。
 - 两个筛选分别通过 Cookie 保存，刷新、退出再登录后恢复，默认不勾选。Cookie 只含 `0/1` 显示偏好，作用域为当前主机的 `/ui`，有效期一年，使用 `SameSite=Lax`，HTTPS 时加 `Secure`；Cookie 不保存任何 Key 或凭据，也不能用于登录。浏览器禁用 Cookie 时仍可筛选，但页面提示刷新可能无法记住状态。
+- 后台刷新按账号/模型键局部更新表格，未变化的行、开关焦点及已展开详情保留；统计数据不变时复用图表。操作结果在右下角浮层显示，不挤动页面：成功提示约 5 秒后关闭，错误提示不会被无关轮询清掉，只在对应接口恢复或新操作提示替换时关闭。
 - 「模型列表」国内 / 国际倍率后有 `!` 按钮，点击显示该倍率的**数据来源**、**更新时间**和一句**白话解释**（例如「官方接口给出的目录倍率」「官方促销已于 … 结束，接口仍返回 0.00x，该数值不可信」「上次真实探测结论：收费（尚未复测）」），其他来源按「其他记录」逐条给出一句解释。原始日志默认折叠在「原始日志（N 条，默认折叠）」里，需要时才展开，避免刷屏。
 - 倍率无法确定具体数值（如「收费(倍率未知)」）时额外显示**如何刷新**：后台自动探测已关闭时提示「用该站点的账号请求一次这个模型，网关会按返回的 `usage.credit` 自动重新判定并写入日志」；探测已开启时提示会自动复测。该提示里的开关状态同样解析自普通日志（`[ModelPrice] 阶段=自动探测调度`），不是额外状态。
 - 详情里**不显示「状态：未知」这类字样**：该结论本身是实测过的，写「未知」会让人误以为从未检测；实际含义由「上次真实探测结论：收费（尚未复测）」和「如何刷新」表达。

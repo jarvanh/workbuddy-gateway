@@ -36,13 +36,7 @@ import (
 	"github.com/skip2/go-qrcode"
 )
 
-// version 是网关版本号：默认取开发值，发布流水线会通过
-// -ldflags "-X main.version=<tag>" 注入 tag 版本（因此必须是 var 而非 const）。
-//
-// ⚠️ 上游把这里改成了 const 形态（截至 v1.14.38 仍如此），fork 不同步这一改动：
-// const 会让 release 流水线的 -ldflags 注入失效（Go 不允许对 const 做 linker 注入），
-// 发版产物会永远显示源码里的开发版本号。保留 var 形态。
-var version = "1.13.1"
+var version = "1.14.40"
 
 const (
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
@@ -813,8 +807,13 @@ func main() {
 	defer closeLog()
 	if serveCommand || command == "probe" {
 		// Config is loaded before logging is initialized. Persist its effective
-		// concurrency limits now as well, rather than leaving them console-only.
-		logConcurrentConfig(newTraceID())
+		// runtime settings now as well, rather than leaving them console-only.
+		trace := newTraceID()
+		logConcurrentConfig(trace)
+		identityEnabled, identityTarget, identityRules := identitySettingsSummary()
+		compatibilityEnabled, compatibilityRules := promptCompatibilitySettingsSummary()
+		log.Printf("[配置就绪] traceId=%s identity启用=%t identity目标=%s identity规则数=%d 独立兼容启用=%t 独立兼容规则数=%d 说明=启动配置已加载，后续修改可热加载；未记录Key或配置正文",
+			trace, identityEnabled, identityTarget, identityRules, compatibilityEnabled, compatibilityRules)
 	}
 	closeDebug := func() {}
 	if serveCommand {

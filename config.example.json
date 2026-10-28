@@ -18,7 +18,15 @@
       "Claude": "WorkBuddy",
       "DeepSeek Harness": "WorkBuddy",
       "Codex": "WorkBuddy",
-      "ZCode": "WorkBuddy"
+      "ZCode": "WorkBuddy",
+      "workspace root": "workspace base",
+      "are paths the user": "are paths that the user"
+    }
+  },
+  "promptCompatibility": {
+    "enabled": false,
+    "replacements": {
+      "workspace root": "workspace base"
     }
   },
   "concurrent": {

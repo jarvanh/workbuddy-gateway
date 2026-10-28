@@ -6,9 +6,9 @@ import (
 	"sync"
 )
 
-// runtimeIdentityConfig controls the display names used when normalizing
-// system/developer/assistant text. An absent config keeps the previous
-// behavior: replace known harness names with "Assistant".
+// runtimeIdentityConfig controls text replacements applied when normalizing
+// system/developer/assistant text. An absent config uses the built-in
+// WorkBuddy identity and channel-compatibility replacements.
 type runtimeIdentityConfig struct {
 	Enabled      *bool             `json:"enabled,omitempty"`
 	Target       string            `json:"target,omitempty"`
@@ -32,25 +32,41 @@ var (
 	currentIdentity      = defaultIdentitySettings()
 )
 
-func defaultIdentitySettings() identitySettings {
-	target := "WorkBuddy"
-	replacements := make([]identityReplacement, 0, len(defaultIdentityTerms))
+const (
+	defaultWorkspaceRootPhrase = "workspace root"
+	defaultWorkspaceBasePhrase = "workspace base"
+	defaultUserPathsPhrase     = "are paths the user"
+	defaultUserPathsNeutral    = "are paths that the user"
+)
+
+func defaultIdentityReplacements(target string) map[string]string {
+	replacements := make(map[string]string, len(defaultIdentityTerms)+2)
 	for _, term := range defaultIdentityTerms {
-		replacements = append(replacements, identityReplacement{Old: term, New: target})
+		replacements[term] = target
 	}
-	return identitySettings{enabled: true, prefix: "You are " + target, replacements: replacements}
+	replacements[defaultWorkspaceRootPhrase] = defaultWorkspaceBasePhrase
+	replacements[defaultUserPathsPhrase] = defaultUserPathsNeutral
+	return replacements
+}
+
+func defaultIdentitySettings() identitySettings {
+	return buildIdentitySettings(defaultIdentityConfig())
 }
 
 func defaultIdentityConfig() runtimeIdentityConfig {
 	enabled := true
-	replacements := make(map[string]string, len(defaultIdentityTerms))
-	for _, term := range defaultIdentityTerms {
-		replacements[term] = "WorkBuddy"
-	}
-	return runtimeIdentityConfig{Enabled: &enabled, Target: "WorkBuddy", Replacements: replacements}
+	return runtimeIdentityConfig{Enabled: &enabled, Target: "WorkBuddy",
+		Replacements: defaultIdentityReplacements("WorkBuddy")}
 }
 
 func setIdentityConfig(c runtimeIdentityConfig) {
+	settings := buildIdentitySettings(c)
+	identityConfigMu.Lock()
+	currentIdentity = settings
+	identityConfigMu.Unlock()
+}
+
+func buildIdentitySettings(c runtimeIdentityConfig) identitySettings {
 	enabled := true
 	if c.Enabled != nil {
 		enabled = *c.Enabled
@@ -72,8 +88,8 @@ func setIdentityConfig(c runtimeIdentityConfig) {
 			prefixTarget = replacement
 		}
 	} else {
-		for _, term := range defaultIdentityTerms {
-			replacements = append(replacements, identityReplacement{Old: term, New: target})
+		for old, newValue := range defaultIdentityReplacements(target) {
+			replacements = append(replacements, identityReplacement{Old: old, New: newValue})
 		}
 	}
 	// Longest first avoids splitting "Claude Code" into "Assistant Code".
@@ -83,11 +99,9 @@ func setIdentityConfig(c runtimeIdentityConfig) {
 		}
 		return replacements[i].Old < replacements[j].Old
 	})
-	identityConfigMu.Lock()
-	currentIdentity = identitySettings{
+	return identitySettings{
 		enabled: enabled, prefix: "You are " + prefixTarget, replacements: replacements,
 	}
-	identityConfigMu.Unlock()
 }
 
 func identitySnapshot() identitySettings {

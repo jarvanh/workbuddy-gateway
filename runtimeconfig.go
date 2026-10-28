@@ -120,6 +120,12 @@ func ensureRuntimeConfigFile(path string) error {
 			return err
 		}
 		changed = true
+	} else {
+		updated, updateErr := ensureIdentityDefaultReplacements(doc)
+		if updateErr != nil {
+			return updateErr
+		}
+		changed = changed || updated
 	}
 	if !hasKey(doc, "concurrent") {
 		doc["concurrent"], _ = json.Marshal(normalizeConcurrentConfig(concurrentFileConfig{}))
@@ -176,8 +182,84 @@ func ensureRuntimeConfigFile(path string) error {
 	if err := os.Rename(temporary, path); err != nil {
 		return err
 	}
-	log.Printf("[配置初始化] 已补充缺失的 identity/concurrent 默认配置；已有值和其他配置保留，后续修改仍可热加载")
+	log.Printf("[配置初始化] 已补充缺失的 identity/concurrent 默认配置；已有值和其他配置保留，后续修改仍可热加载；不自动添加或启用独立兼容模块")
 	return nil
+}
+
+// ensureIdentityDefaultReplacements upgrades older identities without
+// overwriting user-defined values. Missing replacement maps receive the full
+// default set because a non-empty custom map disables runtime defaults.
+func ensureIdentityDefaultReplacements(doc map[string]json.RawMessage) (bool, error) {
+	identityKey := ""
+	for key := range doc {
+		if strings.EqualFold(key, "identity") {
+			identityKey = key
+			break
+		}
+	}
+	if identityKey == "" {
+		return false, nil
+	}
+	var identity map[string]json.RawMessage
+	if json.Unmarshal(doc[identityKey], &identity) != nil || identity == nil {
+		return false, nil
+	}
+	target := "WorkBuddy"
+	for key, raw := range identity {
+		if strings.EqualFold(key, "target") {
+			var configured string
+			if json.Unmarshal(raw, &configured) == nil && strings.TrimSpace(configured) != "" {
+				target = strings.TrimSpace(configured)
+			}
+			break
+		}
+	}
+	replacementsKey := ""
+	for key := range identity {
+		if strings.EqualFold(key, "replacements") {
+			replacementsKey = key
+			break
+		}
+	}
+	if replacementsKey == "" {
+		encoded, err := json.Marshal(defaultIdentityReplacements(target))
+		if err != nil {
+			return false, err
+		}
+		identity["replacements"] = encoded
+	} else {
+		var replacements map[string]string
+		if json.Unmarshal(identity[replacementsKey], &replacements) != nil {
+			return false, nil // 非法类型交给完整配置校验，不擅自覆盖。
+		}
+		// A non-empty custom map disables runtime defaults, so merge every missing
+		// built-in rule while never overwriting an explicitly customized value.
+		defaults := defaultIdentityReplacements(target)
+		if replacements == nil {
+			replacements = make(map[string]string, len(defaults))
+		}
+		updated := false
+		for old, newValue := range defaults {
+			if _, exists := replacements[old]; !exists {
+				replacements[old] = newValue
+				updated = true
+			}
+		}
+		if !updated {
+			return false, nil
+		}
+		encoded, err := json.Marshal(replacements)
+		if err != nil {
+			return false, err
+		}
+		identity[replacementsKey] = encoded
+	}
+	encoded, err := json.Marshal(identity)
+	if err != nil {
+		return false, err
+	}
+	doc[identityKey] = encoded
+	return true, nil
 }
 
 func writeNewRuntimeConfig(path string) error {
@@ -258,10 +340,13 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 	_ = setModelAccountFilter(c.Models.Accounts)
 	setSystemPromptConfig(c.SystemPrompt.Fallback, c.SystemPrompt.Force)
 	setIdentityConfig(c.Identity)
+	setPromptCompatibilityConfig(c.PromptCompatibility)
 	modelConcurrency.configure(c.Concurrent)
 	logConcurrentConfig(trace)
 	identityEnabled, identityTarget, identityRuleCount := identitySettingsSummary()
 	log.Printf("[身份替换配置] traceId=%s 启用=%t 目标=%s 规则数=%d 说明=仅处理 system/developer/assistant 文本；热加载只影响后续请求", trace, identityEnabled, identityTarget, identityRuleCount)
+	compatibilityEnabled, compatibilityRuleCount := promptCompatibilitySettingsSummary()
+	log.Printf("[提示词兼容配置] traceId=%s 启用=%t 规则数=%d 说明=仅处理 system/developer/assistant 文本；热加载只影响后续请求", trace, compatibilityEnabled, compatibilityRuleCount)
 	previousProfile := officialRequests.Load()
 	setRequestProfile(profile)
 	// 未配置 upstream.requestProfile 时会回退 legacy，出站请求体因此不压缩。

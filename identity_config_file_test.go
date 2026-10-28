@@ -28,6 +28,12 @@ func TestEnsureRuntimeConfigFileCreatesCompleteDefault(t *testing.T) {
 			t.Fatalf("default replacement %q=%q", term, c.Identity.Replacements[term])
 		}
 	}
+	if c.Identity.Replacements["workspace root"] != "workspace base" {
+		t.Fatalf("default workspace replacement=%q", c.Identity.Replacements["workspace root"])
+	}
+	if c.Identity.Replacements["are paths the user"] != "are paths that the user" {
+		t.Fatalf("default paths replacement=%q", c.Identity.Replacements["are paths the user"])
+	}
 }
 
 func TestEnsureRuntimeConfigFileMigratesOldConfigWithoutIdentity(t *testing.T) {
@@ -55,7 +61,77 @@ func TestEnsureRuntimeConfigFileMigratesOldConfigWithoutIdentity(t *testing.T) {
 	}
 }
 
-func TestEnsureRuntimeConfigFilePreservesExistingIdentity(t *testing.T) {
+func TestEnsureRuntimeConfigFilePreservesExistingIdentityAndAddsDefaultReplacement(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	original := `{"identity":{"enabled":true,"target":"Assistant","replacements":{"kimi":"K2"}},"concurrent":{"MaxAcc":4,"MaxGlobal":0}}`
+	if err := os.WriteFile(path, []byte(original), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureRuntimeConfigFile(path); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(path)
+	var c runtimeFileConfig
+	if err := json.Unmarshal(raw, &c); err != nil {
+		t.Fatal(err)
+	}
+	if c.Identity.Target != "Assistant" || c.Identity.Replacements["kimi"] != "K2" {
+		t.Fatalf("existing identity was overwritten: %#v", c.Identity)
+	}
+	if c.Identity.Replacements["workspace root"] != "workspace base" {
+		t.Fatalf("missing default workspace replacement: %#v", c.Identity.Replacements)
+	}
+	if c.Identity.Replacements["are paths the user"] != "are paths that the user" {
+		t.Fatalf("missing default paths replacement: %#v", c.Identity.Replacements)
+	}
+}
+
+func TestEnsureRuntimeConfigFilePreservesCustomWorkspaceReplacement(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	original := `{"identity":{"enabled":true,"target":"WorkBuddy","replacements":{"workspace root":"custom base"}},"concurrent":{"MaxAcc":4,"MaxGlobal":0}}`
+	if err := os.WriteFile(path, []byte(original), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureRuntimeConfigFile(path); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(path)
+	var c runtimeFileConfig
+	if err := json.Unmarshal(raw, &c); err != nil {
+		t.Fatal(err)
+	}
+	if c.Identity.Replacements["workspace root"] != "custom base" {
+		t.Fatalf("custom replacement overwritten: %#v", c.Identity.Replacements)
+	}
+	if c.Identity.Replacements["are paths the user"] != "are paths that the user" {
+		t.Fatalf("missing paths replacement beside custom workspace rule: %#v", c.Identity.Replacements)
+	}
+}
+
+func TestEnsureRuntimeConfigFileAddsMissingDefaultWithoutEnablingDisabledIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	original := `{"identity":{"enabled":false,"target":"WorkBuddy","replacements":{"workspace root":"custom base"}},"concurrent":{"MaxAcc":4,"MaxGlobal":0}}`
+	if err := os.WriteFile(path, []byte(original), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureRuntimeConfigFile(path); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(path)
+	var c runtimeFileConfig
+	if err := json.Unmarshal(raw, &c); err != nil {
+		t.Fatal(err)
+	}
+	if c.Identity.Enabled == nil || *c.Identity.Enabled {
+		t.Fatal("migration must not enable an explicitly disabled identity section")
+	}
+	if c.Identity.Replacements["workspace root"] != "custom base" ||
+		c.Identity.Replacements["are paths the user"] != "are paths that the user" {
+		t.Fatalf("migration did not preserve/add expected replacements: %#v", c.Identity.Replacements)
+	}
+}
+
+func TestEnsureRuntimeConfigFileAddsCompleteDefaultsWhenIdentityReplacementsMissing(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	original := `{"identity":{"enabled":true,"target":"Assistant"},"concurrent":{"MaxAcc":4,"MaxGlobal":0}}`
 	if err := os.WriteFile(path, []byte(original), 0600); err != nil {
@@ -65,8 +141,14 @@ func TestEnsureRuntimeConfigFilePreservesExistingIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw, _ := os.ReadFile(path)
-	if string(raw) != original {
-		t.Fatalf("existing identity must not be overwritten: %s", raw)
+	var c runtimeFileConfig
+	if err := json.Unmarshal(raw, &c); err != nil {
+		t.Fatal(err)
+	}
+	if c.Identity.Replacements["Codex"] != "Assistant" ||
+		c.Identity.Replacements["workspace root"] != "workspace base" ||
+		c.Identity.Replacements["are paths the user"] != "are paths that the user" {
+		t.Fatalf("default identity replacements incomplete: %#v", c.Identity.Replacements)
 	}
 }
 
@@ -113,5 +195,13 @@ func TestIdentityConfigEmptyValuesUseDefaultWithoutError(t *testing.T) {
 	got, changed := normalizeAssistantIdentityText("You are Codex")
 	if !changed || got != "You are WorkBuddy" {
 		t.Fatalf("empty identity config got=%q changed=%t", got, changed)
+	}
+	got, changed = normalizeAssistantIdentityText("workspace root")
+	if !changed || got != "workspace base" {
+		t.Fatalf("default workspace replacement got=%q changed=%t", got, changed)
+	}
+	got, changed = normalizeAssistantIdentityText("absolute paths are paths the user can use")
+	if !changed || got != "absolute paths are paths that the user can use" {
+		t.Fatalf("default paths replacement got=%q changed=%t", got, changed)
 	}
 }

@@ -14,6 +14,17 @@ import (
 
 func repoRoot(t *testing.T) string {
 	t.Helper()
+	// Cross-compiled test binaries may run without their original build path.
+	// The deployment preflight supplies a private, extracted source snapshot.
+	if root := os.Getenv("WORKBUDDY_TEST_SOURCE_ROOT"); root != "" {
+		if !filepath.IsAbs(root) {
+			t.Fatal("WORKBUDDY_TEST_SOURCE_ROOT must be absolute")
+		}
+		if info, err := os.Stat(filepath.Join(root, "go.mod")); err != nil || !info.Mode().IsRegular() {
+			t.Fatal("WORKBUDDY_TEST_SOURCE_ROOT must contain the test source tree")
+		}
+		return root
+	}
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("cannot locate source file")
@@ -62,8 +73,16 @@ func TestConfigExampleCoversEveryRuntimeField(t *testing.T) {
 	identityEnabled := true
 	exampleSchema.Identity = runtimeIdentityConfig{Enabled: &identityEnabled, Target: "WorkBuddy", Replacements: map[string]string{
 		"Claude Code": "WorkBuddy", "Claude": "WorkBuddy", "DeepSeek Harness": "WorkBuddy",
-		"Codex": "WorkBuddy", "ZCode": "WorkBuddy",
+		"Codex": "WorkBuddy", "ZCode": "WorkBuddy", "workspace root": "workspace base",
+		"are paths the user": "are paths that the user",
 	}}
+	compatibilityEnabled := false
+	exampleSchema.PromptCompatibility = runtimePromptCompatibilityConfig{
+		Enabled: &compatibilityEnabled,
+		Replacements: map[string]string{
+			"workspace root": "workspace base",
+		},
+	}
 	schema, err := json.Marshal(exampleSchema)
 	if err != nil {
 		t.Fatal(err)
@@ -118,6 +137,32 @@ func TestConfigExampleStartsFreshDeployment(t *testing.T) {
 	}
 	if currentAdminKey() != "" || currentAPIKey() != "" {
 		t.Fatal("示例配置不应预置任何 Key")
+	}
+}
+
+func TestConfigExampleIncludesIdentityCompatibilityDefaults(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(repoRoot(t), "config.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var c runtimeFileConfig
+	if err := json.Unmarshal(raw, &c); err != nil {
+		t.Fatal(err)
+	}
+	if c.PromptCompatibility.Enabled == nil || *c.PromptCompatibility.Enabled {
+		t.Fatal("example must not enable the independent compatibility module")
+	}
+	if len(c.Identity.Replacements) != 7 {
+		t.Fatalf("example identity rules=%d want=7", len(c.Identity.Replacements))
+	}
+	for old, want := range map[string]string{
+		"workspace root":     "workspace base",
+		"are paths the user": "are paths that the user",
+	} {
+		if c.Identity.Replacements[old] != want {
+			t.Fatalf("config.example identity replacement %q=%q want %q",
+				old, c.Identity.Replacements[old], want)
+		}
 	}
 }
 

@@ -73,11 +73,14 @@ type runtimeFileConfig struct {
 		Force    string `json:"force"`
 	} `json:"systemPrompt"`
 	// Identity 控制 system/developer/assistant 中的展示身份替换。
-	// 省略时保持旧行为：已知 Harness 名称替换为 Assistant。
-	Identity   runtimeIdentityConfig `json:"identity"`
-	Concurrent concurrentFileConfig  `json:"concurrent"`
-	Debug      debugFileConfig       `json:"debug"`
-	Logs       struct {
+	// 省略时使用内置 WorkBuddy 展示名及默认文本规则。
+	Identity runtimeIdentityConfig `json:"identity"`
+	// PromptCompatibility 是显式启用的独立文本规则；默认关闭，
+	// 不会在 identity 关闭或自定义替换时偷偷启用额外改写。
+	PromptCompatibility runtimePromptCompatibilityConfig `json:"promptCompatibility"`
+	Concurrent          concurrentFileConfig             `json:"concurrent"`
+	Debug               debugFileConfig                  `json:"debug"`
+	Logs                struct {
 		RetentionDays int `json:"retentionDays"` // 0 保留全部；正数保留含今天在内的 N 个日历日。
 	} `json:"logs"`
 	// Upstream 段可选，用于按网络状况调整上游超时（单位秒，<=0 或省略表示用默认值）。

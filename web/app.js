@@ -17,6 +17,10 @@
     lastModels: null,
     timer: null,
     refreshPending: false,
+    alertSource: "",
+    alertKind: "",
+    alertTimer: null,
+    alertVersion: 0,
     settings: null,
     togglePending: false,
     policyVersion: 0,
@@ -39,6 +43,7 @@
     statsVersion: 0,
     statsLastPoll: 0,
     lastStats: null,
+    statsRenderKey: "",
     accountAlertsPending: false,
     accountAlertsLastPoll: 0,
     accountAlertsGeneration: 0,
@@ -81,13 +86,95 @@
     return (v / 1000000).toFixed(2) + "M";
   }
 
-  function showAlert(msg, ok) {
+  function showAlert(msg, ok, source) {
+    if (state.alertTimer !== null) clearTimeout(state.alertTimer);
+    var version = ++state.alertVersion;
+    state.alertSource = source || "";
+    state.alertKind = ok ? "success" : "error";
+    state.alertTimer = null;
     var el = $("alert");
     el.textContent = msg;
     el.className = "alert" + (ok ? " ok" : "");
+    // Successful actions stay readable instead of disappearing on the next poll.
+    // Errors remain until their own endpoint recovers or a newer action replaces them.
+    if (ok) state.alertTimer = setTimeout(function () {
+      if (version === state.alertVersion) hideAlert();
+    }, 5000);
   }
 
-  function hideAlert() { $("alert").className = "alert hidden"; }
+  function hideAlert() {
+    if (state.alertTimer !== null) clearTimeout(state.alertTimer);
+    state.alertTimer = null;
+    state.alertVersion++;
+    state.alertSource = state.alertKind = "";
+    $("alert").className = "alert hidden";
+  }
+
+  function setHTMLIfChanged(el, html) {
+    if (el._sourceHTML === html && (el.childNodes ? el.childNodes.length : el.innerHTML === html)) return false;
+    el.innerHTML = html;
+    el._sourceHTML = html;
+    return true;
+  }
+
+  // Keep stable rows/cells, focus and expanded details during background polling.
+  // Only renderers' source markup is compared, not transient detail-panel content.
+  function updateTableBody(table, html) {
+    if (table._tableSourceHTML === html && (table.children ? table.children.length : table.innerHTML === html)) return;
+    if (!document.createElement || !table.children) {
+      table.innerHTML = html;
+      table._tableSourceHTML = html;
+      return;
+    }
+    var template = document.createElement("template");
+    template.innerHTML = html;
+    var rows = Array.prototype.slice.call(template.content.children);
+    var wanted = Object.create(null), existing = Object.create(null);
+    var keyed = rows.every(function (row) {
+      var key = row.getAttribute("data-row-key");
+      if (key === null || wanted[key]) return false;
+      wanted[key] = true;
+      return true;
+    });
+    if (!keyed) {
+      table.innerHTML = html;
+      table._tableSourceHTML = html;
+      return;
+    }
+    Array.prototype.forEach.call(table.children, function (row) {
+      var key = row.getAttribute("data-row-key");
+      if (key !== null) existing[key] = row;
+    });
+    rows.forEach(function (candidate, index) {
+      var key = candidate.getAttribute("data-row-key");
+      var row = existing[key], source = candidate.outerHTML;
+      if (!row) {
+        row = candidate;
+        Array.prototype.forEach.call(row.cells, function (cell) { cell._sourceHTML = cell.outerHTML; });
+      } else if (row._sourceHTML !== source) {
+        if (row.cells.length !== candidate.cells.length) {
+          row.replaceWith(candidate);
+          row = candidate;
+          Array.prototype.forEach.call(row.cells, function (cell) { cell._sourceHTML = cell.outerHTML; });
+        } else {
+          Array.prototype.slice.call(candidate.cells).forEach(function (cell, i) {
+            if (row.cells[i]._sourceHTML !== cell.outerHTML) {
+              cell._sourceHTML = cell.outerHTML;
+              row.replaceChild(cell, row.cells[i]);
+            }
+          });
+        }
+      }
+      row._sourceHTML = source;
+      var before = table.children[index];
+      if (before !== row) table.insertBefore(row, before || null);
+    });
+    Array.prototype.slice.call(table.children).forEach(function (row) {
+      var key = row.getAttribute("data-row-key");
+      if (key === null || !wanted[key]) row.remove();
+    });
+    table._tableSourceHTML = html;
+  }
 
   // setConn 更新右上角常驻连接状态，让每次请求的结果都可见（不会一闪而过）。
   function setConn(text, cls) {
@@ -132,14 +219,21 @@
     state.statsVersion++;
     state.statsLastPoll = 0;
     state.lastStats = null;
+    state.statsRenderKey = "";
     hideAllStatsChartHover();
     statsChartControllers = [];
     ["usageSummary", "usageChart", "latencyChart", "statsInfo", "statsRange"].forEach(function (id) {
       $(id).textContent = "";
+      $(id)._sourceHTML = "";
     });
-    if ($("latencyLegend")) $("latencyLegend").textContent = "";
+    if ($("latencyLegend")) {
+      $("latencyLegend").textContent = "";
+      $("latencyLegend")._sourceHTML = "";
+    }
     $("statsAccount").innerHTML = '<option value="">全局 · 全部账号</option>';
+    $("statsAccount")._sourceHTML = "";
     $("statsTable").querySelector("tbody").innerHTML = "";
+    $("statsTable").querySelector("tbody")._sourceHTML = "";
     state.accountAlertsGeneration++;
     state.accountAlertsLastPoll = 0;
     state.lastAccountAlerts = null;
@@ -156,9 +250,12 @@
     if ($("accountAlertTooltip")) $("accountAlertTooltip").hidden = true;
     ["meta", "gatewayInfo", "logBox", "configBox", "tasksInfo"].forEach(function (id) {
       $(id).textContent = "";
+      $(id)._sourceHTML = "";
     });
     ["accountsTable", "modelsTable", "tasksTable"].forEach(function (id) {
-      $(id).querySelector("tbody").innerHTML = "";
+      var body = $(id).querySelector("tbody");
+      body.innerHTML = "";
+      body._tableSourceHTML = "";
     });
   }
 
@@ -192,23 +289,24 @@
         if (!options.quiet) {
           setConn("请求失败 (" + resp.status + ")", "danger");
           showAlert("HTTP " + resp.status + "：" + (result.data.error || "请求失败") +
-            (path.split("?")[0] === "/admin/api/config-edit" ? "；操作未完成，已有编辑输入保留。" : "；已有数据保留，未更新为零。"));
+            (path.split("?")[0] === "/admin/api/config-edit" ? "；操作未完成，已有编辑输入保留。" : "；已有数据保留，未更新为零。"),
+            false, path.split("?")[0]);
         }
         var failure = new Error("HTTP " + resp.status);
         failure.status = resp.status;
         failure.detail = result.data.error || "请求失败";
         throw failure;
       }
-      hideAlert();
+      if (state.alertKind === "error" && state.alertSource === path.split("?")[0]) hideAlert();
       setConn("已连接 · " + nowText(), "ok");
       reportUIEvent("request_completed", path, status, trace);
       return result.data;
     }).catch(function (err) {
       if (keyAtStart === state.apiKey) {
         reportUIEvent("request_failed", path, status, trace);
-        if (!status) {
+        if (!status && !options.quiet) {
           setConn("连接失败", "danger");
-          showAlert("请求未完成；保留上次数据，请检查网络后重试。");
+          showAlert("请求未完成；保留上次数据，请检查网络后重试。", false, path.split("?")[0]);
         }
       }
       throw err;
@@ -793,9 +891,24 @@
   function renderStats(data) {
     state.lastStats = data;
     var s = data.summary || {}, rows = data.buckets || [], store = data.storage || {};
+    var chartBox = function (id) {
+      var el = $(id), w = el && el.clientWidth ? el.clientWidth : 900;
+      return {w: w, h: w < 520 ? 230 : 280};
+    };
+    var chartWidth = Math.min(chartBox("usageChart").w, chartBox("latencyChart").w);
+    var chartNow = statsChartNow(data.serverTime);
+    var payload = {};
+    Object.keys(data).forEach(function (key) {
+      if (key !== "serverTime" && key !== "storage") payload[key] = data[key];
+    });
+    // A changing server clock alone is not new chart data. Still redraw at a
+    // future-bucket boundary, on a filter change, or when the viewport changes.
+    var renderKey = JSON.stringify([payload, state.statsAccount, chartWidth,
+      rows.map(function (row) { return statsBucketIsFuture(row, chartNow); })]);
+    $("statsInfo").textContent = store.message || "";
+    if (renderKey === state.statsRenderKey) return;
     var currentTTFT = data.ttftMetric === "first_token_v2";
     var tokenTime = function (row) { return currentTTFT ? row.avgTtftMs : null; };
-    $("statsInfo").textContent = store.message || "";
     $("statsStart").value = data.start;
     $("statsEnd").value = data.end;
     var choice = state.statsAccount || data.account || "";
@@ -803,28 +916,22 @@
     var scopeOption = function (value, label) {
       return '<option value="' + esc(value) + '"' + (value === choice ? " selected" : "") + '>' + esc(label) + "</option>";
     };
-    $("statsAccount").innerHTML = scopeOption("", "全局 · 全部账号") +
+    setHTMLIfChanged($("statsAccount"), scopeOption("", "全局 · 全部账号") +
       scopeOption("site:intl", "国际站 · 全部国际账号") + scopeOption("site:cn", "国内站 · 全部国内账号") +
       (data.accounts || []).map(function (a) {
         return scopeOption(a.id, a.file + " · " + (a.edition === "intl" ? "国际" : "国内") + " · " + a.id.slice(0, 6));
-      }).join("");
+      }).join(""));
     if (!siteScope && !(data.accounts || []).some(function (a) { return a.id === choice; })) choice = "";
     $("statsAccount").value = choice;
     state.statsAccount = choice;
     var coverage = (s.tokenSamples || 0) + "/" + (s.requests || 0) + " 请求有 Token";
-    $("usageSummary").innerHTML =
+    setHTMLIfChanged($("usageSummary"),
       statsCard("总消耗 Token", s.tokenSamples ? statsNumber(s.tokens) : "—", "输入 " + statsNumber(s.inputTokens) +
         " · 输出 " + statsNumber(s.outputTokens) + " · 缓存读取 " + statsNumber(s.cachedTokens), "token") +
       statsCard("总消耗积分", s.creditSamples ? statsCredit(s.credits) : "—", (s.creditSamples || 0) + "/" + (s.requests || 0) + " 请求有积分 · 仅计 usage.credit", "credit") +
       statsCard("账号调用次数", statsNumber(s.requests), "完整 " + statsNumber(s.success) + " · 失败 / 不完整 " + statsNumber(s.failed), "neutral") +
       statsCard("平均总耗时", statsDuration(s.avgLatencyMs), coverage, "token") +
-      statsCard("平均首Token (TTFT)", statsDuration(tokenTime(s)), (currentTTFT ? (s.ttftSamples || 0) : 0) + "/" + (s.requests || 0) + " 请求有新口径有效样本", "first");
-    var chartBox = function (id) {
-      var el = $(id), w = el && el.clientWidth ? el.clientWidth : 900;
-      return {w: w, h: w < 520 ? 230 : 280};
-    };
-    var chartWidth = Math.min(chartBox("usageChart").w, chartBox("latencyChart").w);
-    var chartNow = statsChartNow(data.serverTime);
+      statsCard("平均首Token (TTFT)", statsDuration(tokenTime(s)), (currentTTFT ? (s.ttftSamples || 0) : 0) + "/" + (s.requests || 0) + " 请求有新口径有效样本", "first"));
     var sharedBox = {w: chartWidth, h: chartWidth < 520 ? 230 : 280};
     var tooltipRows = function (b) {
       return [
@@ -857,9 +964,9 @@
         return i < points.length ? points[i] : null;
       }});
     });
-    $("latencyLegend").innerHTML = latencyLines.map(function (s) {
+    setHTMLIfChanged($("latencyLegend"), latencyLines.map(function (s) {
       return '<i class="series-dot ' + s.color + '"></i><span>' + esc(s.label) + "</span>";
-    }).join("");
+    }).join(""));
     var latencyOptions = {
       lines: latencyLines, bars: latencyBars,
       title: "",
@@ -882,7 +989,7 @@
     // 明细改为按模型排名，跟随同一时间范围与账号筛选；服务端已按用量排序并剔除无调用模型。
     var ranked = data.models || [];
     $("statsRange").textContent = data.start + " → " + data.end + " · " + ranked.length + " 个模型有调用";
-    $("statsTable").querySelector("tbody").innerHTML = ranked.length ? ranked.map(function (m, i) {
+    setHTMLIfChanged($("statsTable").querySelector("tbody"), ranked.length ? ranked.map(function (m, i) {
       return "<tr><td>" + (i + 1) + "</td><td class='mono'>" + esc(m.model) + "</td><td>" + esc(statsNumber(m.requests)) + "</td><td>" +
         esc(m.success + " / " + m.failed) + "</td><td>" + esc(m.tokenSamples ? statsNumber(m.tokens) : "—") + "</td><td>" +
         esc(m.tokenSamples ? statsNumber(m.inputTokens) + " / " + statsNumber(m.outputTokens) : "—") + "</td><td>" +
@@ -890,7 +997,8 @@
         esc(m.creditSamples ? statsCredit(m.credits) : "—") + "</td><td>" + esc(statsDuration(m.avgLatencyMs)) + "</td><td>" +
         esc(statsDuration(tokenTime(m))) + "</td><td class='hint'>" + esc("Token " + m.tokenSamples + "/" + m.requests +
           " · 积分 " + m.creditSamples + "/" + m.requests + " · TTFT " + (currentTTFT ? m.ttftSamples : 0) + "/" + m.requests) + "</td></tr>";
-    }).join("") : '<tr><td colspan="11" class="empty">所选范围没有模型调用记录</td></tr>';
+    }).join("") : '<tr><td colspan="11" class="empty">所选范围没有模型调用记录</td></tr>');
+    state.statsRenderKey = renderKey;
   }
 
   function loadStats(force) {
@@ -905,7 +1013,8 @@
       var value = $(field === "start" ? "statsStart" : "statsEnd").value;
       if (value) params.push(field + "=" + encodeURIComponent(value));
     });
-    $("statsInfo").textContent = "正在读取统计；图表与表格保持上次数据…";
+    // Background refresh keeps the current layout and any storage warning.
+    if (!state.lastStats) $("statsInfo").textContent = "正在读取统计…";
     return api("/admin/api/stats?" + params.join("&")).then(function (data) {
       if (version !== state.statsVersion || key !== state.apiKey) return;
       renderStats(data);
@@ -943,25 +1052,26 @@
   function renderStatus(data) {
     state.lastStatus = data;
     var g = data.gateway || {};
-    $("meta").innerHTML =
+    setHTMLIfChanged($("meta"),
       '<a class="chip chip-link" href="https://github.com/CangShui/workbuddy-gateway"' +
       ' target="_blank" rel="noreferrer" title="在新标签页打开项目地址">v' + esc(g.version) + '</a>' +
       '<span class="chip">' + esc(g.listen) + '</span>' +
       '<span class="chip">模型源 ' + esc(g.modelSource || "unavailable") + '</span>' +
-      '<span class="chip">更新 ' + esc(fmtTime(data.updatedAt)) + '</span>';
+      '<span class="chip">更新 ' + esc(fmtTime(data.updatedAt)) + '</span>');
 
     renderPoolHealth(data);
     if (state.lastAccountAlerts) renderAccountAlerts(state.lastAccountAlerts);
 
-    $("gatewayInfo").innerHTML = kvRow("版本", g.version) +
+    setHTMLIfChanged($("gatewayInfo"), kvRow("版本", g.version) +
       kvRow("监听地址", g.listen) +
       kvRow("API 鉴权", g.apiKeyEnabled ? "已启用" : "未启用") +
       kvRow("管理台", g.webuiEnabled ? "已启用" : "未启用") +
       kvRow("模型来源", g.modelSource || "unavailable") +
-      kvRow("快照更新", fmtTime(data.updatedAt));
+      kvRow("快照更新", fmtTime(data.updatedAt)));
 
     renderAccounts(data.accounts || []);
-    if (data.stale) showAlert("状态快照超过 15 秒未更新，当前展示的是上次数据，请检查网关状态。");
+    if (data.stale) showAlert("状态快照超过 15 秒未更新，当前展示的是上次数据，请检查网关状态。",
+      false, "/admin/api/status");
   }
 
   function kvRow(k, v) {
@@ -1336,11 +1446,11 @@
     var tb = $("accountsTable").querySelector("tbody");
     var focusTarget = focusedPolicyTarget(tb);
     if (!list.length) {
-      tb.innerHTML = '<tr><td colspan="16" class="empty">' +
-        (onlyUsable ? "没有符合条件的可用账号，取消勾选可查看全部账号。" : "暂无账号数据（服务是否已写入状态快照？）") + '</td></tr>';
+      updateTableBody(tb, '<tr><td colspan="16" class="empty">' +
+        (onlyUsable ? "没有符合条件的可用账号，取消勾选可查看全部账号。" : "暂无账号数据（服务是否已写入状态快照？）") + '</td></tr>');
       return;
     }
-    tb.innerHTML = list.map(function (a, i) {
+    var html = list.map(function (a, i) {
       var st = STATE_TEXT[a.state] || a.state || "-";
       var cls = STATE_CLASS[a.state] || "";
       if (a.schedulingEnabled === false) {
@@ -1348,7 +1458,7 @@
         cls = "warn";
       }
       var site = a.edition === "intl" ? "国际站" : "国内站";
-      return "<tr>" +
+      return '<tr data-row-key="' + esc(a.path) + '">' +
         "<td>" + (i + 1) + "</td>" +
         "<td>" + policySwitch("account", a.path, a.schedulingEnabled !== false, a.schedulingReason) + "</td>" +
         "<td class='mono'>" + esc(a.path) + "</td>" +
@@ -1368,6 +1478,7 @@
         esc(a.path) + "\">删除</button></td>" +
         "</tr>";
     }).join("");
+    updateTableBody(tb, html);
     restorePolicyFocus(tb, focusTarget);
   }
 
@@ -1439,12 +1550,12 @@
       "当前使用模型白名单，开关反映白名单规则。首次修改开关会删除 models.allowlist，将当前模型列表的启停状态转为 models.blocklist；以后新增模型默认开启。" :
       "模型开关写入 models.blocklist 并立即生效；停用模型保留统计记录，取消筛选可查看全部模型，客户端模型目录会隐藏停用项。";
     if (!list.length) {
-      tb.innerHTML = '<tr><td colspan="10" class="empty">' +
-        (onlyUsable ? "没有符合条件的可用模型，取消勾选可查看全部模型。" : "暂无模型数据") + '</td></tr>';
+      updateTableBody(tb, '<tr><td colspan="10" class="empty">' +
+        (onlyUsable ? "没有符合条件的可用模型，取消勾选可查看全部模型。" : "暂无模型数据") + '</td></tr>');
       return;
     }
-    tb.innerHTML = list.map(function (m) {
-      return "<tr>" +
+    var html = list.map(function (m) {
+      return '<tr data-row-key="' + esc(m.id) + '">' +
         "<td>" + policySwitch("model", m.id, m.enabled !== false, m.policyReason) + "</td>" +
         "<td class='mono'>" + esc(m.id) + "</td>" +
         rateCell("cn", m.id, m.cnMultiplier) +
@@ -1457,9 +1568,10 @@
         "<td>" + esc(m.lastStatus || "-") + "</td>" +
         "</tr>";
     }).join("");
+    updateTableBody(tb, html);
     restorePolicyFocus(tb, focusTarget);
     restoreRateDetails(tb);
-    if (data.stale) showAlert("模型统计快照过旧，当前展示的是上次数据。");
+    if (data.stale) showAlert("模型统计快照过旧，当前展示的是上次数据。", false, "/admin/api/models");
   }
 
   // ---- 倍率来源：全部取自普通日志，没有记录就显示「没有日志」 -------------------
@@ -1568,14 +1680,16 @@
     fillRateDetail(button, panel);
   }
 
-  // 轮询会重建表格，已展开的详情按 key 恢复，避免每次刷新都折叠。
+  // Replaced cells restore their details; unchanged expanded cells stay intact.
   function restoreRateDetails(table) {
     Array.prototype.forEach.call(table.querySelectorAll("button.rate-info"), function (button) {
       var key = rateKey(button.getAttribute("data-rate-site"), button.getAttribute("data-rate-model"));
       if (!state.openRateKeys[key]) return;
       var cell = button.closest("td");
       var panel = cell ? cell.querySelector(".rate-detail") : null;
-      if (panel) fillRateDetail(button, panel);
+      if (panel && (button.getAttribute("aria-expanded") !== "true" || panel.classList.contains("hidden"))) {
+        fillRateDetail(button, panel);
+      }
     });
   }
 

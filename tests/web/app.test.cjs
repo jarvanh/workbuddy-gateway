@@ -18,7 +18,8 @@ function response(status, body) {
   return {status, ok: status >= 200 && status < 300, json: async () => body};
 }
 function fixture(fetchImpl = async () => response(200, {}), cookies = new Map(), clock) {
-  const elements = new Map(), session = new Map(), local = new Map(), alerts = [];
+  const elements = new Map(), session = new Map(), local = new Map(), alerts = [], timers = new Map();
+  let timerID = 0;
   const cookieWrites = [];
   function element(id) {
     if (!elements.has(id)) {
@@ -46,6 +47,8 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map(),
     sessionStorage: storage(session), localStorage: storage(local),
     window: {alert: message => alerts.push(message), confirm: () => true, addEventListener() {}, location: {protocol: "http:", reload() {}}},
     TextEncoder, fetch: fetchImpl, setInterval: () => 1,
+    setTimeout: (fn) => { timers.set(++timerID, fn); return timerID; },
+    clearTimeout: id => timers.delete(id),
   };
   if (typeof clock === "number") {
     context.Date = class extends Date {
@@ -65,7 +68,7 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map(),
   });
   let source = fs.readFileSync(path.join(projectRoot, "web", "app.js"), "utf8");
   source = source.replace(/\}\)\(\);\s*$/, `globalThis.review = {
-    state, api, renderAccounts, renderModels, renderStatus, refreshActive,
+    state, api, showAlert, hideAlert, togglePolicy, renderAccounts, renderModels, renderStatus, refreshActive,
     renderPoolHealth, renderAccountAlerts, bindAccountAlertTooltip, loadAccountAlerts, lockDashboard,
     saveKey, saveAPISettings, initializeAdmin, discoverSetup,
     showConfigWarning, loadConfigEditor, saveConfigEditor, exitConfigEdit, setTab, lockDashboard,
@@ -78,11 +81,80 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map(),
   vm.createContext(context);
   vm.runInContext(source, context);
   return {review: context.review, element, session, local, alerts, window: context.window,
-    document: context.document, cookies, cookieWrites};
+    document: context.document, cookies, cookieWrites, timers};
 }
 function cells(html) {
   return [...html.matchAll(/<td(?: [^>]*)?>(.*?)<\/td>/g)].map(m => m[1]);
 }
+
+test("成功提示不被轮询清掉，五秒后关闭，旧定时器不能关闭新错误", async () => {
+  const f = fixture();
+  f.review.state.apiKey = "synthetic-notification-key";
+  f.review.showAlert("合成启停成功", true);
+  const oldTimer = [...f.timers.values()][0];
+  await f.review.api("/admin/api/status");
+  assert.equal(f.element("alert").className, "alert ok");
+  f.review.showAlert("合成错误", false, "/admin/api/account-toggle");
+  oldTimer();
+  assert.equal(f.element("alert").className, "alert", "迟到的成功定时器不能吞掉新错误");
+  f.review.showAlert("再次成功", true);
+  [...f.timers.values()][0]();
+  assert.equal(f.element("alert").className, "alert hidden");
+  audit("成功提示防闪烁通过", {poll_preserves_success: true, old_timer_guard: true});
+});
+
+test("无关请求不能清除错误，同一接口恢复才关闭；静默请求失败仍审计", async () => {
+  let quiet = false;
+  const calls = [];
+  const f = fixture(async (path, options) => {
+    calls.push({path, options});
+    if (quiet && path === "/admin/api/stats") throw new Error("synthetic network error");
+    return response(200, {});
+  });
+  f.review.state.apiKey = "synthetic-error-key";
+  f.review.showAlert("开关保存失败", false, "/admin/api/account-toggle");
+  await f.review.api("/admin/api/status");
+  assert.equal(f.element("alert").textContent, "开关保存失败");
+  assert.equal(f.element("alert").className, "alert");
+  await f.review.api("/admin/api/account-toggle");
+  assert.equal(f.element("alert").className, "alert hidden");
+  quiet = true;
+  await assert.rejects(f.review.api("/admin/api/stats", {quiet: true, trace: "synthetic-quiet-trace"}));
+  assert.equal(f.element("alert").className, "alert hidden");
+  assert(calls.some(c => c.path === "/admin/api/client-events" &&
+    c.options.headers["X-Trace-ID"] === "synthetic-quiet-trace" &&
+    JSON.parse(c.options.body).event === "request_failed"));
+  audit("错误归属与静默请求通过", {unrelated_poll_cannot_hide_error: true, failure_audited: true});
+});
+
+test("同一账号与模型数据重复轮询不重写tbody，变化及清空仍更新", () => {
+  const f = fixture();
+  for (const [id, render, payload, changed] of [
+    ["accountsTable", f.review.renderAccounts,
+      [{path: "synthetic.json", state: "active", requests: 1}],
+      [{path: "synthetic.json", state: "active", nickname: "已更新"}]],
+    ["modelsTable", f.review.renderModels,
+      {models: [{id: "synthetic-model", requests: 1}]},
+      {models: [{id: "synthetic-model", requests: 2}]}],
+  ]) {
+    const tb = f.element(id);
+    let html = "", writes = 0;
+    Object.defineProperty(tb, "innerHTML", {configurable: true,
+      get: () => html, set: value => { html = value; writes++; }});
+    render(payload);
+    render(payload);
+    assert.equal(writes, 1, id + ": identical refresh replaced markup");
+    render(changed);
+    assert.equal(writes, 2, id + ": changed data was not rendered");
+    render(id === "accountsTable" ? [] : {models: []});
+    assert.equal(writes, 3);
+    assert.match(html, /暂无/);
+  }
+  f.review.lockDashboard();
+  assert.equal(f.element("accountsTable")._tableSourceHTML, "");
+  assert.equal(f.element("modelsTable")._tableSourceHTML, "");
+  audit("重复轮询跳过表格重写通过", {accounts: true, models: true, real_changes_preserved: true});
+});
 
 test("运行状态只展示健康度，无账号和过旧快照不能显示100%", () => {
   const f = fixture();
@@ -985,6 +1057,56 @@ function statsPayload(over = {}) {
   }, over);
 }
 
+test("统计轮询仅服务器时钟变化时复用图表，跨未来桶边界、数据及宽度变化仍重绘", () => {
+  const f = fixture(), chart = f.element("usageChart");
+  let markup = "", writes = 0;
+  Object.defineProperty(chart, "innerHTML", {configurable: true,
+    get: () => markup, set: value => { markup = value; writes++; }});
+  const start = Date.parse("2026-10-27T08:00:00+08:00");
+  const data = statsPayload({serverTime: start + 1000, buckets: [
+    statsBucket("08:00", {start, requests: 1, tokens: 100, tokenSamples: 1}),
+    statsBucket("09:00", {start: start + 3600000}),
+  ]});
+  f.review.renderStats(data);
+  f.review.renderStats({...data, serverTime: start + 2000});
+  assert.equal(writes, 1, "服务器时间每秒推进不应清空悬浮并重建SVG");
+  f.review.renderStats({...data, serverTime: start + 2000,
+    storage: {lastSavedAt: start + 2000, message: "合成存储警告"}});
+  assert.equal(writes, 1, "落盘时间变化不能重建图表");
+  assert.equal(f.element("statsInfo").textContent, "合成存储警告");
+  f.review.renderStats({...data, serverTime: start + 3600001});
+  assert.equal(writes, 2, "原未来桶到时必须重新显示，不能被缓存冻结");
+  chart.clientWidth = 1200;
+  f.element("latencyChart").clientWidth = 1200;
+  f.review.renderStats({...data, serverTime: start + 3600001});
+  assert.equal(writes, 3, "窗口改变必须更新viewBox");
+  const changed = {...data, serverTime: start + 3600001,
+    summary: {...data.summary, tokens: 1000}};
+  f.review.renderStats(changed);
+  assert.equal(writes, 4, "真实统计变化不能被缓存吞掉");
+  f.review.lockDashboard();
+  f.review.renderStats(changed);
+  assert.equal(writes, 5, "退出登录清空后必须允许重新渲染");
+  audit("统计相同数据复用通过", {clock_only_skipped: true, future_boundary_redraw: true,
+    width_and_data_redraw: true, logout_resets_cache: true});
+});
+
+test("后台读取统计不插入临时提示，不覆盖正在显示的存储警告", async () => {
+  let finish;
+  const payload = statsPayload({storage: {mode: "memory", message: "统计暂时无法写入，保留内存数据"}});
+  const f = fixture(async route => route.startsWith("/admin/api/stats?") ?
+    new Promise(resolve => { finish = () => resolve(response(200, payload)); }) : response(204, {}));
+  f.review.state.apiKey = "synthetic-stats-key";
+  f.review.renderStats(payload);
+  const before = f.element("statsInfo").textContent;
+  const loading = f.review.loadStats(false);
+  assert.equal(f.element("statsInfo").textContent, before);
+  finish();
+  await loading;
+  assert.equal(f.element("statsInfo").textContent, before);
+  audit("统计静默刷新保持布局通过", {temporary_loading_row_removed: true, storage_warning_preserved: true});
+});
+
 test("TTFT新旧口径隔离：旧快照不伪装成首Token，明确显示排除数", () => {
   const f=fixture();
   const old=statsPayload({ttftMetric: undefined});
@@ -1470,7 +1592,8 @@ test("离开图表、取消、重绘或锁定页面后，已排队的悬浮不�
       usage.move(0);
       if (action === "leave") groupEvents.pointerleave();
       if (action === "cancel") usage.listeners.pointercancel();
-      if (action === "render") f.review.renderStats(statsPayload());
+      // Identical polls deliberately no longer redraw; exercise a real update.
+      if (action === "render") f.review.renderStats(statsPayload({startedAt: 1760000000001}));
       if (action === "lock") f.review.lockDashboard();
       if (action === "tab") f.review.setTab("accounts");
       clock.flush();
@@ -1492,7 +1615,7 @@ test("旧帧未能物理取消时，重绘后仍只处理新图的新位置", ()
   // Replacing innerHTML removes the old SVG in a browser; mirror that in the
   // stub so the redraw cannot accidentally rebind the detached test element.
   f.element("usageChart").querySelector = () => null;
-  f.review.renderStats(statsPayload());
+  f.review.renderStats(statsPayload({startedAt: 1760000000001}));
   const chart = hoverChart(f, "usageChart", {left: 0, top: 0, width: 900, height: 280});
   chart.move(1);
   assert.equal(clock.pending, 2);
