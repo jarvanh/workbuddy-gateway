@@ -36,7 +36,7 @@ import (
 	"github.com/skip2/go-qrcode"
 )
 
-var version = "1.14.40"
+var version = "1.29.10"
 
 const (
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
@@ -810,10 +810,10 @@ func main() {
 		// runtime settings now as well, rather than leaving them console-only.
 		trace := newTraceID()
 		logConcurrentConfig(trace)
+		logIdentityRuntimeConfig(trace)
 		identityEnabled, identityTarget, identityRules := identitySettingsSummary()
-		compatibilityEnabled, compatibilityRules := promptCompatibilitySettingsSummary()
-		log.Printf("[配置就绪] traceId=%s identity启用=%t identity目标=%s identity规则数=%d 独立兼容启用=%t 独立兼容规则数=%d 说明=启动配置已加载，后续修改可热加载；未记录Key或配置正文",
-			trace, identityEnabled, identityTarget, identityRules, compatibilityEnabled, compatibilityRules)
+		log.Printf("[配置就绪] traceId=%s identity启用=%t identity目标=%s identity规则数=%d 说明=启动配置已加载，后续修改可热加载；未记录Key或配置正文",
+			trace, identityEnabled, identityTarget, identityRules)
 	}
 	closeDebug := func() {}
 	if serveCommand {

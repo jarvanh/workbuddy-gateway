@@ -76,13 +76,6 @@ func TestConfigExampleCoversEveryRuntimeField(t *testing.T) {
 		"Codex": "WorkBuddy", "ZCode": "WorkBuddy", "workspace root": "workspace base",
 		"are paths the user": "are paths that the user",
 	}}
-	compatibilityEnabled := false
-	exampleSchema.PromptCompatibility = runtimePromptCompatibilityConfig{
-		Enabled: &compatibilityEnabled,
-		Replacements: map[string]string{
-			"workspace root": "workspace base",
-		},
-	}
 	schema, err := json.Marshal(exampleSchema)
 	if err != nil {
 		t.Fatal(err)
@@ -149,8 +142,8 @@ func TestConfigExampleIncludesIdentityCompatibilityDefaults(t *testing.T) {
 	if err := json.Unmarshal(raw, &c); err != nil {
 		t.Fatal(err)
 	}
-	if c.PromptCompatibility.Enabled == nil || *c.PromptCompatibility.Enabled {
-		t.Fatal("example must not enable the independent compatibility module")
+	if len(c.DeprecatedPromptCompatibility) != 0 {
+		t.Fatal("example must not contain the removed compatibility field")
 	}
 	if len(c.Identity.Replacements) != 7 {
 		t.Fatalf("example identity rules=%d want=7", len(c.Identity.Replacements))

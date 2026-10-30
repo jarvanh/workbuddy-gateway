@@ -13,6 +13,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -28,6 +29,7 @@ var statusSnapshotWriteMu sync.Mutex
 // 与运行时状态同步更新，不能仅由扫描协程缓存：网页写入后立即撤回旧文件也必须生效。
 var runtimeAppliedHash [32]byte
 var runtimeHasAppliedHash bool
+var deprecatedPromptCompatibilityPresent atomic.Bool
 
 func parseRuntimeConfig(data []byte) (runtimeFileConfig, error) {
 	var c runtimeFileConfig
@@ -182,7 +184,7 @@ func ensureRuntimeConfigFile(path string) error {
 	if err := os.Rename(temporary, path); err != nil {
 		return err
 	}
-	log.Printf("[配置初始化] 已补充缺失的 identity/concurrent 默认配置；已有值和其他配置保留，后续修改仍可热加载；不自动添加或启用独立兼容模块")
+	log.Printf("[配置初始化] 已补充缺失的 identity/concurrent 默认配置；已有值和其他配置保留，后续修改仍可热加载")
 	return nil
 }
 
@@ -340,13 +342,10 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 	_ = setModelAccountFilter(c.Models.Accounts)
 	setSystemPromptConfig(c.SystemPrompt.Fallback, c.SystemPrompt.Force)
 	setIdentityConfig(c.Identity)
-	setPromptCompatibilityConfig(c.PromptCompatibility)
+	deprecatedPromptCompatibilityPresent.Store(len(c.DeprecatedPromptCompatibility) > 0)
 	modelConcurrency.configure(c.Concurrent)
 	logConcurrentConfig(trace)
-	identityEnabled, identityTarget, identityRuleCount := identitySettingsSummary()
-	log.Printf("[身份替换配置] traceId=%s 启用=%t 目标=%s 规则数=%d 说明=仅处理 system/developer/assistant 文本；热加载只影响后续请求", trace, identityEnabled, identityTarget, identityRuleCount)
-	compatibilityEnabled, compatibilityRuleCount := promptCompatibilitySettingsSummary()
-	log.Printf("[提示词兼容配置] traceId=%s 启用=%t 规则数=%d 说明=仅处理 system/developer/assistant 文本；热加载只影响后续请求", trace, compatibilityEnabled, compatibilityRuleCount)
+	logIdentityRuntimeConfig(trace)
 	previousProfile := officialRequests.Load()
 	setRequestProfile(profile)
 	// 未配置 upstream.requestProfile 时会回退 legacy，出站请求体因此不压缩。
@@ -451,6 +450,18 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 			trace, len(c.Models.Blocklist), len(c.Models.Allowlist), len(c.Models.Accounts), c.Debug.Enabled, c.Logs.RetentionDays, header, idle, retries, keepalive, firstByteRetry, cfg.Port, cfg.WebPort)
 	}
 	return nil
+}
+
+// 启动日志初始化后再记录一次，确保废弃字段提示与热加载结果一样落盘。
+// 不记录替换词正文，避免把旧配置中的私密文本写入普通日志。
+func logIdentityRuntimeConfig(trace string) {
+	enabled, target, rules := identitySettingsSummary()
+	log.Printf("[身份替换配置] traceId=%s 启用=%t 目标=%s 规则数=%d 说明=文本替换统一由 identity 控制；仅处理 system/developer/assistant 文本；热加载只影响后续请求",
+		trace, enabled, target, rules)
+	if deprecatedPromptCompatibilityPresent.Load() {
+		log.Printf("[废弃配置] traceId=%s 字段=promptCompatibility 结果=已忽略 说明=重复替换模块已移除；请将需要保留的规则配置在 identity.replacements 中，确认后可删除旧字段；未记录旧规则正文",
+			trace)
+	}
 }
 
 func upstreamSettings() (time.Duration, time.Duration, int) {

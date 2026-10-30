@@ -23,12 +23,6 @@
       "are paths the user": "are paths that the user"
     }
   },
-  "promptCompatibility": {
-    "enabled": false,
-    "replacements": {
-      "workspace root": "workspace base"
-    }
-  },
   "concurrent": {
     "MaxAcc": 4,
     "MaxGlobal": 0

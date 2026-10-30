@@ -22,6 +22,8 @@
 
 **v1.14.40**：`identity` 默认映射补齐 `workspace root → workspace base` 与 `are paths the user → are paths that the user`。新装生成完整默认配置；旧配置升级只补缺失规则，不覆盖已有自定义值，也不重新启用已关闭的 `identity`。
 
+**v1.14.41**：移除重复的 `promptCompatibility` 替换模块，文本替换统一使用 `identity.replacements`，七条默认规则和热加载保持不变。旧配置若仍有该字段，仅兼容读取并提示已忽略，不会阻止启动或继续执行旧规则。
+
 **v1.14.24**：Chat 流式响应增加首字节前 SSE 心跳与最多一次安全重放；DSH 身份句和 GUI 环境说明扩展覆盖 assistant 历史、后续文本块及配置注入提示词。默认开启，可通过 `upstream` 配置关闭重放。
 
 **v1.14.25**：Responses 的 namespace 子工具、custom 工具（如 `apply_patch`）和 web_search 不再被静默丢弃；恢复 `custom_tool_call` 与 namespace 输出形状。出站头补齐已采集的 WorkBuddy 桌面静态身份；system/developer/assistant 中的 Codex、DeepSeek Harness、Claude Code、ZCode 展示名统一为 `Assistant`。实测 `/v2/responses` 返回 404，上游路径仍为 `/v2/chat/completions`。
@@ -343,7 +345,7 @@ workbuddy-gateway serve -keepalive-hours ""
 }
 ```
 
-- `promptCompatibility` 是可选的独立文本规则，**默认关闭，旧配置升级不自动添加或开启**。只有显式 `enabled:true` 才执行；开启后省略或空映射使用内置词组规则。它与 `identity` 分别控制、均支持热加载；用户、工具定义和工具参数不会被改写。通常只使用 `identity` 即可，不必同时开启两套规则。
+- 文本替换统一使用 `identity.replacements`，支持任意自定义词条并可热加载。v1.14.40 曾提供的重复字段 `promptCompatibility` 已移除；旧配置仍含该字段时仅兼容读取并提示已忽略，不执行其中规则，不影响启动。需要保留的旧规则请放入 `identity.replacements`，确认后可删除旧字段。
 
 | 字段 | 说明 |
 |---|---|
