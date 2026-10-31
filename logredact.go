@@ -30,6 +30,8 @@ func registerSecrets(values ...string) {
 func registerCredentialSecrets(auth *StoredAuth) {
 	if auth != nil {
 		registerSecrets(auth.Auth.AccessToken, auth.Auth.RefreshToken)
+		// 设备令牌与访问令牌同级敏感：日志/错误正文统一脱敏。
+		registerSecrets(auth.Auth.DeviceToken)
 	}
 }
 

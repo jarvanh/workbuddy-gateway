@@ -106,6 +106,20 @@ type runtimeFileConfig struct {
 		// Restricted403RotateMax：命中上游风控限制（11140）后允许换号重试的最大次数。
 		// 0（默认）= 命中即停：绝不把同一请求再打给其他账号，避免连坐扩大封禁。
 		Restricted403RotateMax *int `json:"restricted403RotateMax"`
+		// DeviceToken：全局兑底真实设备令牌（QIMEI/TuringShield SDK 产物）。仅当凭据
+		// 文件未自带 deviceToken 时生效，且只在国内站点发送；空值（默认）关闭管线。
+		// 网关绝不生成/伪造该头——只透运维护运者从官方客户端提取的真实值。
+		DeviceToken string `json:"deviceToken"`
+		// RotationPaceMinSeconds/MaxSeconds：模型请求换号重试前的随机等待窗口（秒）。
+		// 默认 2–5s；被拒后立即换号连发是机器特征，也是连坐封禁的放大器
+		// （hub #422 维护者建议 2–5s 起步）。两个都显式 ≤0 表示关闭该等待。
+		RotationPaceMinSeconds *int `json:"rotationPaceMinSeconds"`
+		RotationPaceMaxSeconds *int `json:"rotationPaceMaxSeconds"`
+		// BackgroundTaskGapMinSeconds/MaxSeconds：后台任务（续期保活/价格探测/warmup）
+		// 逐账号或逐模型之间的随机间隔（秒）。默认 2–5s，取代旧固定 1s——固定值
+		// 本身就是可识别特征。两个都显式 ≤0 表示关闭该等待。
+		BackgroundTaskGapMinSeconds *int `json:"backgroundTaskGapMinSeconds"`
+		BackgroundTaskGapMaxSeconds *int `json:"backgroundTaskGapMaxSeconds"`
 	} `json:"upstream"`
 	// Models 段可选，用于按模型名做黑白名单控制（大小写不敏感）。
 	Models struct {

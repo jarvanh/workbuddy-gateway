@@ -49,7 +49,12 @@
     "earlyFlushGraceSeconds": 30,
     "streamKeepaliveSeconds": 15,
     "enableFirstByteRetry": true,
-    "restricted403RotateMax": 0
+    "restricted403RotateMax": 0,
+    "deviceToken": "",
+    "rotationPaceMinSeconds": 2,
+    "rotationPaceMaxSeconds": 5,
+    "backgroundTaskGapMinSeconds": 2,
+    "backgroundTaskGapMaxSeconds": 5
   },
   "models": {
     "blocklist": [],

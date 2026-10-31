@@ -70,25 +70,30 @@ tool_choice 和 parallel_tool_calls 不因官方样本省略就被删除，工�
 不执行 `high→max` 的无条件升级。用户主动选 high、辅助标题任务使用 high，
 与前置代理错误降档不是一回事。
 
-### 国内模型请求头及压缩
+### 桌面端模型请求头及压缩（两站）
 
-仅国内模型 POST `/v2/chat/completions` 使用已采集的静态头：
+official 模式下，国内/国际站的模型 POST `/v2/chat/completions` 都使用桌面端静态身份，
+版本按站点区分（hub 5.8.3 CN 实抓 / 5.8.4 intl 抓包与 9router PR #753 对齐）：
 
-- User-Agent：`WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0`
-- Accept：`application/json`
-- X-IDE-Type / X-IDE-Name / X-IDE-Version：`WorkBuddy / WorkBuddy / 5.8.3`
-- X-Private-Data：`true`
-- X-Codebuddy-Request：`1`
-- X-Requested-With：`XMLHttpRequest`
-- x-stainless-*：对齐已采集的 Node SDK 静态值
+- User-Agent：国内 `WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0`；
+  国际 `WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0`（第二段是小写
+  workbuddy-ai，国际版 applicationName）
+- X-IDE-Type / X-IDE-Name：`WorkBuddy / WorkBuddy`；X-IDE-Version：国内 `5.8.3`、国际 `5.8.4`
+- X-Private-Data：`true`；X-Codebuddy-Request：`1`；Accept：`application/json`
+- X-Requested-With：`XMLHttpRequest`；国际站另带 `Accept-Language: en-US`
+- Origin/Referer：国际站 `https://www.workbuddy.ai`（国内实抓样本不含，保持不发）
+- X-Domain：国际站发 `www.workbuddy.ai`，凭据自带 Domain（企业自定义域）时不覆盖
+- x-stainless-*：对齐已采集的 Node SDK 6.25.0 静态值
 - X-Agent-Intent / X-Agent-Purpose / X-Agent-Type：`craft / conversation / main`
 - X-Product：`SaaS`
 - X-Request-ID 与 X-Conversation-Message-ID 使用相同的 32 位消息 ID；
   同一逻辑请求的安全重试沿用该标识。
+- chat 请求不再携带 X-Machine-ID / X-Session-ID（5.8.4 抓包实锤：官方桌面
+  chat 不带这两个头，它们只属于反馈上报/计费链路；带上反而是网关特征）。
 
 保留账号所属的 access token、用户/企业/域信息及会话标识；
-模型请求不再携带旧版 X-Client-ID、X-Client-Version、Origin、Referer、
-X-Refresh-Token 和缺省 X-No-* 头。
+模型请求不再携带旧版 X-Client-ID、X-Client-Version、X-Refresh-Token
+和缺省 X-No-* 头（国内站 Origin/Referer 同样删除；国际站由桌面身份重新提供）。
 登录、刷新、额度、模型目录等控制接口保持原逻辑。
 
 模型 JSON 使用 gzip 压缩，请求头与实际压缩字节、Content-Length 一致。
@@ -100,14 +105,41 @@ X-Refresh-Token 和缺省 X-No-* 头。
 
 以下字段不凭空制造：
 
-- X-Device-Token 等设备凭证；
-- x-stainless / Node 运行时等不属于当前 Go 网关的 SDK 身份；
+- X-Device-Token 不伪造：官方由本机 QIMEI/TuringShield SDK 生成，网关无法生成。
+  网关只透传运维配置的**真实** token（凭据 `auth.deviceToken` 优先，
+  `upstream.deviceToken` 全局兑底），且仅国内站发送——国际版客户端没有该头
+  （hub #448，发既是伪造也是跨账号关联键）。留空（默认）整条管线关闭。
+- x-stainless / Node 运行时等仅作为已采集的静态声明值，不声称 Go 网关真的是 Node；
 - 不能可靠判断的 Agent 类型、用途和业务增长事件；
 - 未采集验证的 B3、ACP 等其他链路字段。
 
-国际站的 UA、认证头、站点和请求编码保持 legacy，不把国内桌面头复制到国际站。
+国际站同样应用桌面身份（版本/域与国内站不同，见上表），不再把国内头原样复制，
+也不再回退 legacy 的 CLI 身份；legacy profile 仍是完整的旧行为开关。
 official 的正文准备规则仍适用于该请求；未知模型依旧不注入未经验证的采样字段。
 国内模型 URL 当前仍沿用原有账号站点配置，未改成抓包中另一域名，不把近似兼容宣传为完全相同的官方链路。
+
+## 节奏治理（账号间抖动）
+
+上游风控（11140）的触发画像之一是「程序化轮询」：被拒后立即换号连发、后台任务
+逐账号无缝推进（hub #422 整池连坐事故的放大器，维护者建议 2–5s 随机间隔起步）。
+节奏窗口**默认全部关闭（旧行为）**，由 config.json 的 upstream 段显式启用：
+
+```json
+{
+  "upstream": {
+    "rotationPaceMinSeconds": 2,
+    "rotationPaceMaxSeconds": 5,
+    "backgroundTaskGapMinSeconds": 2,
+    "backgroundTaskGapMaxSeconds": 5
+  }
+}
+```
+
+- 模型请求换号重试：每次换号前随机等待 [min,max] 秒，扣除上一次上游请求
+  本身已耗时；客户端断开立即停止等待。
+- 后台任务（warmup 触发 / 价格探测）：换账号、换探测目标之间随机等待。
+- 续期保活：保留原有 1s 基础间隔，叠加同一随机窗口，抹平「精确等长」特征。
+- 两个值都显式 ≤0 表示关闭；min>max 自动交换；热加载生效，只影响后续请求。
 
 ### Responses 工具保真
 

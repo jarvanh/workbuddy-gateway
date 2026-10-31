@@ -1386,6 +1386,8 @@ func modelPriceProbeOnce() {
 				continue
 			}
 			verdict, credit, tokens, detail := probeModelPrice(acc, id)
+			// 换探测目标前随机间隔（默认关，配置启用）：批量探测无缝推进是机器特征。
+			paceBackgroundTask()
 			modelsMu.Lock()
 			p := modelProbes[probeKey(site, id)]
 			p.LastProbeAt = now.Unix()

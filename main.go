@@ -231,7 +231,19 @@ var (
 	// 0（默认）= 命中即停：绝不把同一请求再打给其他账号。社区实测（workbuddy2api-hub #422）：
 	// 换号重试会成批送出连坐证据，一个任务就能把整池账号逐个打死。
 	restricted403RotateMax = 0
+
+	// deviceTokenDefault 为全局兜底 X-Device-Token（upstream.deviceToken）：仅当凭据
+	// 未自带 deviceToken 时生效，且只在国内站点发送。绝不凭空生成/伪造，
+	// 空值（默认）表示整条管线关闭。
+	deviceTokenDefault = ""
 )
+
+// deviceTokenSnapshot 返回当前生效的全局兜底设备令牌（upstreamConfigMu 保护）。
+func deviceTokenSnapshot() string {
+	upstreamConfigMu.RLock()
+	defer upstreamConfigMu.RUnlock()
+	return deviceTokenDefault
+}
 
 // isTransientNetworkError 判断错误是否为「瞬时网络故障」，这类错误值得重试。
 //
@@ -352,7 +364,7 @@ func doUpstreamRequest(r *http.Request, acc *Account, prof *upstreamProfile, ups
 		debugEvent(r, "debug", "upstream_request_profile_applied", map[string]any{
 			"profile": profile, "desktop_headers": usesObservedDesktopHeaders(profile, prof),
 			"decoded_body_bytes": len(upstreamBytes), "wire_body_bytes": len(wireBytes),
-			"site": prof.Key, "business_impact": "仅模型出站；国际站沿用原请求头，不记录认证或正文",
+			"site": prof.Key, "business_impact": "仅模型出站；两站均应用桌面端身份（版本按站点），不记录认证或正文",
 		})
 		if debugLoggingEnabled() {
 			req.Header.Set("X-Trace-ID", debugTraceID(r))
@@ -515,6 +527,10 @@ type StoredTokens struct {
 	RefreshToken string `json:"refreshToken"`
 	ExpiresAt    int64  `json:"expiresAt"`
 	Domain       string `json:"domain"`
+	// DeviceToken 运维从官方桌面客户端本机提取的真实设备令牌（QIMEI/TuringShield
+	// SDK 产物，可选）。网关绝不伪造：仅透传真实值，且只在国内站点发送
+	// （hub #448：国际版客户端没有该头，发既是伪造也是跨账号关联键）。留空不发送。
+	DeviceToken string `json:"deviceToken,omitempty"`
 	// 以下为本地续期元数据，官方客户端不读；旧凭据文件缺省为 0，不影响解析。
 	RefreshExpiresAt int64 `json:"refreshExpiresAt,omitempty"` // 刷新令牌到期时间（Unix 秒），0=未知
 	LastRefreshTime  int64 `json:"lastRefreshTime,omitempty"`  // 最近一次续期成功时间（Unix 秒），0=从未续期
@@ -4303,10 +4319,18 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 	// pendingRelease 记录本轮已提交在途预留的账号：换号/失败路径必须释放，
 	// 成功路径由调用方（流式写完后）释放，见 handleChatCompletions 的 defer。
 	var pendingRelease *Account
+	// lastDispatch 记录上一次实际发出上游请求的时刻；换号节奏按它扣除已耗时。
+	var lastDispatch time.Time
 	for attempt := 0; attempt < poolSize; attempt++ {
 		if pendingRelease != nil {
 			releaseInFlight(pendingRelease, reqID)
 			pendingRelease = nil
+		}
+		if attempt > 0 {
+			// 换号节奏（11140 加固）：被拒后立即换下一个账号连发是「程序化轮询」
+			// 的机器特征，也是连坐封禁的放大器（hub #422 维护者建议 2–5s 随机
+			// 间隔起步）。默认 2–5s 随机窗口、扣除上一发已耗时；客户端取消即停。
+			paceAccountRotation(r.Context(), lastDispatch)
 		}
 		acc, selection, err := nextAccountForModel(modelName, attempted, reqID)
 		if err != nil {
@@ -4406,6 +4430,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 		// Model sends share the credential read lock; maintenance remains exclusive.
 		// Concurrency slots are retained until the response stream ends.
 		statsSelectAccount(r, acc, modelName)
+		lastDispatch = time.Now()
 		resp, upstreamCancel, err := doUpstreamRequest(r, acc, prof, upstreamBytes, reqID, traceID)
 		acc.lock.RUnlock()
 		if err != nil {
@@ -5207,6 +5232,18 @@ func backendHeaders(req *http.Request, sa *StoredAuth, prof *upstreamProfile) {
 		req.Header.Set("X-Domain", sa.Auth.Domain)
 	} else {
 		req.Header.Set("X-No-Department-Info", "1")
+	}
+	// 设备令牌管线（11140 加固）：官方桌面客户端由本机 QIMEI/TuringShield SDK
+	// 生成真实 X-Device-Token；网关无法生成，只透传运维配置的真实 token
+	// （凭据 deviceToken 优先，upstream.deviceToken 全局兜底），绝不伪造。
+	// 仅国内站点发送——国际版客户端没有该头（hub #448，发即伪造+关联键）；
+	// 国际站 chat 由桌面兼容层再兜底删除一次。计费/续期同口径携带。
+	if prof.Key == "cn" {
+		if sa != nil && sa.Auth.DeviceToken != "" {
+			req.Header.Set("X-Device-Token", sa.Auth.DeviceToken)
+		} else if global := deviceTokenSnapshot(); global != "" {
+			req.Header.Set("X-Device-Token", global)
+		}
 	}
 	req.Header.Set("X-Product", prof.Product)
 }

@@ -17,6 +17,13 @@ const (
 	requestProfileOfficial = "official"
 	// 固定为 2026-10-21 国内桌面实抓版本，不声称跟随官网最新版本。
 	observedDesktopUA = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"
+	// 国际站桌面端身份按 workbuddy2api-hub wb_identity（2026-10-16 5.8.4 mitmproxy
+	// 抓包）与 9router PR #753（从 5.8.4 发行包反读）对齐：UA 第二段是小写
+	// workbuddy-ai（国际版 applicationName），版本 5.8.4。
+	observedDesktopUAINTL     = "WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0"
+	observedDesktopVerCN      = "5.8.3"
+	observedDesktopVerINTL    = "5.8.4"
+	observedDesktopDomainINTL = "www.workbuddy.ai"
 )
 
 var officialRequests atomic.Bool
@@ -181,11 +188,14 @@ func mergeLeadingInstructionMessages(obj map[string]any, r *http.Request, id uin
 }
 
 func usesObservedDesktopHeaders(profile string, prof *upstreamProfile) bool {
-	return profile == requestProfileOfficial && prof.Key == "cn"
+	// 国际站是 11140 风控事故的主场（2026-10-26/28/31 波次全部 intl），
+	// 桌面身份必须两站同时生效；profile 仍是总开关（legacy 完全回退旧行为）。
+	return profile == requestProfileOfficial
 }
 
 // 只用于模型请求。登录/刷新/额度接口继续沿用原有鉴权逻辑。
-// 不伪造 X-Device-Token、SDK/Node 运行时信息或其他无法取得的客户端凭证。
+// 不伪造 X-Device-Token 等无法取得的客户端凭证（真实 token 走配置透传，见
+// backendHeaders 的设备令牌管线）；x-stainless-* 取 SDK 6.25.0 固定值。
 func applyObservedDesktopHeaders(req *http.Request, prof *upstreamProfile, profile string) {
 	if !usesObservedDesktopHeaders(profile, prof) || req.Method != http.MethodPost || req.URL.Path != "/v2/chat/completions" {
 		return
@@ -193,14 +203,15 @@ func applyObservedDesktopHeaders(req *http.Request, prof *upstreamProfile, profi
 	for _, name := range []string{
 		"Origin", "Referer", "X-Client-ID", "X-Client-Version", "X-Refresh-Token",
 		"X-No-Authorization", "X-No-User-Id", "X-No-Enterprise-Id", "X-No-Department-Info",
+		// hub 5.8.4 抓包实锤：官方桌面 chat 不带 X-Machine-ID / X-Session-ID
+		//（那两个是反馈上报/计费链路的头）。chat 带上反而是网关特征；
+		// 每账号隔离由「不带」保证，不存在共用值关联。
+		"X-Machine-ID", "X-Session-ID",
 	} {
 		req.Header.Del(name)
 	}
-	// 2026-10-21 国内桌面实抓的静态客户端身份。设备令牌、用户身份和会话标识
-	// 仍由真实账号/会话提供；不伪造无法取得的 X-Device-Token。
-	for name, value := range map[string]string{
+	identity := map[string]string{
 		"Accept":                      "application/json",
-		"User-Agent":                  observedDesktopUA,
 		"X-Requested-With":            "XMLHttpRequest",
 		"x-stainless-arch":            "x64",
 		"x-stainless-lang":            "js",
@@ -211,15 +222,37 @@ func applyObservedDesktopHeaders(req *http.Request, prof *upstreamProfile, profi
 		"x-stainless-runtime-version": "v22.21.1",
 		"X-IDE-Type":                  "WorkBuddy",
 		"X-IDE-Name":                  "WorkBuddy",
-		"X-IDE-Version":               "5.8.3",
 		"X-Private-Data":              "true",
 		"X-Codebuddy-Request":         "1",
 		"X-Agent-Intent":              "craft",
 		"X-Agent-Purpose":             "conversation",
 		"X-Agent-Type":                "main",
 		"X-Product":                   "SaaS",
-	} {
+	}
+	if prof.Key == "cn" {
+		// 国内站维持 2026-10-21 实抓样本：5.8.3，无 Accept-Language（实抓未含），
+		// X-Domain 由凭据 auth.Domain 提供，不在此覆盖。
+		identity["User-Agent"] = observedDesktopUA
+		identity["X-IDE-Version"] = observedDesktopVerCN
+	} else {
+		// 国际站对齐 hub 5.8.4 抓包：UA 第二段 applicationName 是小写
+		// workbuddy-ai，XMLHttp 包装层带 Origin/Referer 与 Accept-Language: en-US。
+		identity["User-Agent"] = observedDesktopUAINTL
+		identity["X-IDE-Version"] = observedDesktopVerINTL
+		identity["Accept-Language"] = "en-US"
+		identity["Origin"] = prof.Origin
+		identity["Referer"] = prof.Origin + "/"
+	}
+	for name, value := range identity {
 		req.Header.Set(name, value)
+	}
+	// 国际站桌面身份显式声明域；凭据已带 auth.Domain（企业自定义域）时不覆盖。
+	// 国际版客户端没有设备令牌头（hub #448）：若全局兑底被控制链路带上，这里兜底删除。
+	if prof.Key != "cn" {
+		if req.Header.Get("X-Domain") == "" {
+			req.Header.Set("X-Domain", observedDesktopDomainINTL)
+		}
+		req.Header.Del("X-Device-Token")
 	}
 	// 保持同一逻辑请求的 message/request ID 相等；重试沿用，不改变本地审计 TraceID。
 	message := strings.ReplaceAll(req.Header.Get(conversationMessageIDHeader), "-", "")

@@ -149,22 +149,44 @@ func TestOfficialHeadersModelOnlyAndInternationalFallback(t *testing.T) {
 			backendHeaders(req, auth, prof)
 			legacy := req.Header.Clone()
 			applyObservedDesktopHeaders(req, prof, profile)
-			if prof.Key != "cn" || profile == "legacy" {
+			if profile == "legacy" {
 				if !reflect.DeepEqual(req.Header, legacy) {
-					t.Fatal("legacy/international headers changed")
+					t.Fatal("legacy headers changed")
 				}
 				continue
 			}
-			if req.Header.Get("User-Agent") != observedDesktopUA ||
+			// official：两站都应用桌面身份；UA/版本按站点区分（hub 5.8.3 CN / 5.8.4 intl）。
+			wantUA, wantVer := observedDesktopUA, observedDesktopVerCN
+			if prof.Key != "cn" {
+				wantUA, wantVer = observedDesktopUAINTL, observedDesktopVerINTL
+			}
+			if req.Header.Get("User-Agent") != wantUA ||
 				req.Header.Get("Accept") != "application/json" ||
 				req.Header.Get("X-IDE-Name") != "WorkBuddy" ||
+				req.Header.Get("X-IDE-Version") != wantVer ||
 				req.Header.Get("X-Request-ID") != req.Header.Get(conversationMessageIDHeader) ||
 				len(req.Header.Get("X-Request-ID")) != 32 {
 				t.Fatal("observed desktop header contract not met")
 			}
-			for _, name := range []string{"Origin", "Referer", "X-Client-ID", "X-Refresh-Token", "X-Device-Token"} {
+			for _, name := range []string{"X-Client-ID", "X-Refresh-Token", "X-Device-Token", "X-Machine-ID", "X-Session-ID"} {
 				if req.Header.Get(name) != "" {
 					t.Fatalf("unexpected header %s", name)
+				}
+			}
+			if prof.Key == "cn" {
+				// 国内站实抓样本不含 Origin/Referer；X-Domain 走凭据。
+				for _, name := range []string{"Origin", "Referer", "X-Domain", "Accept-Language"} {
+					if req.Header.Get(name) != "" {
+						t.Fatalf("unexpected CN header %s", name)
+					}
+				}
+			} else {
+				// 国际站桌面身份带 XMLHttp 包装层与显式域。
+				if req.Header.Get("Origin") != profileINTL.Origin ||
+					req.Header.Get("Referer") != profileINTL.Origin+"/" ||
+					req.Header.Get("X-Domain") != observedDesktopDomainINTL ||
+					req.Header.Get("Accept-Language") != "en-US" {
+					t.Fatal("intl desktop identity incomplete")
 				}
 			}
 			for name, want := range map[string]string{
@@ -188,6 +210,57 @@ func TestOfficialHeadersModelOnlyAndInternationalFallback(t *testing.T) {
 				t.Fatal("control endpoint authentication changed")
 			}
 		}
+	}
+}
+
+func TestDeviceTokenPipeline(t *testing.T) {
+	isolatedGatewayConfig(t)
+	oldToken := deviceTokenDefault
+	t.Cleanup(func() { upstreamConfigMu.Lock(); deviceTokenDefault = oldToken; upstreamConfigMu.Unlock() })
+
+	req := httptest.NewRequest("POST", profileCN.chatURL(), nil)
+	auth := &StoredAuth{Auth: StoredTokens{AccessToken: "synthetic-access"}}
+
+	// 默认关闭：不发设备令牌。
+	upstreamConfigMu.Lock()
+	deviceTokenDefault = ""
+	upstreamConfigMu.Unlock()
+	backendHeaders(req, auth, &profileCN)
+	if req.Header.Get("X-Device-Token") != "" {
+		t.Fatal("device token sent without config")
+	}
+
+	// 全局兑底仅国内站生效；凭据字段优先。
+	upstreamConfigMu.Lock()
+	deviceTokenDefault = "global-real-token"
+	upstreamConfigMu.Unlock()
+	backendHeaders(req, auth, &profileCN)
+	if req.Header.Get("X-Device-Token") != "global-real-token" {
+		t.Fatal("global device token fallback missing on CN")
+	}
+	auth.Auth.DeviceToken = "credential-real-token"
+	backendHeaders(req, auth, &profileCN)
+	if req.Header.Get("X-Device-Token") != "credential-real-token" {
+		t.Fatal("credential device token must win over global fallback")
+	}
+
+	intl := httptest.NewRequest("POST", profileINTL.chatURL(), nil)
+	backendHeaders(intl, auth, &profileINTL)
+	if intl.Header.Get("X-Device-Token") != "" {
+		t.Fatal("intl must never carry X-Device-Token (hub #448)")
+	}
+	applyObservedDesktopHeaders(intl, &profileINTL, requestProfileOfficial)
+	if intl.Header.Get("X-Device-Token") != "" {
+		t.Fatal("desktop layer must strip X-Device-Token on intl")
+	}
+
+	// official 模式下国际站 chat 的 X-Domain 不覆盖凭据自定义域。
+	custom := httptest.NewRequest("POST", profileINTL.chatURL(), nil)
+	customAuth := &StoredAuth{Auth: StoredTokens{AccessToken: "a", Domain: "ent.example"}}
+	backendHeaders(custom, customAuth, &profileINTL)
+	applyObservedDesktopHeaders(custom, &profileINTL, requestProfileOfficial)
+	if custom.Header.Get("X-Domain") != "ent.example" {
+		t.Fatal("credential domain must not be overridden")
 	}
 }
 

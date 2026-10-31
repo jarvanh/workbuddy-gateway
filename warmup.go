@@ -627,6 +627,7 @@ func warmupTriggerModel(model string, rt warmupRuntime, now time.Time, ms *warmu
 			lastDetail = fmt.Sprintf("站点 %s 无可用账号", site)
 			continue
 		}
+		paceBackgroundTask() // 换站点/账号探测前随机间隔（默认关，配置启用）
 		out := probeModelPriceEx(acc, model)
 		ms.Attempts++
 		ms.LastAt = time.Now().Unix()

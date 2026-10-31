@@ -419,7 +419,20 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 	}
 	upstreamConfigMu.Lock()
 	restricted403RotateMax = rotate
+	// 设备令牌全局兑底 + 出站节奏窗口（11140 加固）：默认全关（保持旧行为），
+	// 由 config.json 的 upstream 段显式启用。deviceToken 只透传真实值，绝不生成。
+	deviceTokenDefault = strings.TrimSpace(c.Upstream.DeviceToken)
 	upstreamConfigMu.Unlock()
+	setPaceConfig(
+		paceSetting{
+			secondsDuration(c.Upstream.RotationPaceMinSeconds),
+			secondsDuration(c.Upstream.RotationPaceMaxSeconds),
+		},
+		paceSetting{
+			secondsDuration(c.Upstream.BackgroundTaskGapMinSeconds),
+			secondsDuration(c.Upstream.BackgroundTaskGapMaxSeconds),
+		},
+	)
 	// 签到 / Buddy 旅行 / 成长任务开关：省略字段恢复默认开启，显式 false 关闭。
 	// 六个开关必须一起重置 —— 漏掉任何一个，配置里省略该字段时都会沿上一次
 	// 加载的残留值，而不是回到默认开启。

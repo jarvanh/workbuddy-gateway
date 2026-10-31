@@ -268,7 +268,9 @@ func runKeepaliveOnce(trigger string, onlyOverdue bool) {
 			continue
 		}
 		if !first {
-			time.Sleep(keepaliveAccountGap) // 串行节流，避免批量并发刷新形成机器特征
+			// 基础 1s 间隔 + 随机抖动（backgroundTaskGapMin/Max，默认关）：固定等长
+			// 本身是可识别特征，配置启用后每号等待 1s+[min,max]s 随机。
+			time.Sleep(keepaliveAccountGap + backgroundJitter()) // 串行节流，避免批量并发刷新形成机器特征
 		}
 		first = false
 
