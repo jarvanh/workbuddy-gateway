@@ -106,6 +106,12 @@ type runtimeFileConfig struct {
 		// Restricted403RotateMax：命中上游风控限制（11140）后允许换号重试的最大次数。
 		// 0（默认）= 命中即停：绝不把同一请求再打给其他账号，避免连坐扩大封禁。
 		Restricted403RotateMax *int `json:"restricted403RotateMax"`
+		// RestrictedWindowHours：命中 11140 后账号完全暂停的时长（小时）。
+		// 缺省/非法值回落代码默认 2 小时（社区经验值）；生产 2026-10-31 起按
+		// 主人指令设 72——上游解封以「天」计（官方口径 1-3 个工作日），短窗口
+		// 到期后的首发复验只会反复重新记账。窗口内后台任务与调度全部跳过；
+		// 官方申诉解封后第一发真实成功仍会提前自动清除受限状态。
+		RestrictedWindowHours *int `json:"restrictedWindowHours"`
 		// DeviceToken：全局兑底真实设备令牌（QIMEI/TuringShield SDK 产物）。仅当凭据
 		// 文件未自带 deviceToken 时生效，且只在国内站点发送；空值（默认）关闭管线。
 		// 网关绝不生成/伪造该头——只透运维护运者从官方客户端提取的真实值。

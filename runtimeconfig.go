@@ -419,6 +419,12 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 	}
 	upstreamConfigMu.Lock()
 	restricted403RotateMax = rotate
+	// 受限窗口（11140 完全暂停时长）：缺省/非法值回落 2h 社区默认；显式配置
+	// 覆盖（生产 72h）。0/负值不采纳——完全关闭受限窗口等于把封禁账号放回池子。
+	restrictedWindow = restrictedDefaultWindow
+	if n := c.Upstream.RestrictedWindowHours; n != nil && *n > 0 && *n <= 24*30 {
+		restrictedWindow = time.Duration(*n) * time.Hour
+	}
 	// 设备令牌全局兑底 + 出站节奏窗口（11140 加固）：默认全关（保持旧行为），
 	// 由 config.json 的 upstream 段显式启用。deviceToken 只透传真实值，绝不生成。
 	deviceTokenDefault = strings.TrimSpace(c.Upstream.DeviceToken)

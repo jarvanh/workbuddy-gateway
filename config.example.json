@@ -50,6 +50,7 @@
     "streamKeepaliveSeconds": 15,
     "enableFirstByteRetry": true,
     "restricted403RotateMax": 0,
+    "restrictedWindowHours": 72,
     "deviceToken": "",
     "rotationPaceMinSeconds": 2,
     "rotationPaceMaxSeconds": 5,

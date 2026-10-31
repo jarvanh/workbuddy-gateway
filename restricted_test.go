@@ -17,6 +17,24 @@ import (
 
 const restricted11140Body = `{"code":11140,"msg":"request illegal","requestId":"t","displayMsg":{"en":"Your account has been restricted due to unusual activity","zh":"账号存在异常行为，已被限制使用"},"displayTips":{"en":"We detected unusual activity on this account. Submit feedback to appeal this restriction","zh":"系统检测到该账号存在异常使用行为，如需申诉请提交反馈"},"actions":["EDIT_INPUT","SUBMIT_FEEDBACK"]}`
 
+// 受限窗口可配置：upstream.restrictedWindowHours 显式覆盖缺省 2 小时
+// （生产 2026-10-31 起设 72：上游解封以「天」计，短窗口到期后的首发复验
+// 只会反复重新记账）。窗口内账号完全暂停，只有真实成功或 clear 才提前解除。
+func TestRestrictedWindowConfigurable(t *testing.T) {
+	chdirTemp(t)
+	resetRestrictedTestState(t)
+	restrictedWindow = 72 * time.Hour
+	acc := retryAccount("a.json", "token-a")
+	setupRetryAccounts(t, acc)
+	until := markAccountRestricted(acc, restricted11140Body)
+	if d := time.Until(until); d < 71*time.Hour || d > 72*time.Hour+time.Minute {
+		t.Fatalf("72 小时窗口未生效: %v", d)
+	}
+	if !accountRestrictedLocked(acc) {
+		t.Fatal("窗口内应处于受限状态")
+	}
+}
+
 // resetRestrictedTestState 保存/恢复受限状态全局量，避免测试间串扰。
 // 开始前必须清零：上一个测试留下的站点命中事件会污染窗口计数。
 func resetRestrictedTestState(t *testing.T) {
@@ -24,6 +42,7 @@ func resetRestrictedTestState(t *testing.T) {
 	oldEvents := restrictedWave.events
 	oldHoldSite, oldHoldUntil := restrictedWave.holdSite, restrictedWave.holdUntil
 	oldRotate := restricted403RotateMax
+	oldWindow := restrictedWindow
 	restrictedWave.Lock()
 	restrictedWave.events = map[string][]time.Time{}
 	restrictedWave.holdSite, restrictedWave.holdUntil = "", time.Time{}
@@ -34,6 +53,7 @@ func resetRestrictedTestState(t *testing.T) {
 		restrictedWave.holdSite, restrictedWave.holdUntil = oldHoldSite, oldHoldUntil
 		restrictedWave.Unlock()
 		restricted403RotateMax = oldRotate
+		restrictedWindow = oldWindow
 	})
 }
 
@@ -245,7 +265,7 @@ func TestRetryAfterHeaders(t *testing.T) {
 	chdirTemp(t)
 	resetRestrictedTestState(t)
 
-	// 场景1：唯一账号受限 → 503 no_available_account + Retry-After ≈2h
+	// 场景1：唯一账号受限 → 503 no_available_account + Retry-After ≈2h（缺省窗口）
 	acc := retryAccount("a.json", "token-a")
 	setupRetryAccounts(t, acc)
 	markAccountRestricted(acc, restricted11140Body)

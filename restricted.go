@@ -13,7 +13,8 @@ package main
 // 本文件照搬 workbuddy2api-hub / magpie 的成熟方案：
 //   1. 独立分类：isRestrictedAccount 优先于限流/鉴权分支，文案写「风控限制需申诉」。
 //   2. 命中即停：默认（upstream.restricted403RotateMax=0）不再换号，直接 429 返回申诉指引。
-//   3. 持久化：wb-restricted-state.json 记录解除时刻（默认 2 小时）；重启、凭据热加载、
+//   3. 持久化：wb-restricted-state.json 记录解除时刻（窗口可配，缺省 2 小时，
+//      生产 2026-10-31 起按主人指令 72 小时完全暂停）；重启、凭据热加载、
 //      Token 续期都不会把受限账号放回池子；只有真实成功一次（chat/probe 200）才清除。
 //   4. 整池熔断：同站点 15 分钟内 ≥2 个账号被限 → 该站点停发 30 分钟，期间一个上游请求都不发。
 //   5. 后台任务（warmup/探测/保活/签到）跳过受限账号与熔断站点；
@@ -40,7 +41,7 @@ const (
 	restrictedStateFile = "wb-restricted-state.json"
 	// restrictedStateSchema 状态文件结构版本；不匹配时视为损坏并忽略（保留原文件）。
 	restrictedStateSchema = 1
-	// restrictedDefaultWindow 单次风控限制的默认时长。社区经验值 2 小时：
+	// restrictedDefaultWindow 单次风控限制的缺省时长。社区经验值 2 小时：
 	// 上游异常行为限制不会在秒级/分钟级自动解除，60 秒冷却只会导致反复重试。
 	restrictedDefaultWindow = 2 * time.Hour
 	// 整池熔断参数（照搬 workbuddy2api-hub 的 wave/hold 设计）。
@@ -81,6 +82,19 @@ var restrictedWave = struct {
 	holdUntil time.Time
 }{events: map[string][]time.Time{}}
 
+// restrictedWindow 当前生效的单账号受限窗口（upstream.restrictedWindowHours）。
+// 缺省回落 restrictedDefaultWindow（2 小时，社区经验值）；生产 2026-10-31 起
+// 按主人指令设 72 小时——社区多波次实测上游解封以「天」计，2 小时窗口到期后
+// 首发复验只是反复重新记账，72 小时才与官方「1-3 个工作日」口径对齐。
+var restrictedWindow = restrictedDefaultWindow
+
+// restrictedWindowSnapshot 返回当前生效的受限窗口（upstreamConfigMu 保护）。
+func restrictedWindowSnapshot() time.Duration {
+	upstreamConfigMu.RLock()
+	defer upstreamConfigMu.RUnlock()
+	return restrictedWindow
+}
+
 // restricted403RotateMaxSnapshot 命中 11140 后允许换号重试的最大次数。
 // 0（默认）= 命中即停；>0 仅用于显式要求旧行为的场景（不建议）。
 func restricted403RotateMaxSnapshot() int {
@@ -101,12 +115,12 @@ func isRestrictedAccount(statusCode int, body string) bool {
 		strings.Contains(strings.ToLower(body), "restricted due to unusual activity")
 }
 
-// markAccountRestricted 将账号标记为受限（2 小时窗口）并落盘，返回解除时刻。
+// markAccountRestricted 将账号标记为受限（完全暂停，窗口可配）并落盘，返回解除时刻。
 // 重复命中只保留更晚的解除时刻，不重置已开始的窗口 —— 避免「每分钟重试一次
 // → 每次都重新计 2 小时」的滚动续期，让账号永远差一分钟解除。
 func markAccountRestricted(acc *Account, msg string) time.Time {
 	now := time.Now()
-	until := now.Add(restrictedDefaultWindow)
+	until := now.Add(restrictedWindowSnapshot())
 	accountMu.Lock()
 	priorRestricted, priorUntil := !acc.RestrictedUntil.IsZero(), acc.RestrictedUntil
 	site := accSiteLocked(acc)
