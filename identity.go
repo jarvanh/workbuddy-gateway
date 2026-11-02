@@ -27,7 +27,7 @@ type identitySettings struct {
 }
 
 var (
-	defaultIdentityTerms = []string{"Claude Code", "Claude", "DeepSeek Harness", "Codex", "ZCode"}
+	defaultIdentityTerms = []string{"Claude Code", "Claude", "DeepSeek Harness", "Codex", "ZCode", "Grok Build", "Grok", "Grok released by xAI"}
 	identityConfigMu     sync.RWMutex
 	currentIdentity      = defaultIdentitySettings()
 )
@@ -55,8 +55,10 @@ func defaultIdentitySettings() identitySettings {
 
 func defaultIdentityConfig() runtimeIdentityConfig {
 	enabled := true
-	return runtimeIdentityConfig{Enabled: &enabled, Target: "WorkBuddy",
-		Replacements: defaultIdentityReplacements("WorkBuddy")}
+	return runtimeIdentityConfig{
+		Enabled: &enabled, Target: "WorkBuddy",
+		Replacements: defaultIdentityReplacements("WorkBuddy"),
+	}
 }
 
 func setIdentityConfig(c runtimeIdentityConfig) {

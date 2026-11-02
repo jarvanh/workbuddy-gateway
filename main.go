@@ -36,6 +36,8 @@ import (
 	"github.com/skip2/go-qrcode"
 )
 
+// fork：版本值不参与 CI 产物（release.yml 以 tag 经 -ldflags 注入 main.version），
+// 保持 var 供本地 -ldflags 注入（const 会使注入失效，见 MEMORY.md 发版约定）。
 var version = "1.29.10"
 
 const (
@@ -882,7 +884,7 @@ func initFileLogging(command string) func() {
 	gatewayConfigMu.RUnlock()
 	// 文件初始化失败时，控制台仍要隐藏秘密值。
 	log.SetOutput(&redactingLogWriter{writer: os.Stderr})
-	if err := os.MkdirAll(logDir, 0755); err != nil {
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		log.Printf("[Log] 无法创建日志目录 %s，将仅输出到控制台: %v", logDir, err)
 		return func() {}
 	}
@@ -1128,14 +1130,14 @@ func saveAuth(sa *StoredAuth) error {
 	log.Printf("[凭据保存] traceId=%s 文件=%s 阶段=开始 说明=先写入磁盘，成功后再更新当前内存凭据", traceID, cfg.AuthFile)
 	dir := filepath.Dir(cfg.AuthFile)
 	if dir != "" && dir != "." {
-		_ = os.MkdirAll(dir, 0755)
+		_ = os.MkdirAll(dir, 0o755)
 	}
 	data, err := json.MarshalIndent(sa, "", "  ")
 	if err != nil {
 		log.Printf("[凭据保存] traceId=%s 阶段=编码 结果=失败 原因=%v 业务影响=当前内存凭据未切换", traceID, err)
 		return err
 	}
-	if err := os.WriteFile(cfg.AuthFile, data, 0600); err != nil {
+	if err := os.WriteFile(cfg.AuthFile, data, 0o600); err != nil {
 		log.Printf("[凭据保存] traceId=%s 阶段=写入磁盘 结果=失败 原因=%v 业务影响=当前内存凭据未切换", traceID, err)
 		return err
 	}
@@ -1153,13 +1155,13 @@ func saveAuthTo(path string, sa *StoredAuth) error {
 	registerCredentialSecrets(sa)
 	dir := filepath.Dir(path)
 	if dir != "" && dir != "." {
-		_ = os.MkdirAll(dir, 0755)
+		_ = os.MkdirAll(dir, 0o755)
 	}
 	data, err := json.MarshalIndent(sa, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	if err := os.WriteFile(path, data, 0o600); err != nil {
 		return err
 	}
 	clearDisabledMarker(path)
@@ -2185,7 +2187,7 @@ func disableAccount(acc *Account, reason string) {
 		Edition:    edition,
 	}
 	if data, err := json.MarshalIndent(marker, "", "  "); err == nil {
-		if werr := os.WriteFile(markerPath(path), data, 0600); werr != nil {
+		if werr := os.WriteFile(markerPath(path), data, 0o600); werr != nil {
 			log.Printf("[Auth] 账号 %s 失效标记写入失败: %v", path, werr)
 		}
 	}
@@ -3589,7 +3591,7 @@ func writeStatusSnapshot() error {
 	}
 	// 原子写：先写临时文件再改名，避免 monitor 读到半截内容
 	tmp := statusSnapshotFile + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, statusSnapshotFile); err != nil {
@@ -5508,6 +5510,25 @@ func cleanChunkJSON(s string) string {
 				choice["finish_reason"] = nil
 			}
 			if delta, ok := choice["delta"].(map[string]any); ok {
+				// 工具增量的身份字段可省略；空值表示本片没有更新。
+				// 保留 index、参数片段和扩展字段，供客户端完整累计。
+				calls, _ := delta["tool_calls"].([]any)
+				for _, raw := range calls {
+					call, ok := raw.(map[string]any)
+					if !ok {
+						continue
+					}
+					for _, key := range []string{"id", "type"} {
+						if value, ok := call[key].(string); ok && value == "" {
+							delete(call, key)
+						}
+					}
+					if function, ok := call["function"].(map[string]any); ok {
+						if name, ok := function["name"].(string); ok && name == "" {
+							delete(function, "name")
+						}
+					}
+				}
 				for k, v := range delta {
 					if k == "function_call" && isEmptyFunctionCall(v) {
 						delete(delta, k)
