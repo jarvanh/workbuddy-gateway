@@ -5425,6 +5425,10 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 		}},
 	}
 	if usage != nil {
+		// 非流式聚合出口做同样的别名归一化（流式走 cleanChunkJSON）。
+		if normalizeUsageCacheAliases(usage) {
+			log.Printf("[Usage兼容] 阶段=非流式聚合 结果=已回填缓存别名 说明=与流式分片同口径，避免下游把命中读成0")
+		}
 		result["usage"] = usage
 	}
 	return json.Marshal(result)
@@ -5447,6 +5451,12 @@ func cleanChunkJSON(s string) string {
 	var obj map[string]any
 	if json.Unmarshal([]byte(s), &obj) != nil {
 		return s
+	}
+	// 缓存命中别名归一化：上游把真实命中数只写在 prompt_cache_hit_tokens /
+	// prompt_tokens_details.cached_tokens，常用别名却是 0；下游 `??` 链会被 0
+	// 短路，导致命中数恒被记成 0。详见 usagecache.go。
+	if usage, ok := obj["usage"].(map[string]any); ok && normalizeUsageCacheAliases(usage) {
+		log.Printf("[Usage兼容] 阶段=流式分片 结果=已回填缓存别名 说明=上游仅给出prompt_cache_hit_tokens时同步cached_tokens/cache_read_input_tokens，避免下游把命中读成0")
 	}
 	if choices, ok := obj["choices"].([]any); ok {
 		for _, c := range choices {
