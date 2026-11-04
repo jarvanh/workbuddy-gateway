@@ -1147,7 +1147,7 @@ func loadProbeDaily() {
 		log.Printf("[ModelPrice] 每日汇总计数文件无效，忽略: %v", err)
 		return
 	}
-	if p.Date != cycleDateOf(time.Now()) {
+	if p.Date != cycleDateOf(warmupNow()) {
 		return // 跨天：不恢复，等首个探测自然重置
 	}
 	probeDailyMu.Lock()
@@ -1197,6 +1197,15 @@ var (
 	probeDailySent   bool
 	probeDailyFirst  time.Time
 )
+
+// warmupNow 是 warmup/probe 汇总路径读取墙钟的唯一入口，便于测试注入固定时刻。
+//
+// 存在理由：loadProbeDaily 需要判断「落盘日期是否等于今天」，直接调 time.Now()
+// 会让测试结果依赖真实运行时刻。2026-11-04 的 CI 失败即由此而来 —— 测试在
+// CST 00:00:22 运行，用 now-5min 落盘（前一天），恢复时却拿「今天」比较，
+// 必然判为跨日而不恢复。生产行为本身正确（跨自然日确实不该恢复），错的是测试
+// 拿真实墙钟当输入。生产恒为 time.Now。
+var warmupNow = time.Now
 
 // recordProbeDailyResult 累计当日探测结论，供每日汇总通知使用。
 func recordProbeDailyResult(site, model, verdict string, now time.Time) {

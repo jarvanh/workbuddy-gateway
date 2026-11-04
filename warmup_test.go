@@ -681,14 +681,25 @@ func TestWarmupWakeCarriesRecovered(t *testing.T) {
 	}
 }
 
+// setWarmupNowForTest 把 warmup 路径的墙钟固定为给定时刻，返回后自动恢复。
+func setWarmupNowForTest(t *testing.T, fixed time.Time) {
+	t.Helper()
+	prev := warmupNow
+	warmupNow = func() time.Time { return fixed }
+	t.Cleanup(func() { warmupNow = prev })
+}
+
 // TestProbeDailyPersistsAcrossRestart 当日探测汇总计数必须跨「进程重启」保持：
 // 这正是 2026-10-10 的 bug —— 内存计数在重启后清零，导致当日 02:11 重启后
 // 03:11 的汇总通知只报了重启后探到的 1 个 free（重启前 01:13 已探到 1 个）。
 func TestProbeDailyPersistsAcrossRestart(t *testing.T) {
 	resetWarmupStateT(t)
 	loc := warmupLocation()
-	// 固定一个「今天」的时刻，保证落盘日期与恢复时的 plan date 一致。
-	now := time.Now().In(loc)
+	// 固定时钟：绝不依赖真实墙钟。此前直接取 time.Now()，若 CI 恰在配置时区
+	// 午夜附近运行，now-5min 落到前一天，落盘日期与恢复时比较的「今天」不一致，
+	// 测试必然失败（2026-11-04T16:00:22Z = CST 00:00:22 实际发生过）。
+	now := time.Date(2026, 11, 4, 14, 30, 0, 0, loc)
+	setWarmupNowForTest(t, now)
 	date := cycleDateOf(now)
 
 	// 首个探测：free。清空落盘，模拟重启前累计。
@@ -758,6 +769,53 @@ func removeIfExists(path string) error {
 		return err
 	}
 	return nil
+}
+
+// TestProbeDailyMidnightBoundaryNotRestored 锁定午夜边界的真实语义：
+// 进程跨自然日重启时，前一天的当日汇总【不得】恢复（新的一天重新计数，
+// 且允许再发一条汇总）。这是生产上的正确行为，与上面测试互为边界 ——
+// 上面固定在同一天内验证恢复，这里固定跨日验证不恢复。
+//
+// 2026-11-04T16:00:22Z（CST 00:00:22）CI 失败不是生产 bug，而是旧测试把
+// now-5min 当成「今天」：那一刻 now-5min 属于前一天。此测试用固定时钟把
+// 该边界永久钉住，不再依赖运行时刻。
+func TestProbeDailyMidnightBoundaryNotRestored(t *testing.T) {
+	resetWarmupStateT(t)
+	loc := warmupLocation()
+	now := time.Date(2026, 11, 5, 0, 0, 22, 0, loc) // CST 午夜后 22 秒
+	setWarmupNowForTest(t, now)
+
+	probeDailyMu.Lock()
+	probeDailyDate, probeDailyFree, probeDailyPaid, probeDailyOther = "", 0, 0, 0
+	probeDailyModels, probeDailySent, probeDailyFirst = nil, false, time.Time{}
+	probeDailyMu.Unlock()
+	_ = removeIfExists(probeDailyFile)
+
+	// 前一天 23:55:22 探到 1 个 free 并落盘
+	recordProbeDailyResult("intl", "deepseek-v4.1-flash", "free", now.Add(-5*time.Minute))
+
+	// 模拟进程重启：内存清零后从落盘恢复
+	probeDailyMu.Lock()
+	probeDailyDate, probeDailyFree, probeDailyPaid, probeDailyOther = "", 0, 0, 0
+	probeDailyModels, probeDailySent, probeDailyFirst = nil, false, time.Time{}
+	probeDailyMu.Unlock()
+	loadProbeDaily()
+
+	probeDailyMu.Lock()
+	gotDate, gotFree := probeDailyDate, probeDailyFree
+	probeDailyMu.Unlock()
+	if gotDate != "" || gotFree != 0 {
+		t.Fatalf("跨自然日不得恢复昨日汇总，实际 date=%q free=%d", gotDate, gotFree)
+	}
+
+	// 新一天的首个探测从 1 开始，日期为今天
+	recordProbeDailyResult("intl", "auto", "free", now)
+	probeDailyMu.Lock()
+	newDate, newFree := probeDailyDate, probeDailyFree
+	probeDailyMu.Unlock()
+	if newDate != cycleDateOf(now) || newFree != 1 {
+		t.Fatalf("新一天应从 1 重新计数，实际 date=%q free=%d", newDate, newFree)
+	}
 }
 
 // TestWarmupModelEntriesFailedFirst 明细条目必须把失败项排最前，并给出失败原因。
