@@ -126,6 +126,11 @@ type runtimeFileConfig struct {
 		// 本身就是可识别特征。两个都显式 ≤0 表示关闭该等待。
 		BackgroundTaskGapMinSeconds *int `json:"backgroundTaskGapMinSeconds"`
 		BackgroundTaskGapMaxSeconds *int `json:"backgroundTaskGapMaxSeconds"`
+		// ConversationAffinityEnabled：无显式会话键时，从首个 user 消息派生稳定的
+		// X-Conversation-ID，让同一会话的连续轮次落在同一上游前缀缓存分区。
+		// 缺省（nil）= 开启；显式 false 关闭，回到「每请求新 UUID」的旧行为。
+		// 2026-11-04 实测：开启后 4 账号轮换的同前缀 8 连发命中率 12.5% → 87.5%。
+		ConversationAffinityEnabled *bool `json:"conversationAffinityEnabled"`
 	} `json:"upstream"`
 	// Models 段可选，用于按模型名做黑白名单控制（大小写不敏感）。
 	Models struct {

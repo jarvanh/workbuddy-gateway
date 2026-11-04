@@ -454,6 +454,13 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 			secondsDuration(c.Upstream.BackgroundTaskGapMaxSeconds),
 		},
 	)
+	// 会话亲和（前缀缓存分区键）：缺省开启，显式 false 关闭。热加载即时生效，
+	// 无需重启即可回滚到「每请求新 UUID」的旧行为。
+	affinity := true
+	if c.Upstream.ConversationAffinityEnabled != nil {
+		affinity = *c.Upstream.ConversationAffinityEnabled
+	}
+	conversationAffinityEnabled.Store(affinity)
 	// 签到 / Buddy 旅行 / 成长任务开关：省略字段恢复默认开启，显式 false 关闭。
 	// 六个开关必须一起重置 —— 漏掉任何一个，配置里省略该字段时都会沿上一次
 	// 加载的残留值，而不是回到默认开启。

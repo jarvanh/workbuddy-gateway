@@ -102,6 +102,16 @@ func prepareConversationContext(r *http.Request, body map[string]any) *conversat
 	} else if seed = bodyValue(metadata, "conversation_id", "conversationId", "session_id", "sessionId"); seed != "" {
 		h.Source = "请求metadata会话字段"
 	}
+	// 无显式会话键时，从首个 user 消息派生稳定会话 ID。上游按该 ID 分区前缀缓存，
+	// 每请求换新 UUID 会让同一会话的前缀永远无法复用（详见 conversationaffinity.go）。
+	// 显式键始终优先；派生失败（无文本 user 消息）时保持随机 UUID 的旧行为。
+	if seed == "" && conversationAffinityEnabled.Load() {
+		if textSeed := conversationSeedFromBody(body); textSeed != "" {
+			model, _ := body["model"].(string)
+			seed = derivedConversationID(caller, model, textSeed)
+			h.Source = "请求前缀派生"
+		}
+	}
 	if seed != "" {
 		h.ID = normalizedConversationID(seed, "conversation", caller)
 	}
