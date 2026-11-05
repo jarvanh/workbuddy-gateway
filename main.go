@@ -38,7 +38,7 @@ import (
 
 // fork：版本值不参与 CI 产物（release.yml 以 tag 经 -ldflags 注入 main.version），
 // 保持 var 供本地 -ldflags 注入（const 会使注入失效，见 MEMORY.md 发版约定）。
-var version = "1.29.16"
+var version = "1.29.21"
 
 const (
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
@@ -1607,6 +1607,14 @@ func siteIsFreeNowLocked(site string, states map[string]siteState) bool {
 
 // nextAccountForModel 按「免费耗尽账号优先 → 有余额账号 → 零余额未知模型受控探测」选号。
 func nextAccountForModel(model string, attempted map[*Account]bool, reqID uint64) (*Account, accountSelectionKind, error) {
+	return nextAccountForModelForSession(model, attempted, reqID, "")
+}
+
+// nextAccountForModelForSession 在轮转前优先尝试「会话 → 账号」绑定的账号。
+// 同一个会话固定同一上游账号，才能命中按账号隔离的 prompt 缓存；绑定只是把
+// 扫描起点挪到该账号，**后续闸门与轮转逻辑一字不改**，不满足条件就自然落到
+// 其余账号（即「亲和兜底」）。sessionKey 为空时与旧行为完全一致。
+func nextAccountForModelForSession(model string, attempted map[*Account]bool, reqID uint64, sessionKey string) (*Account, accountSelectionKind, error) {
 	// 站点优先级必须在加锁前计算：preferredFreeSites 会读取账号账本并自行获取 accountMu，
 	// 若在持锁期间调用会自锁。语义：该模型「一个站点免费、另一个站点收费」时优先用免费站点，
 	// 直到该站点账号全部不可用；其余情况不搞优先，正常轮询。
@@ -1639,10 +1647,24 @@ func nextAccountForModel(model string, attempted map[*Account]bool, reqID uint64
 	// orderedAccounts 是 accounts 的稳定排序副本，长度一致，rrIndex 语义不变。
 	orderedAccounts := sortedAccounts(accounts)
 
+	// 会话亲和：把绑定账号挪到本轮扫描起点，让「同一会话优先回到同一账号」。
+	// 只在绑定仍然有效时生效（账号在池内且本轮未被上游拒绝）；一旦失效立刻解绑，
+	// 后续请求回到常规轮转，不会把一个坏绑定无限重试。
+	startIdx := rrIndex
+	if affinityAcc := accountAffinityGet(sessionKey, now); affinityAcc != nil {
+		if attempted != nil && attempted[affinityAcc] {
+			accountAffinityUnbind(sessionKey)
+		} else if idx := indexAccountInLocked(orderedAccounts, affinityAcc); idx >= 0 {
+			startIdx = idx
+		} else {
+			accountAffinityUnbind(sessionKey)
+		}
+	}
+
 	pick := func(siteFilter func(string) bool) (*Account, accountSelectionKind, bool) {
 		for _, wanted := range []accountSelectionKind{selectionFreeExhausted, selectionNormal, selectionProbeExhausted} {
 			for i := 0; i < len(orderedAccounts); i++ {
-				idx := (rrIndex + i) % len(orderedAccounts)
+				idx := (startIdx + i) % len(orderedAccounts)
 				acc := orderedAccounts[idx]
 				if attempted != nil && attempted[acc] {
 					continue
@@ -1681,6 +1703,7 @@ func nextAccountForModel(model string, attempted map[*Account]bool, reqID uint64
 					modelStateLocked(acc, model).NextProbeAt = now.Add(modelProbeDelay)
 				}
 				rrIndex = (idx + 1) % len(accounts)
+				accountAffinityBind(sessionKey, acc, now)
 				return acc, kind, true
 			}
 		}
@@ -4334,7 +4357,11 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 			// 间隔起步）。默认 2–5s 随机窗口、扣除上一发已耗时；客户端取消即停。
 			paceAccountRotation(r.Context(), lastDispatch)
 		}
-		acc, selection, err := nextAccountForModel(modelName, attempted, reqID)
+		// 会话亲和：同一会话优先回到同一账号（见 accountaffinity.go）。
+		// 用真实会话键；若会话 ID 只是每请求随机的 UUID（派生失败，如图片-only
+		// 首条消息），退回请求前缀指纹，否则亲和键每次都变、永远不命中。
+		sessionKey := affinityKeyForRequest(r, upstreamBytes)
+		acc, selection, err := nextAccountForModelForSession(modelName, attempted, reqID, sessionKey)
 		if err != nil {
 			if errors.Is(err, errModelAccountPolicy) {
 				log.Printf("[请求被拒绝] traceId=%s requestId=%d 模型=%s 原因=账号黑白名单没有匹配的凭据 返回状态码=403 业务影响=未进入上游", traceID, reqID, modelName)
@@ -4969,6 +4996,10 @@ func handleNonStreamUpstream(
 				"error":      safeDebugError(aggErr),
 				"attempt":    attempt,
 			})
+			// 聚合中断说明这个账号这条流不可用：必须解绑会话亲和，否则重试会被
+			// 亲和拉回同一账号，把「回退换号」变成「原地重试同一坏号」。
+			// 解绑后 rrIndex 已随上次选号前进，下一次自然落到其他账号。
+			accountAffinityUnbind(affinityKeyForRequest(r, upstreamBytes))
 			log.Printf("[#%d] 账号 %s [%s] 聚合响应失败 (第 %d/%d 次尝试): %v", reqID, acc.Path, prof.Label, attempt, maxNonStreamAttempts, aggErr)
 			if r.Context().Err() != nil {
 				// 客户端已断开：回退重试无意义

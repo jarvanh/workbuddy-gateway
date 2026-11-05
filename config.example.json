@@ -65,7 +65,8 @@
     "rotationPaceMaxSeconds": 5,
     "backgroundTaskGapMinSeconds": 2,
     "backgroundTaskGapMaxSeconds": 5,
-    "conversationAffinityEnabled": true
+    "conversationAffinityEnabled": true,
+    "accountAffinityEnabled": true
   },
   "models": {
     "blocklist": [],

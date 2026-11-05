@@ -131,6 +131,11 @@ type runtimeFileConfig struct {
 		// 缺省（nil）= 开启；显式 false 关闭，回到「每请求新 UUID」的旧行为。
 		// 2026-11-04 实测：开启后 4 账号轮换的同前缀 8 连发命中率 12.5% → 87.5%。
 		ConversationAffinityEnabled *bool `json:"conversationAffinityEnabled"`
+		// AccountAffinityEnabled：把同一会话优先固定到同一账号（30min TTL）。
+		// 上游若按**账号**隔离 prompt 缓存，仅稳定会话 ID 不够 —— 姊妹项目
+		// qoder2api 实测：单账号会话命中 93.1%，跨账号只有 65.2%。
+		// 缺省（nil）= 开启；显式 false 回到严格轮转。
+		AccountAffinityEnabled *bool `json:"accountAffinityEnabled"`
 	} `json:"upstream"`
 	// Models 段可选，用于按模型名做黑白名单控制（大小写不敏感）。
 	Models struct {

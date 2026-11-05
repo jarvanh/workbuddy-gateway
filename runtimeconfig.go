@@ -461,6 +461,12 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 		affinity = *c.Upstream.ConversationAffinityEnabled
 	}
 	conversationAffinityEnabled.Store(affinity)
+	// 账号亲和：缺省开启，显式 false 关闭。同样热加载即时生效。
+	accountAffinity := true
+	if c.Upstream.AccountAffinityEnabled != nil {
+		accountAffinity = *c.Upstream.AccountAffinityEnabled
+	}
+	accountAffinityEnabled.Store(accountAffinity)
 	// 签到 / Buddy 旅行 / 成长任务开关：省略字段恢复默认开启，显式 false 关闭。
 	// 六个开关必须一起重置 —— 漏掉任何一个，配置里省略该字段时都会沿上一次
 	// 加载的残留值，而不是回到默认开启。

@@ -110,6 +110,13 @@ func prepareConversationContext(r *http.Request, body map[string]any) *conversat
 			model, _ := body["model"].(string)
 			seed = derivedConversationID(caller, model, textSeed)
 			h.Source = "请求前缀派生"
+		} else if prefixSeed := prefixSeedFromBody(body); prefixSeed != "" {
+			// 兜底：首条 user 消息没有文本（纯图片/纯工具结果）时，用 messages
+			// 前两条的结构化哈希当种子。它们同样在整个会话生命周期内不变，
+			// 能给上游一个稳定的会话分区键；否则每请求随机 UUID，缓存必 miss。
+			model, _ := body["model"].(string)
+			seed = derivedConversationID(caller, model, prefixSeed)
+			h.Source = "请求结构派生"
 		}
 	}
 	if seed != "" {

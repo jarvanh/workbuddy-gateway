@@ -130,12 +130,19 @@ func TestConversationAffinityContentShapes(t *testing.T) {
 	if h1.Source != "请求前缀派生" || h1.ID != h2.ID {
 		t.Fatalf("多模态文本应派生稳定 ID：%+v / %+v", h1, h2)
 	}
+	// 2026-11-05 行为变更：首条 user 消息无文本（纯图片/纯工具结果）时不再退回
+	// 随机 UUID，而是用 messages 前两条的结构化哈希派生稳定会话 ID —— 否则每请求
+	// 随机 UUID，上游前缀缓存永远 miss（workbuddy 实测 0/6）。见 accountaffinity.go。
 	noText := map[string]any{"model": "m", "messages": []any{
 		map[string]any{"role": "user", "content": []any{map[string]any{"type": "image_url"}}},
 	}}
 	h3 := prepareConversationContext(httptest.NewRequest("POST", "/", nil), noText)
-	if h3.Source != "独立生成" {
-		t.Fatalf("无文本 user 消息应保持旧行为：%+v", h3)
+	if h3.Source != "请求结构派生" {
+		t.Fatalf("无文本 user 消息应走结构派生兜底：%+v", h3)
+	}
+	h4 := prepareConversationContext(httptest.NewRequest("POST", "/", nil), noText)
+	if h3.ID != h4.ID {
+		t.Fatalf("结构派生必须跨请求稳定：%s vs %s", h3.ID, h4.ID)
 	}
 }
 
