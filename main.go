@@ -4216,6 +4216,13 @@ func (w *auditResponseWriter) Flush() {
 func requestAuditMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		// 在途计数：只统计业务请求，health/models 等观测端点不计入，
+		// 否则看板自己轮询会把曲线顶起来。
+		p := r.URL.Path
+		if p != "/health" && p != "/v1/models" && !strings.HasPrefix(p, "/debug") {
+			beginInflight()
+			defer endInflight()
+		}
 		traceID := r.Header.Get("X-Trace-ID")
 		if traceID == "" {
 			traceID = uuid.NewString()
@@ -5089,13 +5096,17 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	modelIDs, source := mergedModelIDs()
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	payload := map[string]any{
 		"status":       "healthy",
 		"timestamp":    time.Now().Unix(),
 		"version":      version,
 		"model_count":  len(modelIDs),
 		"model_source": modelSourceLabel(source),
-	})
+	}
+	for k, v := range inflightSnapshot() {
+		payload[k] = v
+	}
+	_ = json.NewEncoder(w).Encode(payload)
 }
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
