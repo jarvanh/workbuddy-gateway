@@ -32,14 +32,12 @@ func endInflight() { gatewayInflight.Add(-1) }
 // inflightSnapshot 供 /health 输出，不含任何请求身份信息。
 func inflightSnapshot() map[string]any {
 	limits, total, _ := modelConcurrency.snapshot("")
-	// MaxGlobal==0 表示不设全局闸；此时实际上限 = 每账号并发 × 可用账号数。
-	// 与看板「上限」语义一致：网关自身允许同时在途的最大请求数。
+	// 上限口径（2026-11-06 主人定）：MaxGlobal>0 用全局闸；否则只报**每账号**
+	// 并发闸 MaxAcc。不再用 MaxAcc×账号数 推导全局值 —— 活跃账号数随时间变
+	// （intl 号被风控后 9→4），推导值会把失效容量也算进去，误导。
 	cap := limits.MaxGlobal
-	if cap == 0 {
-		accountMu.Lock()
-		n := len(accounts)
-		accountMu.Unlock()
-		cap = limits.MaxAcc * n
+	if cap == 0 && limits.MaxAcc > 0 {
+		cap = limits.MaxAcc
 	}
 	return map[string]any{
 		"inflight":        gatewayInflight.Load(),
