@@ -38,7 +38,7 @@ import (
 
 // fork：版本值不参与 CI 产物（release.yml 以 tag 经 -ldflags 注入 main.version），
 // 保持 var 供本地 -ldflags 注入（const 会使注入失效，见 MEMORY.md 发版约定）。
-var version = "1.29.23"
+var version = "1.29.24"
 
 const (
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
