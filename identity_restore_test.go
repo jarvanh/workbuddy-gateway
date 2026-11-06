@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -112,6 +113,7 @@ func TestRestoreIdentityTextExactCaseAndBoundaries(t *testing.T) {
 // restoreIdentityTextForTest 是独立于生产代码的参考实现：逐字节扫描，按边界规则
 // 就地替换。用于校验流式实现与一次性结果的等价性。
 func restoreIdentityTextForTest(rules []identityRestoreRule, text string) string {
+	domains := regexp.MustCompile(`[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)+`).FindAllStringIndex(text, -1)
 	var b strings.Builder
 	for i := 0; i < len(text); {
 		matched := ""
@@ -124,6 +126,18 @@ func restoreIdentityTextForTest(rules []identityRestoreRule, text string) string
 				continue
 			}
 			if end < len(text) && isIdentifierByteForTest(text[end]) {
+				continue
+			}
+			protected := i > 0 && (text[i-1] == '.' || text[i-1] == '-') ||
+				end < len(text) && text[end] == '-'
+			tokenStart := strings.LastIndexAny(text[:i], " \t\r\n\"'`<>，。！？；") + 1
+			for _, domain := range domains {
+				if tokenStart <= domain[0] && domain[0] < end {
+					protected = true
+					break
+				}
+			}
+			if protected {
 				continue
 			}
 			if len(rule.from) > len(matched) {
@@ -533,6 +547,52 @@ func TestIdentityRestoreDisabledPlanPassesThrough(t *testing.T) {
 	}
 	if got := restoreIdentityText(nil, "WorkBuddy"); got != "WorkBuddy" {
 		t.Fatalf("inactive plan modified text: %q", got)
+	}
+}
+
+func TestChatStreamWithoutRestoreKeepsOriginalFrames(t *testing.T) {
+	chunks := []string{
+		`{"id":"c1","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{"content":"!"},"finish_reason":"stop"}]}`,
+	}
+	upstream := strings.Join([]string{
+		"data: " + chunks[0],
+		"data: " + chunks[1],
+		`data: [DONE]`,
+	}, "\n\n") + "\n\n"
+	writer := newLockedResponseWriter()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	resp := &http.Response{Body: io.NopCloser(strings.NewReader(upstream))}
+
+	streamChatResponseWithReplay(writer, req, resp, "m", 1, &Account{Path: "synthetic.json"}, &profileCN, time.Now(), nil)
+
+	wantOutput := "data: " + cleanChunkJSON(chunks[0]) + "\n\n" +
+		"data: " + cleanChunkJSON(chunks[1]) + "\n\n" +
+		"data: [DONE]\n\n"
+	if got := writer.String(); got != wantOutput {
+		t.Fatalf("disabled restore changed output bytes:\ngot  %q\nwant %q", got, wantOutput)
+	}
+	frames := sseDataObjects(t, writer.String())
+	if len(frames) != 2 {
+		t.Fatalf("disabled restore changed frame count: got %d frames=%s", len(frames), writer.String())
+	}
+	want := []struct {
+		content string
+		finish  string
+	}{{"hello", ""}, {"!", "stop"}}
+	for i, expected := range want {
+		choices, _ := frames[i]["choices"].([]any)
+		if len(choices) != 1 {
+			t.Fatalf("frame %d choices=%#v", i, frames[i]["choices"])
+		}
+		choice, _ := choices[0].(map[string]any)
+		delta, _ := choice["delta"].(map[string]any)
+		if got := strOf(delta["content"]); got != expected.content {
+			t.Fatalf("frame %d content=%q want %q", i, got, expected.content)
+		}
+		if got := strOf(choice["finish_reason"]); got != expected.finish {
+			t.Fatalf("frame %d finish_reason=%q want %q", i, got, expected.finish)
+		}
 	}
 }
 

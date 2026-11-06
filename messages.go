@@ -1018,7 +1018,7 @@ func streamMessagesResponse(w http.ResponseWriter, r *http.Request, resp *http.R
 	}
 
 	writeEvent(state.finishEvents())
-	observeModelCredit(acc, modelName, state.usage, reqID)
+	observeModelCredit(r, acc, modelName, state.usage, reqID)
 	statsObserveUsage(r, state.usage, true)
 	recordModelTokens(modelName, state.usage, reqID)
 	recordModelLatency(modelName, time.Since(startTime))
@@ -1061,7 +1061,7 @@ func writeMessagesAggregate(w http.ResponseWriter, r *http.Request, resp *http.R
 		}
 	}
 	msg := state.aggregate()
-	observeModelCredit(acc, modelName, state.usage, reqID)
+	observeModelCredit(r, acc, modelName, state.usage, reqID)
 	statsObserveUsage(r, state.usage, true)
 	recordModelTokens(modelName, state.usage, reqID)
 	recordModelLatency(modelName, time.Since(startTime))

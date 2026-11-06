@@ -2,13 +2,16 @@ package main
 
 import (
 	"context"
+	"log"
 	"net/http"
+	"regexp"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
 // -----------------------------------------------------------------------------
-// 出站身份还原（identity.responseRestore，默认关闭）
+// 实验性出站身份还原（identity.responseRestore，默认关闭）
 //
 // 入站时网关把客户端身份改写成配置的 identity.target；上游因此可能在回复的
 // 任意可见文本中输出目标身份。开启本功能后，按可配置 target 做子串级还原：
@@ -21,7 +24,7 @@ import (
 // -----------------------------------------------------------------------------
 
 // identityRestoreMaxTailBytes 是单条流等待「被分片切开的目标文本」时最多缓存的
-// 字节数。超过该长度的异常目标不启用还原，避免用截断后的目标误判边界。
+// 目标长度上限。实际尾部另保留边界 rune 与一个域名后缀判断字节。
 const identityRestoreMaxTailBytes = 4096
 
 type identityRestoreRule struct {
@@ -63,26 +66,30 @@ func planIdentityRestore(r *http.Request, body map[string]any) {
 	if r == nil || identityRestoreFor(r).active() {
 		return
 	}
-	settings := identitySnapshot()
-	if !settings.responseRestore || !settings.enabled || len(settings.restoreTargets) == 0 {
+	identityConfigMu.RLock()
+	enabled := currentIdentity.responseRestore && currentIdentity.enabled
+	identityConfigMu.RUnlock()
+	if !enabled {
+		return
+	}
+	settings := identityStateForRequest(r).settings
+	if !settings.responseRestore || !settings.enabled {
 		return
 	}
 	target := settings.target
-	var rules []identityRestoreRule
-	for _, original := range originalClientIdentitiesWithRules(body, settings.restoreTargets) {
-		rules = append(rules, identityRestoreRule{from: target, to: original})
-	}
-	if len(rules) == 0 {
+	originals := originalClientIdentitiesWithRules(body, settings.restoreTargets)
+	if len(originals) != 1 {
+		log.Printf("[响应身份还原] traceId=%s 阶段=身份判定 实验功能=true 明确身份数=%d 结果=跳过 原因=未找到唯一身份声明 业务影响=响应原样保留，不记录提示词或身份名称", debugTraceID(r), len(originals))
+		debugEvent(r, "debug", "identity_response_restore_skipped", map[string]any{
+			"identity_count": len(originals), "reason": "no_unique_declaration",
+		})
 		return
 	}
-	maxFrom := 0
-	for _, rule := range rules {
-		if len(rule.from) > maxFrom {
-			maxFrom = len(rule.from)
-		}
-	}
+	rules := []identityRestoreRule{{from: target, to: originals[0]}}
+	maxFrom := len(target)
 	// 目标超过上限时宁可不还原，也不能拿截断的 target 做前缀判断。
 	if maxFrom == 0 || maxFrom > identityRestoreMaxTailBytes {
+		log.Printf("[响应身份还原] traceId=%s 阶段=计划校验 结果=跳过 目标字节数=%d 上限=%d 业务影响=响应原样保留", debugTraceID(r), maxFrom, identityRestoreMaxTailBytes)
 		return
 	}
 	plan := identityRestore{rules: rules, hold: maxFrom}
@@ -92,6 +99,7 @@ func planIdentityRestore(r *http.Request, body map[string]any) {
 		}
 	}
 	*r = *r.WithContext(context.WithValue(r.Context(), identityRestoreContextKey{}, plan))
+	log.Printf("[响应身份还原] traceId=%s 阶段=计划建立 实验功能=true 明确身份数=1 目标字节数=%d 结果=启用 业务影响=仅还原正文和推理文本；保留地址、路径及工具参数，不记录正文", debugTraceID(r), plan.hold)
 	debugEvent(r, "debug", "identity_response_restore_planned", map[string]any{
 		"targets":         len(plan.rules),
 		"hold_bytes":      plan.hold,
@@ -101,7 +109,7 @@ func planIdentityRestore(r *http.Request, body map[string]any) {
 }
 
 // originalClientIdentities 只从原始入站请求的 instructions、system、developer
-// 位置收集客户端身份原文（按出现顺序去重）。其他角色、content 中非文本块、
+// 位置收集明确的客户端身份声明（按出现顺序去重）。其他角色、content 中非文本块、
 // 工具参数与推理字段都不参与推断。
 func originalClientIdentities(body map[string]any) []string {
 	return originalClientIdentitiesWithRules(body, identitySnapshot().restoreTargets)
@@ -113,13 +121,11 @@ func originalClientIdentitiesWithRules(body map[string]any, rules []identityRest
 	}
 	var found []string
 	for _, text := range identityInstructionTexts(body) {
-		client := clientIdentitiesInText(rules, text)
-		if len(client) == 0 {
-			continue
+		client, ambiguous := clientIdentitiesInText(rules, text)
+		if ambiguous {
+			return nil
 		}
-		// 还原计划需要的是客户端身份名本身，不是完整系统提示行；用规则表把
-		// 这一行映射回它包含的身份名（例如 "You are Claude Code." -> "Claude Code"）。
-		for _, name := range clientIdentitiesInLine(rules, client[0]) {
+		for _, name := range client {
 			duplicate := false
 			for _, existing := range found {
 				if existing == name {
@@ -193,62 +199,55 @@ func appendContentText(texts []string, content any) []string {
 	return texts
 }
 
-// clientIdentitiesInText 找出指令原文里的客户端身份：被改写成 target 的客户端名
-// （例如 "Claude Code"）出现的那一行完整文本就是客户端身份原文。
-// 像 WorkBuddy 这样的产品名可能本来就在客户端提示词里，不能据此断定客户端身份。
-// 同一行出现多个不同的身份名时整行作废，避免把上游注入的身份句当成客户端身份。
-func clientIdentitiesInText(rules []identityRestoreRule, text string) []string {
+var identityDeclarationPrefix = regexp.MustCompile(`(?i)(?:^|[.!?。！？;；]\s*)(?:you are an AI agent powered by\s+|you are\s+|you're\s+|you’re\s+|i am\s+|i'm\s+|i’m\s+|we are\s+|你是\s*|您是\s*|我是\s*)`)
+
+// 只接受行首或句首的自我身份声明；普通提及、否定指令、引用和围栏代码不作为身份来源。
+// 名称必须紧随声明词，描述中的其他产品名不参与判定；并列/选择句式视为歧义。
+func clientIdentitiesInText(rules []identityRestoreRule, text string) ([]string, bool) {
 	names := identityNameRules(rules)
 	if len(names) == 0 {
-		return nil
+		return nil, false
 	}
 	var found []string
+	fence := ""
 	for _, line := range strings.Split(text, "\n") {
-		ids := clientIdentitiesInLine(names, line)
-		if len(ids) == 0 {
+		line = strings.TrimSpace(line)
+		if fence != "" {
+			if strings.HasPrefix(line, fence) {
+				fence = ""
+			}
 			continue
 		}
-		found = append(found, line)
-	}
-	return found
-}
-
-// clientIdentitiesInLine 用一次最长匹配扫描提取行内实际身份名，避免 "Grok Build"
-// 被 "Grok" 规则二次命中而误判成多身份。同一行出现多个不同身份名时返回空。
-func clientIdentitiesInLine(rules []identityRestoreRule, line string) []string {
-	var found []string
-	for scan := 0; scan < len(line); {
-		best := -1
-		bestEnd := scan
-		bestFrom := ""
-		for _, rule := range rules {
-			for from := scan; ; {
-				at := strings.Index(line[from:], rule.from)
-				if at < 0 {
-					break
+		if strings.HasPrefix(line, "```") || strings.HasPrefix(line, "~~~") {
+			fence = line[:3]
+			continue
+		}
+		if strings.HasPrefix(line, ">") || strings.HasPrefix(line, "\"") ||
+			strings.HasPrefix(line, "'") || strings.HasPrefix(line, "`") {
+			continue
+		}
+		for _, prefix := range identityDeclarationPrefix.FindAllStringIndex(line, -1) {
+			declaration := strings.TrimLeft(line[prefix[1]:], "`*_")
+			name := ""
+			for _, rule := range names {
+				if len(rule.from) > len(name) && strings.HasPrefix(declaration, rule.from) &&
+					identityMatchBoundary(declaration, 0, len(rule.from)) {
+					name = rule.from
 				}
-				start := from + at
-				end := start + len(rule.from)
-				from = start + 1
-				if !identityMatchBoundary(line, start, end) {
-					continue
-				}
-				if best < 0 || start < best || (start == best && end > bestEnd) {
-					best, bestEnd, bestFrom = start, end, rule.from
-				}
-				break
 			}
+			if name == "" {
+				continue
+			}
+			tail := strings.ToLower(strings.TrimLeft(declaration[len(name):], "`*_,， \t"))
+			for _, connector := range []string{"or ", "and ", "/", "或", "、"} {
+				if strings.HasPrefix(tail, connector) {
+					return nil, true
+				}
+			}
+			found = append(found, name)
 		}
-		if best < 0 {
-			break
-		}
-		if len(found) > 0 && found[0] != bestFrom {
-			return nil
-		}
-		found = append(found, bestFrom)
-		scan = bestEnd
 	}
-	return found
+	return found, false
 }
 
 // identityNameRules 返回计划中身份名对应的规则副本，用于在指令里定位客户端身份。
@@ -322,9 +321,70 @@ func isASCIIIdentifierByte(b byte) bool {
 // -----------------------------------------------------------------------------
 
 type identityRestorer struct {
-	plan   identityRestore
-	carry  []byte // 上一条分片留下的尾部，最多为目标长度加一个 rune
-	active bool
+	plan    identityRestore
+	carry   []byte // 尾部最多为目标长度、边界 rune 和一个点号
+	active  bool
+	address identityAddressContext
+}
+
+// 只记已消费原文的地址状态，不缓存整条 URL 或路径。引号内路径允许包含空格。
+// dot 表示刚收到“标识符.”，下一字节若仍为标识符则属于域名或文件名。
+type identityAddressContext struct {
+	path  bool
+	dot   bool
+	prev  byte
+	quote rune
+}
+
+func (c *identityAddressContext) advance(text string) {
+	for _, r := range text {
+		if (r == '"' || r == '\'' || r == '`') &&
+			(c.quote == r || c.quote == 0 && !isASCIIIdentifierByte(c.prev)) {
+			if c.quote == 0 {
+				c.quote = r
+			} else if c.quote == r {
+				*c = identityAddressContext{}
+			}
+			c.prev, c.dot = 0, false
+			continue
+		}
+		if unicode.IsSpace(r) || strings.ContainsRune("<>，。！？；", r) {
+			if c.quote == 0 || r == '\n' || r == '\r' {
+				*c = identityAddressContext{}
+			} else {
+				c.prev, c.dot = 0, false
+			}
+			continue
+		}
+		id := r < utf8.RuneSelf && isASCIIIdentifierByte(byte(r))
+		if c.dot && id {
+			c.path = true
+		}
+		if r == '/' || r == '\\' || r == ':' || r == '@' {
+			c.path = true
+		}
+		c.dot = r == '.' && isASCIIIdentifierByte(c.prev)
+		c.prev = 0
+		if r < utf8.RuneSelf {
+			c.prev = byte(r)
+		}
+	}
+}
+
+func (c identityAddressContext) protects(text string, end int) bool {
+	if c.path || c.prev == '.' || c.prev == '-' {
+		return true
+	}
+	if end == len(text) {
+		return false
+	}
+	switch text[end] {
+	case '/', '\\', ':', '@', '-':
+		return true
+	case '.':
+		return end+1 < len(text) && (isASCIIIdentifierByte(text[end+1]) || text[end+1] == '-')
+	}
+	return false
 }
 
 func newIdentityRestorer(plan identityRestore) *identityRestorer {
@@ -347,7 +407,8 @@ func (s *identityRestorer) Write(delta string) string {
 		cut = lastRuneStart(pending)
 	}
 	cut = runeStartAtOrBefore(pending, cut)
-	out, consumed := restoreStreamingPrefix(s.plan.rules, pending, cut)
+	out, consumed := restoreIdentityPrefix(s.plan.rules, pending, cut, s.address, false)
+	s.address.advance(pending[:consumed])
 	if consumed < len(pending) {
 		s.carry = append(s.carry, pending[consumed:]...)
 	}
@@ -359,20 +420,21 @@ func (s *identityRestorer) Flush() string {
 	if !s.active || len(s.carry) == 0 {
 		return ""
 	}
-	out := restoreIdentityText(s.plan.rules, string(s.carry))
+	pending := string(s.carry)
+	out, _ := restoreIdentityPrefix(s.plan.rules, pending, len(pending), s.address, true)
 	s.carry = s.carry[:0]
+	s.address = identityAddressContext{}
 	return out
 }
 
 // restorePendingCut 找出尚未结束文本的初始处理边界：只有在当前文本末端仍可能是目标前缀的
 // 位置才扣留，已经出现后继字节的完整目标可以立即判定并还原。
 //
-// 需要保留的情况只有两种：末尾是某条目标的真前缀，或末尾正好是完整目标。
-// 同时保留目标前的一个字节，供下一片判断左边界；目标后一个字节不属于扣留
-// 条件，因为一旦它已经到达，右边界就已经确定。hold 把扫描限制在一个目标长度内。
+// 保留末尾的目标前缀、完整目标，以及“目标.”：后者要等待下个字节区分句号
+// 和域名/文件后缀。同时保留目标前的边界上下文，扫描窗口为 hold 加一个字节。
 func restorePendingCut(text string, plan identityRestore) int {
 	cut := len(text)
-	scanStart := len(text) - plan.hold
+	scanStart := len(text) - plan.hold - 1
 	if scanStart < 0 {
 		scanStart = 0
 	}
@@ -382,9 +444,10 @@ func restorePendingCut(text string, plan identityRestore) int {
 		}
 		suffix := text[start:]
 		for _, rule := range plan.rules {
-			// HasPrefix 同时覆盖真前缀和完整目标；目标后面已经有字节时
-			// suffix 会变长，不能再被当作未决前缀。
-			if !strings.HasPrefix(rule.from, suffix) {
+			// HasPrefix 覆盖真前缀和完整目标；单独保留尚未判定的点号后缀。
+			dottedTarget := len(suffix) == len(rule.from)+1 && suffix[len(suffix)-1] == '.' &&
+				strings.HasPrefix(suffix, rule.from)
+			if !strings.HasPrefix(rule.from, suffix) && !dottedTarget {
 				continue
 			}
 			// 目标起点前的一个字节用于判断左边界。若它还没有出现在 pending
@@ -402,25 +465,25 @@ func restorePendingCut(text string, plan identityRestore) int {
 	return cut
 }
 
-// restoreStreamingPrefix 只处理 limit 以内的命中，同时允许用 limit 后面的一个
-// 字节判断右边界。跨过 limit 的目标整体留给下一片；已经到达边界但右边界
-// 尚未出现的目标也会被保留，避免流式路径把未完成的目标提前替换。
-func restoreStreamingPrefix(rules []identityRestoreRule, text string, limit int) (string, int) {
+// restoreIdentityPrefix 只处理 limit 以内的命中，结合原文地址上下文跳过 URL、
+// 域名和路径。流式调用保留未决目标；final 调用允许处理恰好位于文末的目标。
+func restoreIdentityPrefix(rules []identityRestoreRule, text string, limit int, address identityAddressContext, final bool) (string, int) {
 	if limit <= 0 {
 		return "", 0
 	}
 	var b strings.Builder
 	started := false
 	cursor := 0
+	scan := 0
 	for {
-		match, found := matchIdentityTarget(rules, cursor, text)
+		match, found := matchIdentityTarget(rules, scan, text)
 		if !found {
 			break
 		}
 		if match.start >= limit {
 			break
 		}
-		if match.end > limit || match.end == len(text) {
+		if match.end > limit || !final && match.end == len(text) {
 			// 目标跨过当前处理边界，或末尾仍缺少右边界；从目标起点开始暂存。
 			if match.start > cursor {
 				if !started {
@@ -429,6 +492,13 @@ func restoreStreamingPrefix(rules []identityRestoreRule, text string, limit int)
 				b.WriteString(text[cursor:match.start])
 			}
 			return b.String(), match.start
+		}
+		address.advance(text[scan:match.start])
+		protected := address.protects(text, match.end)
+		address.advance(text[match.start:match.end])
+		scan = match.end
+		if protected {
+			continue
 		}
 		if !started {
 			b.Grow(limit)
@@ -477,23 +547,8 @@ func minInt(a, b int) int {
 }
 
 // restoreIdentityText 用同一套匹配规则替换一段完整文本。命中之间未改动的
-// 字节原样保留；首尾边界按「是否被标识符字符包围」判断，与流式逐片判定一致。
-// cursor 从 0 开始，因此只要发生过替换就必然写入过前缀，用它区分「无命中」。
+// 字节原样保留；标识符边界与地址保护规则与流式逐片判定一致。
 func restoreIdentityText(rules []identityRestoreRule, text string) string {
-	var b strings.Builder
-	cursor := 0
-	for {
-		match, found := matchIdentityTarget(rules, cursor, text)
-		if !found {
-			break
-		}
-		b.WriteString(text[cursor:match.start])
-		b.WriteString(match.to)
-		cursor = match.end
-	}
-	if cursor == 0 {
-		return text
-	}
-	b.WriteString(text[cursor:])
-	return b.String()
+	out, _ := restoreIdentityPrefix(rules, text, len(text), identityAddressContext{}, true)
+	return out
 }

@@ -38,7 +38,7 @@ import (
 
 // fork：版本值不参与 CI 产物（release.yml 以 tag 经 -ldflags 注入 main.version），
 // 保持 var 供本地 -ldflags 注入（const 会使注入失效，见 MEMORY.md 发版约定）。
-var version = "1.29.21"
+var version = "1.29.23"
 
 const (
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
@@ -2893,9 +2893,14 @@ func usageTotalTokens(usage map[string]any) (int64, bool) {
 	return 0, false
 }
 
-func observeModelCredit(acc *Account, model string, usage map[string]any, reqID uint64) {
+func observeModelCredit(r *http.Request, acc *Account, model string, usage map[string]any, reqID uint64) {
+	trace := debugTraceID(r)
+	if trace == "" {
+		trace = newTraceID()
+	}
 	credit, ok := usageCredit(usage)
-	if !ok || acc == nil {
+	if !ok || acc == nil || !validRateCredit(credit) {
+		log.Printf("[倍率来源] traceId=%s requestId=%d 阶段=实测校验 模型=%s 结果=跳过 原因=缺少有效usage.credit或账号 业务影响=保留上次可信来源，缺失不当作免费", trace, reqID, normalizeModelName(model))
 		return
 	}
 	// credit=0 只有样本足够大时才判定为免费：极小请求（例如探针）上游也可能记 0，
@@ -2903,8 +2908,8 @@ func observeModelCredit(acc *Account, model string, usage map[string]any, reqID 
 	if credit <= 0 {
 		total, hasTotal := usageTotalTokens(usage)
 		if !hasTotal || total < modelFreeMinTokens {
-			log.Printf("[ModelCost] requestId=%d 账号 %s 模型 %s credit=0 但样本过小（total_tokens=%d < %d），忽略本次免费判定",
-				reqID, acc.Path, model, total, modelFreeMinTokens)
+			log.Printf("[ModelCost] requestId=%d 账号 %s 模型 %s credit=0 但样本过小（total_tokens=%d < %d），忽略本次免费判定 traceId=%s",
+				reqID, acc.Path, model, total, modelFreeMinTokens, trace)
 			return
 		}
 	}
@@ -2941,17 +2946,19 @@ func observeModelCredit(acc *Account, model string, usage map[string]any, reqID 
 	if accountReqWindow(acc, reqID) {
 		consumeProbeBudget(acc.Profile().Key, model, credit, time.Now())
 	}
-	recordModelCostClass(model, acc.Profile().Key, credit <= 0)
+	recordModelCostClass(model, site, credit <= 0)
+	total, _ := usageTotalTokens(usage)
+	recordRateUsage(site, model, credit, total, time.Now(), reqID, trace)
 
 	if credit <= 0 {
 		if oldClass != modelCostFree {
-			log.Printf("[ModelCost] requestId=%d 账号 %s 站点=%s 模型 %s 实测 usage.credit=0，已学习为免费模型", reqID, path, site, model)
+			log.Printf("[ModelCost] requestId=%d 账号 %s 站点=%s 模型 %s 实测 usage.credit=0，已学习为免费模型 traceId=%s", reqID, path, site, model, trace)
 		}
 		if quotaExhausted {
 			log.Printf("[FreeModel] requestId=%d 站点=%s 请求的是免费模型 %s，已明确使用付费余额耗尽账号 %s 完成请求，usage.credit=0", reqID, site, model, path)
 		}
 	} else if oldClass != modelCostPaid {
-		log.Printf("[ModelCost] requestId=%d 账号 %s 站点=%s 模型 %s 实测 usage.credit=%s，已学习为收费模型", reqID, path, site, model, formatQuota(credit))
+		log.Printf("[ModelCost] requestId=%d 账号 %s 站点=%s 模型 %s 实测 usage.credit=%s，已学习为收费模型 traceId=%s", reqID, path, site, model, formatQuota(credit), trace)
 	}
 	writeStatusSnapshot()
 }
@@ -3993,6 +4000,8 @@ func runServe() {
 	// 恢复上游风控限制（11140）状态：重启不会把受限账号放回池子，站点熔断继续生效。
 	loadRestrictedState()
 
+	restoreRateUsageFromAccounts()
+
 	// 启动后台自动刷新协程
 	go backgroundTokenRefresher()
 	// 主动续期（保活）：到点刷新全部账号登录凭据，不等访问令牌临近过期
@@ -4827,7 +4836,10 @@ func streamChatResponseWithReplay(w http.ResponseWriter, r *http.Request, resp *
 		commentLines, metadataLines := 0, 0
 		// 每个通道的还原缓存都属于本次尝试；重放时从干净状态重新累积。
 		restorePlan := identityRestoreFor(r)
-		restorers := map[chatRestoreKey]*identityRestorer{}
+		var restorers map[chatRestoreKey]*identityRestorer
+		if restorePlan.active() {
+			restorers = map[chatRestoreKey]*identityRestorer{}
+		}
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if line == "" {
@@ -4863,14 +4875,18 @@ func streamChatResponseWithReplay(w http.ResponseWriter, r *http.Request, resp *
 				}
 				finishReason = noteFinishReason(finishReason, chunk)
 			}
-			if cleanedChunk := cleanChunkObject(cleanData, restorePlan, restorers); cleanedChunk != "" {
-				writeRestoredChatChunk(guard, cleanedChunk, chunk, restorers)
+			if restorePlan.active() {
+				if cleanedChunk := cleanChunkObject(cleanData, restorePlan, restorers); cleanedChunk != "" {
+					writeRestoredChatChunk(guard, cleanedChunk, chunk, restorers)
+				}
+			} else if cleanedChunk := cleanChunkJSON(cleanData); cleanedChunk != "" {
+				guard.writeData(cleanedChunk)
 			}
 		}
 		scanErr := scanner.Err()
 		// 只有确认上游正常完成时才补发剩余尾部；中断或缺少 finish_reason
 		// 时保持残缺语义，不能把尾部伪造成完整回复。
-		if scanErr == nil && finishReason != "" {
+		if restorePlan.active() && scanErr == nil && finishReason != "" {
 			flushAllChatRestorers(guard, restorers)
 		}
 		if commentLines > 0 || metadataLines > 0 {
@@ -4951,7 +4967,9 @@ func streamChatResponseWithReplay(w http.ResponseWriter, r *http.Request, resp *
 				"saw_done":      sawDone,
 			})
 		}
-		observeModelCredit(acc, modelName, usage, reqID)
+		if scanErr == nil && finishReason != "" {
+			observeModelCredit(r, acc, modelName, usage, reqID)
+		}
 		statsObserveUsage(r, usage, scanErr == nil && finishReason != "")
 		recordModelTokens(modelName, usage, reqID)
 		recordUsageLine(r, modelName, usage)
@@ -5030,7 +5048,7 @@ func handleNonStreamUpstream(
 			writeOpenAIError(w, http.StatusInternalServerError, "translate_error", "转换 Responses 响应失败: "+convErr.Error())
 			return
 		}
-		observeModelCredit(acc, modelName, usage, reqID)
+		observeModelCredit(r, acc, modelName, usage, reqID)
 		recordModelTokens(modelName, usage, reqID)
 		recordUsageLine(r, modelName, usage)
 		recordModelTTFT(modelName, body.duration())

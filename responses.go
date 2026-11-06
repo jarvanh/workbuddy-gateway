@@ -1177,7 +1177,7 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 	if usage != nil {
 		final["usage"] = toResponsesUsage(usage)
 	}
-	observeModelCredit(acc, modelName, usage, reqID)
+	observeModelCredit(r, acc, modelName, usage, reqID)
 	recordModelTokens(modelName, usage, reqID)
 	recordUsageLine(r, modelName, usage)
 	emit("response.completed", map[string]any{"response": final})

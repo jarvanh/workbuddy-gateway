@@ -140,6 +140,9 @@ func TestConfigExampleIncludesIdentityCompatibilityDefaults(t *testing.T) {
 	if err := json.Unmarshal(raw, &c); err != nil {
 		t.Fatal(err)
 	}
+	if c.Identity.ResponseRestore == nil || *c.Identity.ResponseRestore {
+		t.Fatal("config.example.json must explicitly disable experimental response restore")
+	}
 	if len(c.DeprecatedPromptCompatibility) != 0 {
 		t.Fatal("example must not contain the removed compatibility field")
 	}

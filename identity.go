@@ -16,7 +16,7 @@ type runtimeIdentityConfig struct {
 	Enabled      *bool             `json:"enabled,omitempty"`
 	Target       string            `json:"target,omitempty"`
 	Replacements map[string]string `json:"replacements,omitempty"`
-	// ResponseRestore 默认关闭。开启后只改写响应可见正文：把出站时被替换掉的
+	// ResponseRestore 是默认关闭的实验功能。开启后只改写响应可见正文：把出站时被替换掉的
 	// 客户端身份还原回来。入站请求处理与出站请求体完全不受影响。
 	ResponseRestore *bool `json:"responseRestore,omitempty"`
 }
@@ -35,9 +35,7 @@ type identitySettings struct {
 	target       string
 	replacements []identityReplacement
 	invalidRules int
-	// responseRestore 是配置开关；restoreTargets 是可直接按字节查找的
-	// identity.replacements 键（字面规则）及其值，供响应还原使用：
-	// 前半段是完全等于 target 的替换值（身份名），后半段是包含 target 的替换值。
+	// restoreTargets 只在实验开关开启时建立，包含替换值等于 target 的字面身份规则。
 	responseRestore bool
 	restoreTargets  []identityRestoreRule
 }
@@ -85,9 +83,11 @@ func defaultIdentitySettings() identitySettings {
 
 func defaultIdentityConfig() runtimeIdentityConfig {
 	enabled := true
+	responseRestore := false
 	return runtimeIdentityConfig{
 		Enabled: &enabled, Target: "WorkBuddy",
-		Replacements: defaultIdentityReplacements("WorkBuddy"),
+		Replacements:    defaultIdentityReplacements("WorkBuddy"),
+		ResponseRestore: &responseRestore,
 	}
 }
 
@@ -140,10 +140,14 @@ func buildIdentitySettings(c runtimeIdentityConfig) identitySettings {
 		}
 		return a.Old < b.Old
 	})
-	restoreRules := buildIdentityRestoreRules(target, replacements)
+	responseRestore := c.ResponseRestore != nil && *c.ResponseRestore
+	var restoreRules []identityRestoreRule
+	if enabled && responseRestore {
+		restoreRules = buildIdentityRestoreRules(target, replacements)
+	}
 	return identitySettings{
 		enabled: enabled, target: target, replacements: replacements, invalidRules: invalid,
-		responseRestore: c.ResponseRestore != nil && *c.ResponseRestore, restoreTargets: restoreRules,
+		responseRestore: responseRestore, restoreTargets: restoreRules,
 	}
 }
 
