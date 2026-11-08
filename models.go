@@ -1746,7 +1746,7 @@ func probeModelPriceEx(acc *Account, model string) probeOutcome {
 			out.Status, out.Detail = "restricted", "上游风控限制（11140），账号停止调度；请在官方端提交反馈申诉"
 		case isQuotaExhausted(resp.StatusCode, s):
 			out.Status, out.Detail = "quota", "14018 额度耗尽，不覆盖"
-		case isModelRateLimited(s):
+		case isModelRateLimited(resp.StatusCode, s):
 			out.Status, out.Detail = "rate_limited", "6004 模型限流，不覆盖"
 			if until, ok := parseResetTime(s); ok {
 				out.RetryAt = until
