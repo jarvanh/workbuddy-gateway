@@ -4,7 +4,8 @@
     "webPort": 8316,
     "adminKey": "",
     "apiKeyEnabled": false,
-    "apiKey": ""
+    "apiKey": "",
+    "corsAllowedOrigins": []
   },
   "systemPrompt": {
     "fallback": "",
@@ -54,6 +55,7 @@
     "requestProfile": "official",
     "headerTimeoutSeconds": 300,
     "idleTimeoutSeconds": 120,
+    "maxRequestBodyMB": 32,
     "transientRetries": 2,
     "earlyFlushGraceSeconds": 30,
     "streamKeepaliveSeconds": 15,

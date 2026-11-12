@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -38,10 +37,14 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	startTime := requestStartFor(r)
 
 	readStarted := debugBodyReadStarted(r)
-	bodyBytes, err := io.ReadAll(r.Body)
+	bodyBytes, err := readModelRequestBody(w, r)
 	readDuration := debugElapsedSince(readStarted)
 	if err != nil {
 		debugBodyReadFailed(r, bodyBytes, readStarted, err)
+		if errors.Is(err, errModelRequestBodyTooLarge) {
+			writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large", "请求体超过网关允许的大小上限")
+			return
+		}
 		writeOpenAIError(w, http.StatusBadRequest, "read_error", "读取请求体失败")
 		return
 	}

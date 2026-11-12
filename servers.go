@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -35,13 +36,52 @@ func newAPIHandler() http.Handler {
 	return requestAuditMiddleware(corsMiddleware(authMiddleware(mux)))
 }
 
+// isLoopbackListenAddr 判断监听地址是否仅绑定回环。
+// 空 host（":8080"）代表全部网卡，不属于回环。
+func isLoopbackListenAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	host = strings.Trim(host, "[]")
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// validateListenSecurity 落实 WB1 的安全默认：模型 API 未配置 Key 时只允许
+// 回环监听；要绑定 0.0.0.0/局域网地址必须显式配置 gateway.apiKey。
+// 运行时 authMiddleware 保留空 key 放行语义，因此本校验是空 key 暴露面的
+// 唯一闸门——必须在 net.Listen 之前执行。
+func validateListenSecurity(addr string) error {
+	if strings.TrimSpace(currentAPIKey()) != "" {
+		return nil
+	}
+	if isLoopbackListenAddr(addr) {
+		log.Printf("[安全默认] 模型 API 未配置 gateway.apiKey，仅绑定回环地址 %s；局域网访问需配置 Key", addr)
+		return nil
+	}
+	return fmt.Errorf("拒绝启动：模型 API 未配置 gateway.apiKey，监听 %s 不是回环地址；"+
+		"请在 config.json 设置 gateway.apiKeyEnabled=true 与 gateway.apiKey，或改为监听 127.0.0.1", addr)
+}
+
 func prepareGatewayServers() ([]*http.Server, []net.Listener, error) {
+	apiAddr := net.JoinHostPort(cfg.Addr, strconv.Itoa(cfg.Port))
+	if err := validateListenSecurity(apiAddr); err != nil {
+		return nil, nil, err
+	}
 	if err := webUIPreflightError(); err != nil {
 		return nil, nil, err
 	}
 	servers := []*http.Server{{
-		Addr: net.JoinHostPort(cfg.Addr, strconv.Itoa(cfg.Port)), Handler: newAPIHandler(),
-		ReadTimeout: 120 * time.Second,
+		Addr: apiAddr, Handler: newAPIHandler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       120 * time.Second,
 		// 保留模型流无总写入时限，不把管理端限制扩散到模型 API。
 		WriteTimeout: 0,
 	}}
@@ -98,7 +138,10 @@ func newGatewayHTTPSlot(addr string, web bool) *gatewayHTTPSlot {
 		}
 	} else {
 		handler = newAPIHandler()
-		server = &http.Server{Addr: addr, Handler: handler, ReadTimeout: 120 * time.Second, WriteTimeout: 0}
+		server = &http.Server{
+			Addr: addr, Handler: handler, ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout: 120 * time.Second, WriteTimeout: 0,
+		}
 	}
 	return &gatewayHTTPSlot{server: server, web: web}
 }

@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"os"
+	"strings"
 	"sync"
 )
 
@@ -24,6 +26,9 @@ type gatewayFileConfig struct {
 	AdminKey      string `json:"adminKey"`
 	APIKeyEnabled bool   `json:"apiKeyEnabled"`
 	APIKey        string `json:"apiKey"`
+	// CORSAllowedOrigins：模型 API 允许跨域读取的来源白名单（精确匹配 scheme://host[:port]）。
+	// 为空时不返回任何 Access-Control-Allow-* 头；绝不使用通配符 *。
+	CORSAllowedOrigins []string `json:"corsAllowedOrigins"`
 }
 
 type gatewayValidationError string
@@ -60,7 +65,41 @@ func normalizeGatewayConfig(g gatewayFileConfig) (gatewayFileConfig, error) {
 	if g.APIKeyEnabled && g.APIKey == "" {
 		return g, gatewayValidationError("启用 API Key 校验时必须设置 gateway.apiKey")
 	}
+	origins, err := normalizeCORSAllowedOrigins(g.CORSAllowedOrigins)
+	if err != nil {
+		return g, err
+	}
+	g.CORSAllowedOrigins = origins
 	return g, nil
+}
+
+// normalizeCORSAllowedOrigins 只接受精确的 http(s) 来源，禁止通配符与路径。
+// 浏览器发送的 Origin 形如 scheme://host[:port]，带路径/查询的配置永远匹配不上，
+// 因此在这里直接拒绝，避免用户误以为已生效。
+func normalizeCORSAllowedOrigins(values []string) ([]string, error) {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]bool, len(values))
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			continue
+		}
+		if value == "*" {
+			return nil, gatewayValidationError("gateway.corsAllowedOrigins 不支持通配符 *，请显式列出允许的来源")
+		}
+		u, err := url.Parse(value)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" ||
+			u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.RawPath != "" {
+			return nil, gatewayValidationError(fmt.Sprintf("gateway.corsAllowedOrigins 条目 %q 无效，必须是 scheme://host[:port]（如 https://example.com）", raw))
+		}
+		canonical := strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host)
+		if seen[canonical] {
+			continue
+		}
+		seen[canonical] = true
+		out = append(out, canonical)
+	}
+	return out, nil
 }
 
 func applyGatewayConfig(g gatewayFileConfig) error {
@@ -311,12 +350,14 @@ func gatewaySettingsView() map[string]any {
 	}
 }
 
-// ignoreLegacyAPIKeyFlag 只是吞掉旧 systemd 单元/脚本里残留的 -api-key，避免升级后启动失败。
+// ignoreLegacyAPIKeyFlag 不再静默接受已弃用的 -api-key。
 //
-// 该参数在新版本中**完全静默、不产生任何作用**：不写日志、不写盘、不修改 config.json、
-// 不影响模型 API 鉴权；模型 API 鉴权一律只由 config.json 的 gateway.apiKeyEnabled / apiKey 决定。
-//
-// TODO(remove): 这是纯兼容占位，计划在后续版本彻底删除该参数与 main.go 中的注册代码；
-// 删除后旧启动命令会因未知参数而启动失败，届时应在发布说明中提示用户先移除该参数。
-func ignoreLegacyAPIKeyFlag(_ string) {
+// 旧版本该参数直接开启模型 API 鉴权；新版本鉴权只由 config.json 的
+// gateway.apiKeyEnabled / apiKey 决定。若继续静默吞掉，运维会误以为参数仍生效，
+// 实际端口处于未鉴权状态。因此显式传值时直接返回启动错误，提示迁移方式。
+func ignoreLegacyAPIKeyFlag(value string) error {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	return fmt.Errorf("-api-key 已弃用且不再生效；请在 config.json 的 gateway.apiKeyEnabled=true 与 gateway.apiKey 中配置后移除该参数")
 }

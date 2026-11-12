@@ -201,11 +201,15 @@ func TestOfficialHeadersModelOnlyAndInternationalFallback(t *testing.T) {
 			if req.Header.Get("Authorization") != "Bearer synthetic-access" {
 				t.Fatal("model access token was lost")
 			}
-			// 控制接口仍使用原鉴权函数，不受模型兼容层修改。
+			// 控制接口仍使用原鉴权函数，不受模型兼容层修改；但 refresh token
+			// 只属于刷新流程，普通控制请求不得携带。
 			control := httptest.NewRequest("POST", prof.authTokenURL("test"), nil)
 			backendHeaders(control, auth, prof)
 			applyObservedDesktopHeaders(control, prof, profile)
-			if control.Header.Get("X-Refresh-Token") != "synthetic-refresh" ||
+			if control.Header.Get("X-Refresh-Token") != "" {
+				t.Fatal("普通控制请求不得携带 refresh token")
+			}
+			if control.Header.Get("Authorization") != "Bearer synthetic-access" ||
 				control.Header.Get("User-Agent") != prof.ClientUA {
 				t.Fatal("control endpoint authentication changed")
 			}

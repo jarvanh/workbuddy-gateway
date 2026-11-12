@@ -63,6 +63,9 @@ func parseRuntimeConfig(data []byte) (runtimeFileConfig, error) {
 			return c, errors.New("upstream 超时秒数过大，超出 time.Duration 可表示范围")
 		}
 	}
+	if mb := c.Upstream.MaxRequestBodyMB; mb < 0 || mb > 1024 {
+		return c, errors.New("upstream.maxRequestBodyMB 必须为 0～1024 的整数；0 表示使用默认 32MB")
+	}
 	// 兼容旧示例同时携带两个空数组，但非空黑白名单不能同时生效。
 	if hasModelNames(c.Models.Blocklist) && hasModelNames(c.Models.Allowlist) {
 		return c, errors.New("models.allowlist 与 models.blocklist 不能同时非空，请只保留一种模型名单")
@@ -411,6 +414,11 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 	upstreamHeaderTimeout, upstreamIdleTimeout, upstreamTransientRetries = header, idle, retries
 	streamKeepalive = keepalive
 	enableFirstByteRetry = firstByteRetry
+	requestBodyMB := defaultModelRequestBodyMB
+	if n := c.Upstream.MaxRequestBodyMB; n > 0 {
+		requestBodyMB = n
+	}
+	modelRequestBodyMaxBytes = int64(requestBodyMB) << 20
 	upstreamConfigMu.Unlock()
 	// --- fork 专有段：以下是 fork 自身能力的装载，上游没有对应逻辑 ---
 	// 5 小时窗口主动触发 + 主动探测调度（默认开启，缺失字段回落默认值）。

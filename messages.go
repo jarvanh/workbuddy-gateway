@@ -38,6 +38,38 @@ func withAnthropicErrFormat(ctx context.Context) context.Context {
 	return context.WithValue(ctx, anthropicErrFmtKey{}, true)
 }
 
+// errModelRequestBodyTooLarge 把 MaxBytesReader 的溢出错误与普通读错误区分开，
+// 便于三个模型入口统一返回 413 而不是笼统的 400。
+var errModelRequestBodyTooLarge = errors.New("模型 API 请求体超过上限")
+
+// defaultModelRequestBodyMB 是模型 API 入站请求体默认上限（32MB）。
+const defaultModelRequestBodyMB = 32
+
+// modelRequestBodyMaxBytes 为生效的入站请求体上限，可由 config.json 的
+// upstream.maxRequestBodyMB 覆盖（upstreamConfigMu 保护）。
+var modelRequestBodyMaxBytes int64 = defaultModelRequestBodyMB << 20
+
+func currentModelRequestBodyLimit() int64 {
+	upstreamConfigMu.RLock()
+	defer upstreamConfigMu.RUnlock()
+	return modelRequestBodyMaxBytes
+}
+
+// readModelRequestBody 以硬上限读取模型 API 请求体。所有模型入口必须走这里，
+// 禁止裸 io.ReadAll(r.Body)，否则超大请求可以把进程内存打满。
+func readModelRequestBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	r.Body = http.MaxBytesReader(w, r.Body, currentModelRequestBodyLimit())
+	body, err := io.ReadAll(r.Body)
+	if err == nil {
+		return body, nil
+	}
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		return body, errModelRequestBodyTooLarge
+	}
+	return body, err
+}
+
 // writeUpstreamError 是 upstreamChat / 鉴权中间件的统一错误出口：
 // 请求来自 /v1/messages 时回 Anthropic 形状，否则回 OpenAI 形状。
 func writeUpstreamError(w http.ResponseWriter, r *http.Request, statusCode int, errType, message string) {
@@ -91,10 +123,14 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	startTime := requestStartFor(r)
 
 	readStarted := debugBodyReadStarted(r)
-	bodyBytes, err := io.ReadAll(r.Body)
+	bodyBytes, err := readModelRequestBody(w, r)
 	readDuration := debugElapsedSince(readStarted)
 	if err != nil {
 		debugBodyReadFailed(r, bodyBytes, readStarted, err)
+		if errors.Is(err, errModelRequestBodyTooLarge) {
+			writeAnthropicError(w, http.StatusRequestEntityTooLarge, "request_too_large", "请求体超过网关允许的大小上限")
+			return
+		}
 		writeAnthropicError(w, http.StatusBadRequest, "api_error", "读取请求体失败")
 		return
 	}
@@ -1088,10 +1124,14 @@ func handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	readStarted := debugBodyReadStarted(r)
-	bodyBytes, err := io.ReadAll(r.Body)
+	bodyBytes, err := readModelRequestBody(w, r)
 	readDuration := debugElapsedSince(readStarted)
 	if err != nil {
 		debugBodyReadFailed(r, bodyBytes, readStarted, err)
+		if errors.Is(err, errModelRequestBodyTooLarge) {
+			writeAnthropicError(w, http.StatusRequestEntityTooLarge, "request_too_large", "请求体超过网关允许的大小上限")
+			return
+		}
 		writeAnthropicError(w, http.StatusBadRequest, "api_error", "读取请求体失败")
 		return
 	}

@@ -91,6 +91,9 @@ type runtimeFileConfig struct {
 		HeaderTimeoutSeconds int `json:"headerTimeoutSeconds"`
 		// IdleTimeoutSeconds：流式响应体的空闲读超时（持续有数据则不超时）。
 		IdleTimeoutSeconds int `json:"idleTimeoutSeconds"`
+		// MaxRequestBodyMB：模型 API 入站请求体上限（MB）。省略或 <=0 使用默认 32MB；
+		// 超过上限直接返回 413，避免无上限 io.ReadAll 被超大请求拖垮内存。
+		MaxRequestBodyMB int `json:"maxRequestBodyMB"`
 		// TransientRetries：请求体发送阶段遇到瞬时网络错误的额外重试次数。
 		// 用指针区分「未配置」（用默认值）与「显式设为 0」（禁用重试）。
 		TransientRetries *int `json:"transientRetries"`

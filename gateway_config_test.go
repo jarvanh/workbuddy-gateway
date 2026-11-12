@@ -447,11 +447,13 @@ func BenchmarkTailLongLineLinear(b *testing.B) {
 	}
 }
 
-// 旧启动参数必须被接受（不报错），但必须完全不产生作用。
-func TestGatewayLegacyAPIKeyFlagIsAcceptedButInert(t *testing.T) {
+// 旧启动参数必须显式报错（不再静默吞掉），且不得改变任何配置（WB3）。
+func TestGatewayLegacyAPIKeyFlagIsRejected(t *testing.T) {
 	isolatedGatewayConfig(t)
-	// 场景一：config.json 未配置 Key，旧参数不得开启鉴权、不得写盘。
-	ignoreLegacyAPIKeyFlag("synthetic-legacy-key")
+	// 场景一：config.json 未配置 Key，旧参数必须报错，不得开启鉴权、不得写盘。
+	if err := ignoreLegacyAPIKeyFlag("synthetic-legacy-key"); err == nil {
+		t.Fatal("legacy -api-key must be rejected instead of being silently ignored")
+	}
 	if currentAPIKey() != "" {
 		t.Fatal("legacy -api-key must not enable API authentication")
 	}
@@ -464,7 +466,7 @@ func TestGatewayLegacyAPIKeyFlagIsAcceptedButInert(t *testing.T) {
 	if code := adminRequest(newAPIHandler(), http.MethodPost, "/v1/messages/count_tokens", "any-client-key", `{"messages":[]}`).Code; code != 200 {
 		t.Fatalf("arbitrary key should still work while API auth is disabled, status=%d", code)
 	}
-	// 场景二：config.json 已配置 Key，旧参数不得覆盖配置。
+	// 场景二：config.json 已配置 Key，旧参数仍须报错且不得覆盖配置。
 	content := `{"gateway":{"apiPort":8317,"webPort":8316,"adminKey":"manual-admin","apiKeyEnabled":true,"apiKey":"synthetic-config-key"}}`
 	if err := os.WriteFile(runtimeConfigFile, []byte(content), 0600); err != nil {
 		t.Fatal(err)
@@ -472,12 +474,38 @@ func TestGatewayLegacyAPIKeyFlagIsAcceptedButInert(t *testing.T) {
 	if err := loadRuntimeConfig(runtimeConfigFile); err != nil {
 		t.Fatal(err)
 	}
-	ignoreLegacyAPIKeyFlag("synthetic-other-key")
+	if err := ignoreLegacyAPIKeyFlag("synthetic-other-key"); err == nil {
+		t.Fatal("legacy -api-key must be rejected even when config.json has a key")
+	}
 	if currentAPIKey() != "synthetic-config-key" {
 		t.Fatal("legacy flag must not override config.json")
 	}
 	if code := adminRequest(newAPIHandler(), http.MethodPost, "/v1/messages/count_tokens", "synthetic-other-key", `{"messages":[]}`).Code; code != 401 {
 		t.Fatalf("legacy flag value must not authenticate, status=%d", code)
+	}
+}
+
+// 空 key + 非回环监听必须在启动前被拒绝；回环/已配 key 不受影响（WB1）。
+func TestValidateListenSecurityEmptyKey(t *testing.T) {
+	isolatedGatewayConfig(t)
+	oldKey := cfg.APIKey
+	t.Cleanup(func() { cfg.APIKey = oldKey })
+
+	cfg.APIKey = ""
+	if err := validateListenSecurity("127.0.0.1:8080"); err != nil {
+		t.Fatalf("loopback with empty key must be allowed: %v", err)
+	}
+	if err := validateListenSecurity("[::1]:8080"); err != nil {
+		t.Fatalf("ipv6 loopback with empty key must be allowed: %v", err)
+	}
+	for _, addr := range []string{"0.0.0.0:8080", ":8080", "192.0.2.10:8080"} {
+		if err := validateListenSecurity(addr); err == nil {
+			t.Fatalf("empty key must refuse non-loopback listen %q", addr)
+		}
+	}
+	cfg.APIKey = "configured-key"
+	if err := validateListenSecurity("0.0.0.0:8080"); err != nil {
+		t.Fatalf("configured key must allow non-loopback listen: %v", err)
 	}
 }
 

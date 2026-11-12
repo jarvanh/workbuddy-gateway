@@ -38,7 +38,7 @@ import (
 
 // fork：版本值不参与 CI 产物（release.yml 以 tag 经 -ldflags 注入 main.version），
 // 保持 var 供本地 -ldflags 注入（const 会使注入失效，见 MEMORY.md 发版约定）。
-var version = "1.29.26"
+var version = "1.29.27"
 
 const (
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
@@ -755,10 +755,8 @@ func main() {
 	}
 
 	fs := flag.NewFlagSet(command, flag.ExitOnError)
-	// legacyAPIKeyFlag 仅用于吞掉旧启动命令里的 -api-key，避免升级后报未知参数而启动失败。
-	// 该值不会被任何逻辑读取，也不会产生任何日志或状态变化；用法说明留空，
-	// 使其不出现在 --help 与默认参数列表中。
-	// TODO(remove): 纯兼容占位，计划在后续版本连同下面这行注册一起删除。
+	// legacyAPIKeyFlag 仅用于识别旧启动命令里的 -api-key。该参数已弃用且不再生效：
+	// 显式传值时启动直接报错并提示迁移到 config.json，绝不静默忽略。
 	var legacyAPIKeyFlag string
 	fs.StringVar(&cfg.Addr, "addr", "127.0.0.1", "网关监听地址")
 	fs.IntVar(&cfg.Port, "port", defaultAPIPort, "API 监听端口（显式传入时覆盖 config.json 的 gateway.apiPort）")
@@ -816,7 +814,10 @@ func main() {
 				os.Exit(1)
 			}
 		}
-		ignoreLegacyAPIKeyFlag(legacyAPIKeyFlag)
+		if err := ignoreLegacyAPIKeyFlag(legacyAPIKeyFlag); err != nil {
+			fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	// 初始化 HTTP 客户端
@@ -4273,12 +4274,42 @@ func requestAuditMiddleware(next http.Handler) http.Handler {
 // 中间件: CORS 与可选 APIKey 校验
 // -----------------------------------------------------------------------------
 
+// corsAllowedOrigin 判断请求 Origin 是否在配置的 allowlist 中。
+// 比较使用 EqualFold：scheme/host 本身大小写不敏感，浏览器通常发送小写形式。
+func corsAllowedOrigin(origin string) bool {
+	gatewayConfigMu.RLock()
+	allowed := gatewaySettings.CORSAllowedOrigins
+	gatewayConfigMu.RUnlock()
+	for _, item := range allowed {
+		if strings.EqualFold(item, origin) {
+			return true
+		}
+	}
+	return false
+}
+
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "*")
+		// 只有显式配置的 origin 才回显；无配置时一个 Access-Control-Allow-* 头都不发，
+		// 更不会出现 Access-Control-Allow-Origin: *（此前恒发 * 等于对所有站点开放读取）。
+		origin := strings.TrimSpace(r.Header.Get("Origin"))
+		allowed := origin != "" && corsAllowedOrigin(origin)
+		if allowed {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Add("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "*")
+		}
 		if r.Method == http.MethodOptions {
+			if origin != "" && !allowed {
+				debugEvent(r, "warn", "cors_preflight_rejected", map[string]any{
+					"result":          "rejected",
+					"business_impact": "来源不在 gateway.corsAllowedOrigins 中，预检被拒绝",
+				})
+				log.Printf("[中间件-CORS] traceId=%s 结果=拒绝 原因=来源不在白名单 说明=预检请求未进入业务方法", w.Header().Get("X-Trace-ID"))
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
 			debugEvent(r, "info", "cors_preflight_completed", map[string]any{
 				"result":  "allowed",
 				"message": "CORS 预检已直接返回，请求未进入业务逻辑",
@@ -4300,8 +4331,16 @@ func isAuthExemptPath(p string) bool {
 
 func authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isAuthExemptPath(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
 		apiKey := currentAPIKey()
-		if apiKey != "" && !isAuthExemptPath(r.URL.Path) {
+		// 空 key 的失败关闭由启动期校验负责（prepareGatewayServers）：
+		// 空 key 只允许绑定回环地址，因此本机零配置仍可用；局域网/公网部署
+		// 必须配置 gateway.apiKey，否则拒绝启动（WB1）。运行时保留“空 key
+		// 跳过校验”的语义，避免已绑定的本机实例在运行中突然全部 401。
+		if apiKey != "" {
 			authHeader := r.Header.Get("Authorization")
 			token := strings.TrimPrefix(authHeader, "Bearer ")
 			// Anthropic 客户端（Claude Code 等）用 x-api-key 头携带密钥。
@@ -4689,10 +4728,14 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	startTime := requestStartFor(r)
 
 	readStarted := debugBodyReadStarted(r)
-	bodyBytes, err := io.ReadAll(r.Body)
+	bodyBytes, err := readModelRequestBody(w, r)
 	readDuration := debugElapsedSince(readStarted)
 	if err != nil {
 		debugBodyReadFailed(r, bodyBytes, readStarted, err)
+		if errors.Is(err, errModelRequestBodyTooLarge) {
+			writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large", "请求体超过网关允许的大小上限")
+			return
+		}
 		writeOpenAIError(w, http.StatusBadRequest, "read_error", "读取请求体失败")
 		return
 	}
@@ -5256,9 +5299,8 @@ func backendHeaders(req *http.Request, sa *StoredAuth, prof *upstreamProfile) {
 	} else {
 		req.Header.Set("X-No-Enterprise-Id", "1")
 	}
-	if sa != nil && sa.Auth.RefreshToken != "" {
-		req.Header.Set("X-Refresh-Token", sa.Auth.RefreshToken)
-	}
+	// 安全：refresh token 只在刷新流程（refreshTokenPayload）携带。普通模型/探针/
+	// 搜索/额度请求一律不发送，避免长期凭据出现在每一条出站请求里。
 	if sa != nil && sa.Auth.Domain != "" {
 		req.Header.Set("X-Domain", sa.Auth.Domain)
 	} else {
