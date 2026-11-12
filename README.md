@@ -203,7 +203,7 @@ workbuddy-gateway serve -models-refresh 0
 | 5 小时窗口主动触发（本 fork） | 每天 `warmup.time`（默认 `04:00`） | 按价格上限筛选模型各打一次最小请求；`warmup` 段默认开启 |
 | 每日主动探测（本 fork） | 跟随 warmup 时刻，或独立 `06:00` | warmup 关闭时按 `probe.schedule.time` 执行 |
 | 每日签到与 Buddy 旅行（本 fork） | 每天 `UTC+8 09:00` | 国内站签到+Buddy旅行、国际站签到；`checkin` 段可分别关闭 |
-| 状态快照 | 3 秒 | 写 `workbuddy-status.json` 供 `monitor` 读取 |
+| 状态快照 | 20 秒 | 写 `workbuddy-status.json` 供 `monitor` 读取 |
 | 凭据热加载 | 5 秒 | 扫描凭据新增 / 更新 / 删除 |
 
 **上游超时策略**

@@ -26,6 +26,14 @@ var runtimeConfigMu sync.Mutex
 var upstreamConfigMu sync.RWMutex
 var statusSnapshotWriteMu sync.Mutex
 
+// 状态快照周期（2026-11-12）。
+// 背景：workbuddy-status.json 原每 3 秒重写一次，rclone/Dropbox 的 VFS 写回
+// 每次都会取消在途上传，导致该文件几乎从未成功上传（实测 40 分钟 1009 次重写、
+// 0 次成功）。20 秒既保证 monitor/通知的实时性，又给上传留出完成窗口。
+// 注意：不在 writeStatusSnapshot 里做全局节流 —— 那会让测试/关键事件互相
+// 跳过；只降周期，并把每请求的热路径改为等周期落盘。
+const statusSnapshotInterval = 20 * time.Second
+
 // 与运行时状态同步更新，不能仅由扫描协程缓存：网页写入后立即撤回旧文件也必须生效。
 var runtimeAppliedHash [32]byte
 var runtimeHasAppliedHash bool

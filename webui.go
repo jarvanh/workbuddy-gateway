@@ -119,7 +119,7 @@ func taskViewDefinitions() []scheduledTaskView {
 	return []scheduledTaskView{
 		{ID: "config_reload", Name: "配置热加载", Schedule: "每1秒；高频日志每60秒汇总", Enabled: true, IntervalSeconds: 1},
 		{ID: "credential_reload", Name: "凭据文件扫描", Schedule: fmt.Sprintf("每%d秒；高频日志每60秒汇总", cfg.ReloadInterval), Enabled: cfg.ReloadInterval > 0, IntervalSeconds: int64(cfg.ReloadInterval)},
-		{ID: "status_snapshot", Name: "状态快照写入", Schedule: "每3秒；高频日志每60秒汇总", Enabled: true, IntervalSeconds: 3},
+		{ID: "status_snapshot", Name: "状态快照写入", Schedule: "每20秒；高频日志每60秒汇总", Enabled: true, IntervalSeconds: 20},
 		{ID: "token_check", Name: "令牌有效期检查", Schedule: "每5分钟；临近过期才续期", Enabled: true, IntervalSeconds: 300},
 		{ID: "keepalive", Name: "主动续期保活", Schedule: "每日 " + formatKeepaliveHours(cfg.KeepaliveHours) + "（服务器本地时间）", Enabled: keepaliveEnabled},
 		{ID: "keepalive_catchup", Name: "启动续期补跑", Schedule: "启动后90秒；只处理久未续期账号", Enabled: keepaliveEnabled, OneShot: true},

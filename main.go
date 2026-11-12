@@ -2969,7 +2969,9 @@ func observeModelCredit(r *http.Request, acc *Account, model string, usage map[s
 	} else if oldClass != modelCostPaid {
 		log.Printf("[ModelCost] requestId=%d 账号 %s 站点=%s 模型 %s 实测 usage.credit=%s，已学习为收费模型 traceId=%s", reqID, path, site, model, formatQuota(credit), trace)
 	}
-	writeStatusSnapshot()
+	// 2026-11-12：这里是每请求热路径，原实现每次请求都重写状态快照，
+	// 与 3 秒周期叠加会把文件写成永不停歇的临时文件，持久化层永远传不完。
+	// 改为等 statusSnapshotLoop 的 20 秒周期统一落盘，最多晚 20 秒反映额度变化。
 }
 
 // refreshAccountQuota 通过用户中心只读计费接口刷新账号额度，不记录或回传 Token。
@@ -3775,7 +3777,7 @@ func renderAccountTable(accs []accountSnapshot) string {
 	return b.String()
 }
 
-// statusSnapshotLoop serve 后台每 3 秒刷新一次状态快照。
+// statusSnapshotLoop serve 后台按 statusSnapshotInterval 刷新状态快照。
 func statusSnapshotLoop() {
 	var lastLogged time.Time
 	var previousStatus string
@@ -3788,11 +3790,11 @@ func statusSnapshotLoop() {
 		}
 		logFrequentTask("status_snapshot", status, detail, started, next, &lastLogged, &previousStatus, err != nil)
 	}
-	write(time.Now().Add(3 * time.Second))
-	ticker := time.NewTicker(3 * time.Second)
+	write(time.Now().Add(statusSnapshotInterval))
+	ticker := time.NewTicker(statusSnapshotInterval)
 	defer ticker.Stop()
 	for tick := range ticker.C {
-		write(tick.Add(3 * time.Second))
+		write(tick.Add(statusSnapshotInterval))
 	}
 }
 
