@@ -99,8 +99,8 @@ func TestRestricted403StopsRotationAndKeepsAccount(t *testing.T) {
 	setupRetryAccounts(t, retryAccount("a.json", "token-a"), retryAccount("b.json", "token-b"))
 
 	rec := retryPostChat(t)
-	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("命中 11140 应命中即停返回 429，实际 %d body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("命中 11140 应命中即停返回 403，实际 %d body=%s", rec.Code, rec.Body.String())
 	}
 	if !strings.Contains(rec.Body.String(), "account_restricted") || !strings.Contains(rec.Body.String(), "a.json") {
 		t.Fatalf("错误体应含 account_restricted 与受限账号名: %s", rec.Body.String())
@@ -109,13 +109,10 @@ func TestRestricted403StopsRotationAndKeepsAccount(t *testing.T) {
 		t.Fatalf("命中即停：账号 b 绝不能被尝试，实际被尝试 %d 次", n)
 	}
 	accountMu.Lock()
-	disabled, until := accounts[0].Disabled, accounts[0].RestrictedUntil
+	disabled := accounts[0].Disabled
 	accountMu.Unlock()
-	if disabled {
-		t.Fatalf("风控限制不是凭据失效，不应禁用账号")
-	}
-	if !until.After(time.Now()) {
-		t.Fatalf("账号 a 应进入受限状态，RestrictedUntil=%v", until)
+	if !disabled {
+		t.Fatalf("精确命中账号风控应停止该账号调度（Disabled=true）")
 	}
 }
 
@@ -279,7 +276,7 @@ func TestRetryAfterHeaders(t *testing.T) {
 		t.Fatalf("503 的 Retry-After 应≈7200s，实际 %q", ra)
 	}
 
-	// 场景2：上游直接返回 11140 → 429 account_restricted + Retry-After
+	// 场景2：上游直接返回 11140 → 403 account_restricted（停止该账号调度，不再换号）
 	setupRetryUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = io.WriteString(w, restricted11140Body)
@@ -288,10 +285,10 @@ func TestRetryAfterHeaders(t *testing.T) {
 	acc.RestrictedUntil, acc.RestrictedAt, acc.RestrictedMsg = time.Time{}, time.Time{}, ""
 	accountMu.Unlock()
 	rec2 := retryPostChat(t)
-	if rec2.Code != http.StatusTooManyRequests {
-		t.Fatalf("期望 429，实际 %d body=%s", rec2.Code, rec2.Body.String())
+	if rec2.Code != http.StatusForbidden {
+		t.Fatalf("期望 403，实际 %d body=%s", rec2.Code, rec2.Body.String())
 	}
-	if rec2.Header().Get("Retry-After") == "" {
-		t.Fatal("429 account_restricted 应带 Retry-After")
+	if !strings.Contains(rec2.Body.String(), "account_restricted") {
+		t.Fatalf("403 错误体应含 account_restricted: %s", rec2.Body.String())
 	}
 }

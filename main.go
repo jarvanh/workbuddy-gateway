@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/subtle"
@@ -2354,6 +2353,10 @@ func bodyIndicatesAuthFailure(body string) bool {
 
 // isAuthFailure 判断上游响应是否为授权失效（401/403 / invalid token / 登录过期等）。
 func isAuthFailure(statusCode int, body string) bool {
+	// 11140 还用于模型限流和内容审核，不能仅凭 HTTP 403 禁用并轮转账号。
+	if envelope := parseRestrictionEnvelope([]byte(body)); envelope != nil && envelope.usesCode() {
+		return envelope.restricted()
+	}
 	if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden {
 		return true
 	}
@@ -4569,6 +4572,14 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 			log.Printf("[#%d] 账号 %s [%s] 上游返回 HTTP %d: %s (耗时 %v)", reqID, acc.Path, prof.Label, resp.StatusCode, errStr, time.Since(startTime))
 			log.Printf("[外部接口] traceId=%s requestId=%d 上游=%s 状态码=%d 结果=失败 账号=%s", traceID, reqID, prof.chatURL(), resp.StatusCode, acc.Path)
 
+			if isAccountRestrictionPayload(errBody) {
+				markAccountRestrictionStop(r, acc, reqID, modelName)
+				writeUpstreamError(w, r, http.StatusForbidden, "account_restricted",
+					fmt.Sprintf("账号 %s 被上游风控限制（11140 request illegal）；已停止本请求换号并保留凭据，请在上游官方端提交反馈申诉",
+						filepath.Base(acc.Path)))
+				return nil, nil, nil, false
+			}
+
 			if isQuotaExhausted(resp.StatusCode, errStr) {
 				markModelQuotaBlocked(acc, modelName, errStr)
 				if selection == selectionProbeExhausted {
@@ -4817,6 +4828,8 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			return
 		}
+		// 空正文恢复（默认关闭）：未开启时原样返回，不改变流式直写。
+		resp = recoverEmptyResponse(w, r, resp, acc, prof, upstreamBytes, modelName, reqID, startTime, true)
 		// 流式写完后释放在途预留（含 usage 记账，此时额度已按实际扣费更新）
 		defer releaseInFlight(acc, reqID)
 		// 上游 v1.14.30 流式韧性：首字节前空闲/瞬时网络中断安全重放一次。
@@ -4830,7 +4843,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 响应侧身份还原与流式路径保持同一开关；未开启时原样返回。
 			completionJSON = restoreChatCompletionIdentity(r, completionJSON)
 			return completionJSON, usageFromCompletion(completionJSON), nil
-		})
+		}, true)
 }
 
 // streamChatResponse 将上游 SSE 逐行透传为 OpenAI Chat Completions 流式响应。
@@ -4881,9 +4894,9 @@ func streamChatResponseWithReplay(w http.ResponseWriter, r *http.Request, resp *
 	for attempt := 0; ; attempt++ {
 		body := newTTFTReader(resp.Body, startTime)
 		finalBody = body
-		scanner := bufio.NewScanner(body)
-		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+		scanner := newUpstreamSSEScanner(body, r)
 		var usage map[string]any
+		var output completionOutput
 		finishReason := ""
 		sawDone := false
 		commentLines, metadataLines := 0, 0
@@ -4923,10 +4936,16 @@ func streamChatResponseWithReplay(w http.ResponseWriter, r *http.Request, resp *
 			var chunk map[string]any
 			if json.Unmarshal([]byte(cleanData), &chunk) == nil {
 				observeFirstToken(body, chunk)
+				output.observe(chunk)
 				if u, ok := chunk["usage"].(map[string]any); ok {
 					usage = u
 				}
 				finishReason = noteFinishReason(finishReason, chunk)
+			}
+			if output.emptyLimit(finishReason) {
+				// 暂不发送空正文的 length 终止帧；继续读取独立 usage 帧，
+				// 收尾时只返回预算错误，避免客户端先把空结果当作成功。
+				continue
 			}
 			if restorePlan.active() {
 				if cleanedChunk := cleanChunkObject(cleanData, restorePlan, restorers); cleanedChunk != "" {
@@ -4972,6 +4991,23 @@ func streamChatResponseWithReplay(w http.ResponseWriter, r *http.Request, resp *
 
 		completeTokenStream(body, scanErr == nil && finishReason != "")
 		if scanErr != nil {
+			if errors.Is(scanErr, errUpstreamAccountRestricted) {
+				markAccountRestrictionStop(r, acc, reqID, modelName)
+				payload, _ := json.Marshal(map[string]any{"error": accountRestrictionError()})
+				guard.writeData(string(payload))
+				statsObserveUsage(r, usage, false)
+				recordModelTokens(modelName, usage, reqID)
+				recordModelLatency(modelName, time.Since(startTime))
+				return
+			}
+			if failure := upstreamSSEClientError(scanErr); failure != nil {
+				payload, _ := json.Marshal(map[string]any{"error": failure})
+				guard.writeData(string(payload))
+				statsObserveUsage(r, usage, false)
+				recordModelTokens(modelName, usage, reqID)
+				recordModelLatency(modelName, time.Since(startTime))
+				return
+			}
 			// 流被中断（上游卡死 / 超时 / 客户端取消）时，绝不补发 [DONE]：
 			// 补发等于告诉下游「正常结束」，会让残缺的工具调用被当成完整结果执行。
 			debugEvent(r, "error", "stream_response_failed", map[string]any{
@@ -5010,20 +5046,28 @@ func streamChatResponseWithReplay(w http.ResponseWriter, r *http.Request, resp *
 			guard.writeData(string(errPayload))
 			log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游流结束 账号=%s 结果=拒绝当成成功 原因=连接正常关闭但没有非空 finish_reason 是否看到DONE=%t 业务影响=不补发 [DONE]，客户端收到 stream_closed_without_finish 是否已处理=是",
 				debugTraceID(r), reqID, acc.Path, sawDone)
+		} else if output.emptyLimit(finishReason) {
+			payload, _ := json.Marshal(outputBudgetErrorPayload(usage, false))
+			guard.writeData(string(payload))
 		} else {
 			if sawDone {
 				guard.writeData("[DONE]")
 			}
-			debugEvent(r, "info", "stream_response_completed", map[string]any{
+			event := "stream_response_completed"
+			if finishReason == "length" {
+				event = "stream_response_incomplete"
+			}
+			debugEvent(r, "info", event, map[string]any{
 				"status_code":   http.StatusOK,
 				"finish_reason": finishReason,
 				"saw_done":      sawDone,
 			})
 		}
 		if scanErr == nil && finishReason != "" {
+			logOutputBudget(r, reqID, modelName, finishReason, output, usage)
 			observeModelCredit(r, acc, modelName, usage, reqID)
 		}
-		statsObserveUsage(r, usage, scanErr == nil && finishReason != "")
+		statsObserveUsage(r, usage, scanErr == nil && finishReason != "" && finishReason != "length")
 		recordModelTokens(modelName, usage, reqID)
 		recordUsageLine(r, modelName, usage)
 		recordModelLatency(modelName, time.Since(startTime))
@@ -5045,6 +5089,9 @@ const maxNonStreamAttempts = 3
 // maxNonStreamAttempts 次；全部失败才返回错误，绝不把截断内容伪装成完整结果。
 // 流式请求不经过此路径：部分内容已发出，无法透明重试（由 streamChatResponse /
 // streamResponsesResponse 下发明确的中断错误事件）。
+//
+// enforceOutputBudget 为 true 时（Chat 非流式），输出预算耗尽返回显式错误；
+// Responses 沿用上游语义只记录预算事件，不改写响应体。
 func handleNonStreamUpstream(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -5053,6 +5100,7 @@ func handleNonStreamUpstream(
 	upstreamBytes []byte,
 	startTime time.Time,
 	buildResponse func(completionJSON []byte) (finalJSON []byte, usage map[string]any, err error),
+	enforceOutputBudget ...bool,
 ) {
 	// 非流式不建闸门，此处读 Header 安全；upstreamChat 统一要求显式传 traceID。
 	traceID := w.Header().Get("X-Trace-ID")
@@ -5062,12 +5110,24 @@ func handleNonStreamUpstream(
 		if !ok {
 			return
 		}
+		// 空正文恢复（默认关闭）：在聚合前接管响应体；未开启时原样返回。
+		resp = recoverEmptyResponse(w, r, resp, acc, prof, upstreamBytes, modelName, reqID, startTime, false)
 		body := newTTFTReader(resp.Body, startTime)
-		completionJSON, aggErr := aggregateCompletion(body, modelName)
+		completionJSON, aggErr := aggregateCompletion(body, modelName, r)
 		resp.Body.Close()
 		// 本轮请求已结束（聚合完成/中断），释放在途预留；回退重试会重新预留
 		releaseInFlight(acc, reqID)
 		if aggErr != nil {
+			// 账号风控与上游错误信封：直接按上游状态返回，不当作可重试的聚合中断。
+			if errors.Is(aggErr, errUpstreamAccountRestricted) {
+				markAccountRestrictionStop(r, acc, reqID, modelName)
+				writeUpstreamError(w, r, http.StatusForbidden, "account_restricted", aggErr.Error())
+				return
+			}
+			if failure := upstreamSSEClientError(aggErr); failure != nil {
+				writeUpstreamError(w, r, http.StatusBadGateway, "upstream_error", strOf(failure["message"]))
+				return
+			}
 			recordModelFailure(modelName, "聚合中断")
 			debugEvent(r, "error", "aggregate_response_failed", map[string]any{
 				"error_type": debugErrorType(aggErr),
@@ -5101,11 +5161,18 @@ func handleNonStreamUpstream(
 			writeOpenAIError(w, http.StatusInternalServerError, "translate_error", "转换 Responses 响应失败: "+convErr.Error())
 			return
 		}
+		output, finish := completionOutputFromJSON(completionJSON)
+		statsObserveUsage(r, usage, finish != "length")
+		logOutputBudget(r, reqID, modelName, finish, output, usage)
 		observeModelCredit(r, acc, modelName, usage, reqID)
 		recordModelTokens(modelName, usage, reqID)
 		recordUsageLine(r, modelName, usage)
 		recordModelTTFT(modelName, body.duration())
 		recordModelLatency(modelName, time.Since(startTime))
+		if len(enforceOutputBudget) > 0 && enforceOutputBudget[0] && output.emptyLimit(finish) {
+			writeOutputBudgetError(w, usage, false)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(finalJSON)
@@ -5113,7 +5180,7 @@ func handleNonStreamUpstream(
 			"status_code":    http.StatusOK,
 			"response_bytes": len(finalJSON),
 		})
-		log.Printf("[#%d] 非流式响应完成 (账号 %s [%s], 耗时 %v, 首字 %v)", reqID, acc.Path, prof.Label, time.Since(startTime), body.duration())
+		log.Printf("[#%d] 非流式响应完成 (账号 %s [%s], 耗时 %v, 首Token(v2) %s)", reqID, acc.Path, prof.Label, time.Since(startTime), body.text())
 		return
 	}
 }
@@ -5601,15 +5668,14 @@ func restoreChatCompletionIdentity(r *http.Request, completionJSON []byte) []byt
 	return out
 }
 
-func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
+func aggregateCompletion(r io.Reader, model string, requests ...*http.Request) ([]byte, error) {
 	var content, reasoning, role, respModel, respID, finish string
 	var created int64
 	var usage map[string]any
 	toolCalls := map[int]*mergedToolCall{}
 	var toolOrder []int
 
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	scanner := newUpstreamSSEScanner(r, requests...)
 	for scanner.Scan() {
 		data := stripDataPrefix(scanner.Text())
 		if data == "" || data == "[DONE]" {
@@ -5653,10 +5719,10 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		// 上游流在聚合期间被中断（网络错误 / 空闲看门狗 / 客户端取消）。
-		// 绝不把已聚合的部分内容伪装成完整结果（finish_reason=stop）返回，
-		// 交由上层判断是否回退其他账号重试。
-		return nil, fmt.Errorf("上游流式响应读取中断: %w", err)
+		if len(requests) > 0 {
+			statsObserveUsage(requests[0], usage, false)
+		}
+		return nil, fmt.Errorf("读取上游流失败: %w", err)
 	}
 	// 上游连接正常结束却从未给出 finish_reason：不能当成完整回复。
 	if finish == "" {

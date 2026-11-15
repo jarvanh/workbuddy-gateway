@@ -68,7 +68,8 @@
     "backgroundTaskGapMinSeconds": 2,
     "backgroundTaskGapMaxSeconds": 5,
     "conversationAffinityEnabled": true,
-    "accountAffinityEnabled": true
+    "accountAffinityEnabled": true,
+    "emptyResponseRecovery": false
   },
   "models": {
     "blocklist": [],

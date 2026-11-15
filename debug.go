@@ -139,6 +139,8 @@ type runtimeFileConfig struct {
 		// qoder2api 实测：单账号会话命中 93.1%，跨账号只有 65.2%。
 		// 缺省（nil）= 开启；显式 false 回到严格轮转。
 		AccountAffinityEnabled *bool `json:"accountAffinityEnabled"`
+		// EmptyResponseRecovery：实验性空正文恢复；默认关闭，命中时同账号关思考重发一次并单独记录费用。
+		EmptyResponseRecovery bool `json:"emptyResponseRecovery"`
 	} `json:"upstream"`
 	// Models 段可选，用于按模型名做黑白名单控制（大小写不敏感）。
 	Models struct {
