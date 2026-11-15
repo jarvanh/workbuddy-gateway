@@ -37,6 +37,7 @@ import (
 
 // fork：版本值不参与 CI 产物（release.yml 以 tag 经 -ldflags 注入 main.version），
 // 保持 var 供本地 -ldflags 注入（const 会使注入失效，见 MEMORY.md 发版约定）。
+// 上游 v1.14.47 把 version 收进 const 块；fork 维持 var，值不随发版更新（真实版本=tag 注入）。
 var version = "1.29.27"
 
 const (
@@ -896,6 +897,9 @@ func initFileLogging(command string) func() {
 	}
 	log.SetOutput(&redactingLogWriter{writer: io.MultiWriter(os.Stderr, f)})
 	log.Printf("[Log] 审计日志已启用，文件=%s，命令=%s，版本=%s", path, command, version)
+	// 不在脱敏器内部写日志，避免日志写入再次进入脱敏器。
+	log.Printf("[日志脱敏] traceId=%s 阶段=初始化 结果=启用不可变替换器缓存 业务影响=新秘密注册后失效重建；重复注册复用；旧秘密继续保护，不淘汰令牌或裁剪统计",
+		newTraceID())
 	return func() { _ = f.Close() }
 }
 
