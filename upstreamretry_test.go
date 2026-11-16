@@ -179,7 +179,7 @@ func TestUpstream5xxFallsBackToNextAccount(t *testing.T) {
 }
 
 // 所有账号的网络调用都失败：应返回 502 upstream_network_error，且完成原地重试。
-func TestAllAccountsNetworkFailureReturns502(t *testing.T) {
+func TestAllAccountsNetworkFailureReturns503WithRetryAfter(t *testing.T) {
 	oldRetries, oldDelay := upstreamTransientRetries, upstreamRetryBackoff
 	upstreamTransientRetries, upstreamRetryBackoff = 1, 5*time.Millisecond
 	defer func() { upstreamTransientRetries, upstreamRetryBackoff = oldRetries, oldDelay }()
@@ -192,8 +192,8 @@ func TestAllAccountsNetworkFailureReturns502(t *testing.T) {
 	setupRetryAccounts(t, retryAccount("solo.json", "token-a"))
 
 	rec := retryPostChat(t)
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("全部账号网络失败应返回 502, status=%d body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("全部账号网络失败应返回 503+RA（契约 2026-11-16）, status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	if !strings.Contains(rec.Body.String(), "upstream_network_error") {
 		t.Fatalf("错误体应包含 upstream_network_error:\n%s", rec.Body.String())

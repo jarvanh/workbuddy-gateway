@@ -80,8 +80,8 @@ func TestEarlyFlushDisabledKeepsNativeErrorStatus(t *testing.T) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	})
 	rec := postChatStream(t, `{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("禁用时应维持原生 502，实际=%d body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("禁用时应维持原生 503+RA（契约 2026-11-16），实际=%d body=%s", rec.Code, rec.Body.String())
 	}
 	if strings.Contains(rec.Body.String(), "data: ") {
 		t.Fatalf("禁用时不应出现 SSE 事件:\n%s", rec.Body.String())

@@ -199,7 +199,7 @@ func TestUpstreamDoesNotRetryAfterServerReceivesRequest(t *testing.T) {
 	rec := httptest.NewRecorder()
 	requestAuditMiddleware(http.HandlerFunc(handleChatCompletions)).ServeHTTP(rec, req)
 
-	if got := atomic.LoadInt32(&attempts); got != 1 || rec.Code != http.StatusBadGateway {
+	if got := atomic.LoadInt32(&attempts); got != 1 || rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("request reached server, must not retry: attempts=%d status=%d", got, rec.Code)
 	}
 }
@@ -236,7 +236,7 @@ func TestUpstreamDoesNotRetryRealEOF(t *testing.T) {
 }
 
 // 重试次数用尽仍失败时，应如实返回 502，且不得伪造成功。
-func TestUpstreamRetriesExhaustedReturns502(t *testing.T) {
+func TestUpstreamRetriesExhaustedReturns503WithRetryAfter(t *testing.T) {
 	var attempts int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&attempts, 1)
@@ -287,8 +287,8 @@ func TestUpstreamRetriesExhaustedReturns502(t *testing.T) {
 	rec := httptest.NewRecorder()
 	requestAuditMiddleware(http.HandlerFunc(handleChatCompletions)).ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("重试用尽应返回 502, got %d", rec.Code)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("重试用尽应返回 503+RA（契约 2026-11-16）, got %d", rec.Code)
 	}
 	if got := atomic.LoadInt32(&attempts); got != 1 {
 		t.Fatalf("RST after request headers must not retry, attempts=%d", got)

@@ -491,7 +491,16 @@ func (p *upstreamProfile) authTokenURL(state string) string {
 
 func (p *upstreamProfile) tokenRefreshURL() string { return p.Base + "/v2/plugin/auth/token/refresh" }
 
+// upstreamBaseOverride 允许测试/联调把上游 base 指到本地假上游；
+// 生产不设置该环境变量时行为完全不变。
+func upstreamBaseOverride() string {
+	return strings.TrimRight(os.Getenv("UPSTREAM_BASE_OVERRIDE"), "/")
+}
+
 func (p *upstreamProfile) chatURL() string {
+	if ov := upstreamBaseOverride(); ov != "" {
+		return ov + "/v2/chat/completions"
+	}
 	base := p.Base
 	// 测试或本地会把 Base 指向假上游；只有生产默认 Base 才切到 ChatBase。
 	if p.ChatBase != "" && (p.DefaultBase == "" || p.Base == p.DefaultBase) {
@@ -4694,26 +4703,30 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, traceID string, reqID 
 		pendingRelease = nil
 	}
 
-	// 账号池中每个账号都尝试过且均失败（网络错误 / 上游瞬时错误 / 冷却等）
+	// 账号池中每个账号都尝试过且均失败（网络错误 / 上游瞬时错误 / 冷却等）。
+	// 契约：终局统一 503 + Retry-After（而非 502）—— 瞬时故障耗尽是「暂时不可用」，
+	// RA 让 OmniRoute 按可等待退避处理而不是立刻降级（502 无 RA 会被当成终态失败）。
 	if lastNetErr != "" {
 		debugEvent(r, "error", "request_failed_all_accounts_network", map[string]any{
-			"status_code":     http.StatusBadGateway,
+			"status_code":     http.StatusServiceUnavailable,
 			"reason":          "upstream_network_error",
 			"tried_accounts":  poolSize,
 			"business_impact": "所有账号上游网络调用均失败",
 		})
-		ef.fail(w, http.StatusBadGateway, "upstream_network_error",
+		setRetryAfter(w, earliestRecoveryHint())
+		ef.fail(w, http.StatusServiceUnavailable, "upstream_network_error",
 			fmt.Sprintf("已依次尝试全部 %d 个账号仍网络转发失败，最近一次错误: %s", poolSize, truncate(lastNetErr, 200)))
 		return nil, nil, nil, false
 	}
 	if lastUpstreamErr != "" {
 		debugEvent(r, "warn", "request_failed_all_accounts_upstream", map[string]any{
-			"status_code":     http.StatusBadGateway,
+			"status_code":     http.StatusServiceUnavailable,
 			"reason":          "upstream_error",
 			"tried_accounts":  poolSize,
 			"business_impact": "所有账号上游均返回瞬时错误",
 		})
-		ef.fail(w, http.StatusBadGateway, "upstream_error",
+		setRetryAfter(w, earliestRecoveryHint())
+		ef.fail(w, http.StatusServiceUnavailable, "upstream_error",
 			fmt.Sprintf("已依次尝试全部 %d 个账号仍失败，最近一次上游错误: %s", poolSize, truncate(lastUpstreamErr, 200)))
 		return nil, nil, nil, false
 	}
