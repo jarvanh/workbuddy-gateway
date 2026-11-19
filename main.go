@@ -5206,6 +5206,13 @@ func handleNonStreamUpstream(
 // 路由处理: /v1/models (列出常见模型供客户端自动补全)
 // -----------------------------------------------------------------------------
 
+// 2026-11-19：实测支持图片输入的模型族（1x1 PNG 探针 → 正确识别颜色）。
+// 新增模型必须先跑真实图片请求再往这里加，避免误标导致错误溢出。
+func isVisionCapableModel(id string) bool {
+	k := strings.ToLower(id)
+	return strings.Contains(k, "glm-5.3") || strings.Contains(k, "glm-4.6v") || strings.Contains(k, "glm-4.5v")
+}
+
 func handleModels(w http.ResponseWriter, r *http.Request) {
 	modelIDs, source := mergedModelIDs()
 	modelsList := make([]map[string]any, 0, len(modelIDs))
@@ -5219,6 +5226,13 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 		// context_length 是模型能力上限，default_context_length 是客户端默认预算，
 		// 两者语义不同，必须分开给，不能合并成一个值。
 		// 这里只补充描述信息，不注入上游请求参数、不截断消息，也不改变输出预算逻辑。
+		// 2026-11-19 实测：glm-5.3-flash 能正确识别 1x1 红色 PNG（回答「红色」），
+		// 但上游目录未声明视觉，OmniRoute 会因此拒绝所有图片请求。
+		// 只给实测过的 GLM 族补声明，其余模型保持上游原样。
+		if isVisionCapableModel(id) {
+			entry["input_modalities"] = []string{"text", "image"}
+			entry["capabilities"] = map[string]any{"vision": true}
+		}
 		if mc, ok := modelCapabilityFor(id); ok {
 			if mc.Ceiling > 0 {
 				entry["context_length"] = mc.Ceiling
