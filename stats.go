@@ -83,7 +83,6 @@ var statsQueryCache struct {
 	bucketsStart []int64
 }
 
-
 var modelWindowCache struct {
 	sync.Mutex
 	revision  uint64
