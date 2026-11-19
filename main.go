@@ -3654,6 +3654,7 @@ func writeStatusSnapshot() error {
 	if err := os.Rename(tmp, statusSnapshotFile); err != nil {
 		return err
 	}
+	cacheStatusSnapshotFromDisk(statusSnapshotFile, snap)
 	return nil
 }
 
