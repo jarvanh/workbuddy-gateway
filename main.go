@@ -5209,8 +5209,20 @@ func handleNonStreamUpstream(
 // 2026-11-19：实测支持图片输入的模型族（1x1 PNG 探针 → 正确识别颜色）。
 // 新增模型必须先跑真实图片请求再往这里加，避免误标导致错误溢出。
 func isVisionCapableModel(id string) bool {
+	// 2026-11-19 扩表：实测（1x1 红色 PNG 探针）+ 上游公开模型信息。
+	// 只收确认支持图像输入的族；未列出的保持不支持，避免误标后带图请求
+	// 被路由到不支持的腿、错误溢出客户端。
 	k := strings.ToLower(id)
-	return strings.Contains(k, "glm-5.3") || strings.Contains(k, "glm-4.6v") || strings.Contains(k, "glm-4.5v")
+	for _, tag := range []string{
+		"glm-5.3", "glm-5.2", "glm-4.6v", "glm-4.5v", "glm-5v",
+		"deepseek-v4", "kimi-k3", "minimax-m3", "mimo-v2.6",
+		"qwen3.8", "qwen4", "hy4flash",
+	} {
+		if strings.Contains(k, tag) {
+			return true
+		}
+	}
+	return false
 }
 
 func handleModels(w http.ResponseWriter, r *http.Request) {
